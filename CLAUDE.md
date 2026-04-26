@@ -1,0 +1,511 @@
+# CLAUDE.md
+
+This file is read by Claude Code (Anthropic's terminal agent) and other AI
+assistants working on this repository. It captures the project's invariants,
+conventions, and the reasoning behind non-obvious decisions so that changes
+preserve correctness on a destructive Adobe API.
+
+> **Critical**: this tool submits **irreversible deletion** requests to
+> Adobe Experience Platform. Every assumption called out here exists
+> because the wrong behaviour would silently delete customer data. If you
+> are about to weaken one of these invariants, stop and ask the user first.
+
+---
+
+## What this tool does
+
+Local helper for bulk identity deletion from **Adobe Experience Platform**.
+Takes a CSV of `hashedKocid` source identifiers, expands each through the
+**Identity Graph** to find all linked identities (email, phone, ECID, CRMID,
+GAID, IDFA, custom), groups the result into work orders of ≤100,000
+identifiers, and submits them to the **Data Hygiene** (record-delete) API
+within Adobe's 1,000,000 identifiers/day cap.
+
+Runs as a single Node.js process. One SQLite file for state.
+**Not** deployed to Kubernetes, containers, or cloud — this is explicitly a
+local helper that an operator runs on their laptop when a deletion batch
+needs to happen.
+
+---
+
+## Architecture at a glance
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│       Single Node.js process (binds 127.0.0.1:3000)         │
+│                                                             │
+│  Express server ─┬─▶ REST API (/api/*)                     │
+│                  ├─▶ Static UI (/src/web, vanilla JS)      │
+│                  │                                          │
+│                  ├─▶ In-process runners:                    │
+│                  │     • expansion (p-limit concurrency)    │
+│                  │     • submission (quota-gated)           │
+│                  │     • monitor (setInterval 60s)          │
+│                  │     • recovery  (one-shot at startup)    │
+│                  │                                          │
+│                  ├─▶ SQLite (WAL mode, data/state.db)       │
+│                  └─▶ In-memory IMS token cache              │
+└─────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+                    Adobe Experience Platform APIs
+```
+
+The HTTP server binds to `127.0.0.1` by default — never `0.0.0.0`. Override
+explicitly via `HOST` env var only when you need to expose the unauthenticated
+API (e.g., SSH-tunneling for a demo). See invariant I12.
+
+No Redis, no Postgres, no BullMQ, no worker threads. "Scalable" here
+means **per-process throughput** via async I/O and bounded concurrency,
+which is sufficient to saturate Adobe's rate limits from one machine.
+
+---
+
+## File map
+
+```
+src/
+├── index.js                    Express entrypoint, startup, runner boot
+├── config.js                   Config defaults + env overrides (no zod)
+├── db.js                       SQLite schema + prepared statements
+│
+├── services/                   Thin wrappers over Adobe APIs
+│   ├── imsAuth.js              IMS token cache + thundering-herd guard
+│   ├── adobeClient.js          axios factory (retry, backoff, auth inject)
+│   ├── sandboxes.js            GET /data/foundation/sandbox-management/
+│   ├── datasets.js             GET /data/foundation/catalog/dataSets (filtered)
+│   ├── namespaces.js           GET /data/core/idnamespace/identities + index
+│   ├── identityGraph.js        POST /data/core/identity/clusters/members
+│   ├── hygiene.js              POST /data/core/hygiene/workorder + validation
+│   └── quotaManager.js         SQLite-backed daily quota ledger
+│
+├── runner/                     In-process background work
+│   ├── expansion.js            CSV stream → batched Identity Graph calls
+│   ├── submission.js           Planner (with replan guard) + quota-gated submission
+│   ├── monitor.js              setInterval(60s) status poll
+│   └── recovery.js             One-shot startup reconciliation of orphan work orders
+│
+├── routes/                     Express route modules
+│   ├── config.js               Credential CRUD + test
+│   ├── adobe.js                Sandbox/dataset/namespace discovery
+│   ├── upload.js               CSV upload → job creation
+│   └── jobs.js                 Job detail, plan, submit, progress, export
+│
+├── utils/
+│   ├── csv.js                  Streaming CSV in/out
+│   ├── crypto.js               AES-256-GCM envelope encryption
+│   └── logger.js               Text or JSON output
+│
+└── web/                        Zero-build static UI
+    ├── index.html              AEP Spectrum-styled templates
+    ├── styles.css              Spectrum tokens (gray scale, blue, red)
+    ├── app.js                  Vanilla JS controller (no React)
+    ├── aep-icon.svg            Local copy of the AEP brand mark (no CDN)
+    └── fonts/                  Self-hosted Source Sans 3 (.woff2, OFL)
+
+data/                           Created at runtime
+├── state.db                    SQLite (WAL)
+├── .key                        AES-256 encryption key (chmod 600)
+├── uploads/                    Streamed CSV uploads
+└── output/                     Exported CSVs
+
+test/                           Integration tests (mocked Adobe via nock)
+docs/                           REVIEW.md + anything else reviewers need
+```
+
+---
+
+## Invariants (DO NOT break these)
+
+### I1. Work-order payload shape is exact
+
+Adobe's `POST /data/core/hygiene/workorder` accepts:
+
+```json
+{
+  "action": "delete_identity",
+  "datasetId": "ALL",
+  "displayName": "…",
+  "description": "…",
+  "targetServices": ["identity", "profile", "ajo"],
+  "namespacesIdentities": [
+    { "namespace": { "code": "email", "id": 6 }, "ids": ["a@x.com"] },
+    { "namespace": { "code": "hashedKocid" },    "ids": ["abc"] }
+  ]
+}
+```
+
+- `namespacesIdentities[].namespace` must have **either `code` or `id`**
+  (numeric nsid). Both is best — Adobe accepts either and we supply both
+  when known so custom namespaces can't collide.
+- **Never** stringify an `nsid` as a fake code (e.g. `"411"`). That's
+  what the old code did, and it would silently target a namespace named
+  literally `"411"` — which doesn't exist, so the delete is a no-op.
+- `datasetId` is exactly one of: `"ALL"` | single id | comma-separated ids.
+  `"ALL"` cannot be combined with specific ids.
+- `targetServices`, when present, must be exactly
+  `["identity","profile","ajo"]` in any order, AND `datasetId` MUST be
+  `"ALL"`. This is "profile-only mode" — deletes from profile/identity/AJO
+  but leaves the data lake intact.
+
+All of this is validated in `services/hygiene.js` via
+`normalizeNamespacesIdentities`, `validateDatasetId`, and
+`validateTargetServices`. **If you change those, add tests.** Adobe returns
+HTTP 400 on any payload violation, but once the request goes through it's
+irreversible, so we validate aggressively before calling.
+
+### I2. Namespaces have TWO forms and we respect both
+
+Every AEP identity namespace has:
+- **`code`** (string): e.g. `"email"`, `"Phone_E.164"`, `"hashedKocid"`
+- **`id`** (number): the `nsid`, e.g. `6`, `411`
+
+The Identity Graph returns identities with varying shapes depending on the
+namespace and the data path that produced them. We canonicalize everything
+via `services/namespaces.js::canonicalizeNamespace()` — it takes
+`{ns, nsid}` (either/both) plus an optional index and returns `{code, id}`.
+
+`runner/expansion.js` loads the full namespace list **once per job** and
+passes the index through every batch. The SQLite `expanded_identities`
+table stores BOTH `ns_code` and `ns_id` so the planner can emit either or
+both in the Adobe payload.
+
+### I3. Identity batch size hard limits
+
+- `POST /identity/clusters/members`: **max 1000 composite XIDs per call**
+  (Adobe-enforced; also documented as "1500000 lookups/day in batches of
+  1000 at p95 850 ms").
+- `POST /hygiene/workorder`: **max 100,000 identifiers per work order**
+  (Adobe-enforced hard limit).
+- **Daily cap**: 1,000,000 identifiers/day (default entitlement; lower for
+  some orgs, higher with Shield add-ons).
+
+These live in `config.js` and must match Adobe's current limits. If Adobe
+raises them, bump the defaults and re-run the tests.
+
+### I4. Clusters should stay together when they fit
+
+When the planner builds work orders, it reads identities in
+`(source_id, ns_code)` order (see `db.js::streamIdentitiesBySource`). It
+collects each cluster into a bundle, and when the current work order can't
+hold the whole bundle, it flushes the order first and starts a new one
+with the full bundle.
+
+Clusters bigger than 100k will span multiple orders — this is acceptable
+because Identity Service still resolves them to the same cluster server-side.
+But the default should be to keep them together.
+
+### I5. Quota reservation is atomic and reversible across BOTH dimensions
+
+`services/quotaManager.js` uses SQLite transactional INSERTs with
+`ON CONFLICT DO UPDATE` against two ledgers:
+- `quota_usage` (daily, keyed on `utc_date`)
+- `quota_usage_monthly` (monthly, keyed on `utc_year_month`)
+
+The flow is:
+
+1. `reserve(imsOrgId, count, dailyLimit, monthlyLimit)` checks BOTH caps.
+   Denies with `reason: 'daily'` or `reason: 'monthly'` depending on which
+   cap would overflow. If both pass, both ledgers are incremented.
+2. If `granted === false`, the work order is marked `deferred`. Daily
+   denials clear at UTC midnight; monthly denials clear at UTC first-of-month.
+3. If the subsequent Adobe submission **fails**, we call
+   `release(imsOrgId, count, monthlyLimit)` — decrementing the daily ledger
+   always, and the monthly ledger only when `monthlyLimit != null`. Without
+   this, a transient 500 would waste quota permanently.
+
+`monthlyLimit` can be `null` (or 0 from the UI) to disable monthly tracking
+for a job — useful for operators whose contract has no monthly cap. In that
+mode only the daily dimension is checked, AND `release` skips the monthly
+decrement so it can't eat headroom from unrelated jobs on the same org that
+have monthly tracking on. **Pass the same `monthlyLimit` you passed to
+`reserve` — `submission.js` and `recovery.js` both use `job.monthly_limit`.**
+
+Any code that submits a work order MUST pair `reserve` with `release`
+in a try/catch. **Exception**: on network timeout we don't know if Adobe
+received the POST. `services/adobeClient.js`'s retry guard never retries
+the hygiene POST on network errors OR 5xx (see I11), so the double-submit
+risk is minimal, but the quota may undercount. Reconcile by checking
+Adobe's actual usage if precise accounting matters.
+
+### I6. Client secrets are encrypted at rest
+
+`utils/crypto.js` uses AES-256-GCM with a per-row random 12-byte IV.
+The encryption key lives at `data/.key` (auto-generated, chmod 600) or in
+the `ENCRYPTION_KEY` env var. Never log, dump, or emit decrypted secrets
+anywhere. Tokens (short-lived) stay in memory only, never written to disk.
+
+### I7. Datasets shown to the user are pre-filtered
+
+`services/datasets.js` filters to `tags.unifiedIdentity = "enabled:true"`
+by default. Non-Identity-enabled datasets would accept a work order but
+delete nothing, so hiding them prevents a footgun. If you need the raw
+list (e.g. for a diagnostic view), pass `identityOnly: false` and label
+the UI clearly that the non-Identity datasets won't actually be touched.
+
+### I8. `data/` is never committed
+
+The `.gitignore` excludes `data/` because it contains the encryption key
+and all stored client secrets. If you add a new path that holds secrets,
+add it to `.gitignore` and `utils/crypto.js` if needed.
+
+### I9. Identity API region MUST come from the credential, not a global
+
+The Identity Service is regionally sharded — `/clusters/members` and
+`/idnamespace/identities` live on `platform-{region}.adobe.io` where
+`region ∈ {va7, nld2, aus5, can2}`. **A wrong-region call to `/clusters/members`
+returns HTTP 200 with empty cluster data**, which means an operator on a
+non-VA7 sandbox would see "no linked identities" and proceed to delete
+only the source `hashedKocid` — leaving the linked email/phone/CRMID
+alive. Silent partial deletes are exactly what every safety invariant
+exists to prevent.
+
+`utils/crypto.js::decryptCreds` must include `region` in its return value.
+`services/namespaces.js::listNamespaces` and
+`services/identityGraph.js::expandBatch` must build their endpoint URL
+from `creds.region` — not `config.aep.identityRegion`. The global config
+is only the fallback when a credential row was inserted before the
+region column existed. Tests in `test/region.test.js` lock this in.
+
+### I10. Re-planning is forbidden once any work order has shipped
+
+`runner/submission.js::planWorkOrders` reads from `expanded_identities`
+and emits work orders for every identity in the table — it has no notion
+of "which identities have already shipped to Adobe". So a second `/plan`
+call after submission would re-emit work orders for identities Adobe
+already received, and the next Submit would create **duplicate
+irreversible deletes**.
+
+The planner now refuses by throwing `ReplanForbiddenError` (HTTP 409)
+when any work order on the job is in a state other than `planned` or
+`deferred`. Deferred is fine — those rows never went to Adobe. The UI
+in `web/app.js` mirrors the guard: the Plan tab no longer auto-POSTs
+`/plan` on tab entry, and the "↻ Re-plan" button auto-disables once any
+order has shipped, with a tooltip explaining why.
+
+If you add new flow that mutates work-order state, ensure the planner's
+guard sees it. If you add new statuses, decide whether they should be
+on the "safe to re-plan" list (currently only `planned`/`deferred`).
+
+### I11. Adobe POST retries are gated by a per-request idempotency flag
+
+`services/adobeClient.js::retryCondition` distinguishes idempotent from
+non-idempotent requests:
+- **GETs** are always idempotent.
+- **Non-GETs** default to **non-idempotent**. Pass `{ idempotent: true }`
+  in the axios config to opt back in.
+- Non-idempotent requests do NOT retry on 5xx or network errors. They
+  DO retry on 401 (token refresh) and 429 (rate limit), because those
+  unambiguously mean Adobe didn't process the request.
+- Idempotent requests retry the full set (5xx + 401 + 429 + network).
+
+Concretely:
+- **`services/hygiene.js`** — POST `/hygiene/workorder` is **deliberately
+  not idempotent**. A 5xx after Adobe partly processed the request must
+  not auto-retry; that would create a duplicate irreversible work order.
+  The orphan-recovery path (`runner/recovery.js`) is the safe
+  reconciliation route on next startup. **Do not add `idempotent: true`
+  to this call site.** A comment marks it.
+- **`services/identityGraph.js`** — POST `/clusters/members` opts in via
+  `{ idempotent: true }`. It's a side-effect-free query despite using
+  POST (the body just carries XID lookups), so retrying transient 5xx
+  is safe and useful.
+
+### I12. UI loads only local assets
+
+The CLAUDE.md rule "Never add telemetry, analytics, or outbound calls
+beyond the documented Adobe endpoints" applies to the browser too, not
+just the server. The HTML page must not load fonts, scripts, styles,
+analytics pixels, or images from any third-party CDN. Every asset lives
+under `src/web/`.
+
+This means:
+- **Fonts**: Source Sans 3 woff2 files are committed at `src/web/fonts/`
+  (OFL-licensed). The `@font-face` blocks in `styles.css` reference local
+  paths only — never `fonts.googleapis.com` or `use.typekit.net`.
+- **Logo**: `src/web/aep-icon.svg` is a local copy of the AEP brand mark
+  extracted from Adobe's HeroIcons sprite. Never `<img src="https://cdn...">`.
+- **No analytics, no Sentry, no telemetry** — even one image-pixel beacon
+  leaks user-agent + IP to a third party from a destructive admin tool.
+
+If you find yourself wanting to load anything from a third-party origin,
+download it and ship it. Disk space is fine; offline correctness is the
+goal.
+
+---
+
+## Conventions
+
+### Code style
+
+- **ES modules** (`.js` with `"type": "module"` in package.json). No CommonJS.
+- **No TypeScript**. This stays deliberately simple — one-file services,
+  JSDoc types where helpful.
+- **No build step**. The UI loads raw HTML/CSS/JS served by Express.
+  The backend runs directly via `node src/index.js`.
+- **No bundlers, transpilers, or framework**. If a dependency needs a build
+  step to work, don't add it.
+- **better-sqlite3** is the ONLY persistence. It's synchronous and ~10x
+  faster than async sqlite for our workload.
+
+### Dependencies
+
+When adding a dep, prefer:
+- Standard Node APIs (streams, crypto, url, etc.)
+- Small, single-purpose libs (`p-limit`, `fast-csv`, `axios-retry`)
+
+Avoid:
+- ORMs (we write raw SQL in prepared statements)
+- Request/response frameworks beyond Express (no NestJS, Fastify, etc.)
+- Big batteries-included libs if a 50-line implementation will do
+
+### Error handling
+
+- All Adobe API calls go through `services/adobeClient.js`, which handles
+  401/429/5xx retry + exponential backoff + `Retry-After` honoring,
+  **gated by per-request idempotency** (see I11).
+- Adobe error bodies are extracted (`detail` / `message` / `error_description`
+  / `error_message` / `title` / `error` / `errors[].message`) and replace
+  axios's generic "Request failed with status code 403". On 403 specifically,
+  a URL-aware permission hint is appended (e.g., "needs Data Hygiene product
+  profile + Delete Record permission"). Original axios message preserved on
+  `err.originalMessage`. Tests in `test/adobeClient.test.js`.
+- Validation errors throw `WorkOrderValidationError` (in `hygiene.js`) —
+  these are pre-network and safe.
+- Runtime errors from the Adobe API bubble up; the runner catches them,
+  marks the work order `failed`, stores the error message, and releases
+  the quota reservation (passing the job's `monthly_limit` so monthly
+  decrement is gated correctly — see I5).
+
+### Logging
+
+Structured events via `utils/logger.js`. Never log:
+- Client secrets (even partial)
+- Full access tokens (prefix OK for debugging: `token.slice(0, 12) + '…'`)
+- Full identifier lists (use counts instead: `{total: 123456}`)
+
+### Testing
+
+- Unit tests in `test/*.test.js` using `node --test` and `nock` for mocking.
+- Live smoke test at `test/smoke.live.js` — requires real creds via env
+  vars. Gated by `SMOKE_SUBMIT=1` so nobody runs a real deletion by mistake.
+- When you change payload-building code (hygiene.js, identityGraph.js,
+  namespaces.js), add or update a test.
+
+---
+
+## Build/run/test commands
+
+```bash
+npm install        # compiles better-sqlite3 native binding
+npm start          # runs src/index.js, opens browser
+npm run dev        # auto-restart on file changes
+npm test           # integration tests (mocked Adobe)
+
+# Reset all state (deletes creds + jobs + encryption key):
+rm -rf data/
+```
+
+---
+
+## Current known limitations
+
+These are deliberate trade-offs, not bugs. If you "fix" them, check with
+the maintainer first — they may actually be intended.
+
+- **Single-process.** No distributed coordination. Running two instances
+  against the same `data/state.db` will corrupt the WAL. If a user needs
+  concurrency, they run multiple sandboxes in one instance.
+- **In-memory token cache.** Tokens don't survive a restart. This is fine
+  — refresh takes ~300 ms and happens automatically.
+- **No user auth on the local web UI.** Server binds to `127.0.0.1` by
+  default (see I12 / `config.host`); the UI trusts whoever reaches the
+  loopback socket. Setting `HOST=0.0.0.0` exposes the unauthenticated
+  destructive API to the LAN — only do so for SSH-tunneled demos and
+  add real auth before that, never for production use.
+- **Source CSV rows must be one identifier per column.** Multi-identifier
+  rows (e.g. CSV with both kocid and email) aren't supported yet. The
+  `streamIds` util reads a single column.
+- **Single source namespace per job.** All rows in the CSV are treated as
+  belonging to whichever namespace the user picks in the Upload-tab dropdown
+  (defaults to `hashedKocid` if it exists in the sandbox's registry). If you
+  need mixed-namespace sources, split the CSV per namespace and run separate
+  jobs. The backend also auto-resolves the numeric `nsid` from the namespace
+  registry when the UI sends only a code, so custom namespaces work reliably.
+- **Monitor polls every 60s.** No webhook support — Adobe doesn't emit
+  webhooks for work-order status, so polling is the only option. The
+  interval is the `POLL_INTERVAL_MS` constant at the top of
+  `runner/monitor.js` (not env-configurable today). Edit there if you
+  want a different cadence.
+
+---
+
+## Things a future change might need
+
+These are NOT yet implemented but are worth flagging if the user asks:
+
+1. **Namespace-qualifier strictness from the /workorder.** If a dataset
+   stores both primary and secondary identities, Adobe only matches on
+   the schema's primary identity. Failing rows are silently skipped. We
+   could pre-check schema primaries via the XDM API and warn.
+2. **Multi-file upload.** Currently one CSV per job. A "batch import" of
+   a folder would help ops running many deletions per day.
+3. **Audit export.** We have `api_audit` in the schema but no write path
+   yet. If the client needs SOC-style audit logs, wire logging in
+   `adobeClient.js` to insert one row per Adobe call.
+4. **Implement the recovery list-without-filter fallback.** When Adobe's
+   `GET /hygiene/workorder?displayName=…` returns 400, the recovery
+   path currently leaves the orphan in `submitting` (safer than rolling
+   back, since rolling back risks duplicates). The originally documented
+   fallback was to list recent orders without the filter and match
+   client-side. Add it if Adobe ever breaks the displayName filter for
+   real and we need automated recovery rather than operator triage.
+
+**Already done (don't ask again):**
+- Resume a job across restarts — `runner/recovery.js::resumeExpandingJobs`
+  rebuilds `expanded_identities` source-ID set and resumes via
+  `runExpansion(... skipSourceIds)`. Tests in `test/recovery.test.js`.
+
+---
+
+## Adobe endpoints cheat sheet
+
+Full details in `docs/REVIEW.md`. Quick reference:
+
+| Method | URL                                                                   | Purpose                               |
+|--------|-----------------------------------------------------------------------|---------------------------------------|
+| POST   | `/ims/token/v3`                                                       | IMS access token (client_credentials) |
+| GET    | `/data/foundation/sandbox-management/`                                | List sandboxes                        |
+| GET    | `/data/foundation/catalog/dataSets`                                   | List datasets (filter by tags)        |
+| GET    | `/data/core/idnamespace/identities`                                   | List identity namespaces              |
+| POST   | `/data/core/identity/clusters/members`                                | Expand cluster (region-scoped host)   |
+| POST   | `/data/core/hygiene/workorder`                                        | Create record-delete work order       |
+| GET    | `/data/core/hygiene/workorder/{id}`                                   | Poll work-order status                |
+
+Host: `https://platform.adobe.io` for everything **except** Identity APIs,
+which require `https://platform-{region}.adobe.io` (region ∈ `va7`, `nld2`,
+`aus5`, `can2`).
+
+---
+
+## If Claude is asked to modify this project
+
+1. **Read `docs/ARCHITECTURE.md` first.** It's the living system overview —
+   module map, data flow, Adobe contracts, schema. Agents should orient here
+   before touching any code.
+2. **Read the latest entries in `docs/CHANGELOG.md`.** Recent changes often
+   answer "why is it this way?" before you propose reverting them.
+3. **Read `docs/REVIEW.md`** if your change touches any Adobe payload.
+4. Find the relevant invariant above. If your change would break it, say so
+   to the user before proceeding.
+5. When in doubt, prefer **rejection at validation time** over relying on
+   Adobe's response. Adobe's error messages can be cryptic and a 400 still
+   costs a round-trip.
+6. Never add telemetry, analytics, or outbound calls beyond the documented
+   Adobe endpoints.
+7. Run `node --test test` before suggesting a change is done. **95 tests
+   should pass** (as of the 2026-04-26 review remediation).
+8. **After your change**, append a bullet to the current session in
+   `docs/CHANGELOG.md` describing what + why. If you changed the module map,
+   data flow, Adobe contract, or DB schema, also update `docs/ARCHITECTURE.md`.
+   If you changed an invariant, update this file.

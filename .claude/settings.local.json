@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node --test test)",
+      "Bash(node --check src/web/app.js)",
+      "WebFetch(domain:cdn.experience.adobe.net)",
+      "Bash(curl -sSf \"https://cdn.experience.adobe.net/assets/HeroIcons.6620f5dc.svg\" -o \"C:/Users/tushark/OneDrive - Adobe/Documents/Utility_Applications/aep-lifecycle-helper/aep-lifecycle-helper/src/web/aep-icons.svg\")",
+      "Bash(node --check src/db.js)",
+      "Bash(node --check src/utils/crypto.js)",
+      "Bash(node --check src/routes/config.js)",
+      "Bash(node --test test/adobeClient.test.js)",
+      "WebFetch(domain:developer.adobe.com)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:adobedocs.github.io)",
+      "Bash(node --test test/region.test.js)",
+      "Bash(node --check src/runner/submission.js)",
+      "Bash(node --check src/routes/jobs.js)",
+      "Bash(node --test test/planWorkOrders.test.js)",
+      "Bash(node --test test/deferred.test.js)",
+      "Bash(node --test test/quotaManager.test.js)",
+      "Bash(node --test test/recovery.test.js)"
+    ]
+  }
+}

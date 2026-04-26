@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>AEP Data Lifecycle Helper</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <!-- ─── Top bar (AEP dark) ─────────────────────────────────── -->
+  <header class="topbar">
+    <div class="brand">
+      <img class="brand-mark" src="/aep-icon.svg" alt="Adobe Experience Platform">
+      <div>Adobe Experience Platform</div>
+    </div>
+    <div class="spacer"></div>
+    <div class="client-name" id="client-name" hidden></div>
+    <div class="env-chip" id="env-chip">
+      <span class="dot"></span>
+      <span id="env-label">Not configured</span>
+    </div>
+    <div class="auth-chip" id="auth-chip" hidden>
+      <span class="dot green"></span> Authenticated
+    </div>
+    <div class="avatar" id="user-avatar" title="Local tool — no user account. Initials reflect the configured client name.">DE</div>
+  </header>
+
+  <div class="layout">
+    <!-- ─── Sidebar ──────────────────────────────────────────── -->
+    <aside class="sidebar">
+      <div class="app-head">
+        <div class="app-icon"></div>
+        <div>
+          <div class="app-name">Record Delete</div>
+          <div class="app-sub">Bulk Lifecycle Tool</div>
+        </div>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-label">DATA MANAGEMENT</div>
+        <button class="nav-item" data-step="config"><span class="ico">⚙</span>Environment</button>
+        <button class="nav-item" data-step="upload"><span class="ico">↑</span>Source CSV</button>
+      </div>
+      <div class="nav-group">
+        <div class="nav-label">IDENTITIES</div>
+        <button class="nav-item" data-step="expand"><span class="ico">◎</span>Expansion</button>
+        <button class="nav-item" data-step="plan"><span class="ico">▤</span>Batch Planning</button>
+      </div>
+      <div class="nav-group">
+        <div class="nav-label">DATA LIFECYCLE</div>
+        <button class="nav-item" data-step="submit"><span class="ico">↗</span>Submit</button>
+        <button class="nav-item" data-step="monitor"><span class="ico">◈</span>Monitor</button>
+      </div>
+    </aside>
+
+    <!-- ─── Main content ─────────────────────────────────────── -->
+    <main class="main">
+      <div class="crumbs" id="crumbs"></div>
+      <h1 id="page-title"></h1>
+      <p class="page-sub" id="page-sub"></p>
+
+      <div class="view" id="view"></div>
+    </main>
+  </div>
+
+  <!-- Templates -->
+  <template id="tpl-config">
+    <div class="grid-2">
+      <div class="card">
+        <div class="section">
+          <div class="section-head">Credentials</div>
+          <div class="section-sub">IMS Server-to-Server OAuth (client_credentials grant)</div>
+        </div>
+        <div class="fields">
+          <label class="f"><span>Client name</span>
+            <input id="c-client-name" placeholder="e.g. Coca-Cola — shown in the top bar and avatar">
+          </label>
+          <div class="f-row-2">
+            <label class="f"><span>Label*</span>
+              <input id="c-label" placeholder="Production creds"></label>
+            <label class="f"><span>Environment*</span>
+              <select id="c-environment">
+                <option>Production</option><option>Stage</option><option>Development</option>
+              </select></label>
+          </div>
+          <div class="f-row-2">
+            <label class="f"><span>Region*</span>
+              <select id="c-region">
+                <option value="va7">VA7 (Virginia)</option>
+                <option value="nld2">NLD2 (Netherlands)</option>
+                <option value="aus5">AUS5 (Australia)</option>
+                <option value="can2">CAN2 (Canada)</option>
+              </select></label>
+            <label class="f"><span>IMS Organization ID*</span>
+              <input id="c-ims-org" placeholder="9C1F2AC143214567890ABCDE@AdobeOrg"></label>
+          </div>
+          <label class="f"><span>Client ID (API Key)*</span>
+            <input id="c-client-id" placeholder="abc123def456..."></label>
+          <label class="f"><span>Client Secret*</span>
+            <div class="secret-wrap">
+              <input id="c-client-secret" type="password" placeholder="••••••••">
+              <button class="secret-toggle" id="toggle-secret">show</button>
+            </div></label>
+        </div>
+
+        <div class="section">
+          <div class="section-head">Sandbox & datasets</div>
+          <div class="section-sub">Pulled dynamically from Adobe after authentication</div>
+        </div>
+        <div class="fields">
+          <label class="f"><span>Sandbox*</span>
+            <div style="display:flex; gap:8px">
+              <select id="c-sandbox-picker" style="flex:1" disabled>
+                <option value="">Test connection first to load sandboxes…</option>
+              </select>
+              <button class="btn btn-secondary" id="btn-refresh-sandboxes" disabled title="Refresh from Adobe">↻</button>
+            </div>
+          </label>
+
+          <label class="f"><span>Deletion mode</span>
+            <select id="c-delete-mode">
+              <option value="datasets">Delete from specific datasets (data lake + profile)</option>
+              <option value="all">Delete from ALL datasets</option>
+              <option value="profile-only">Profile-only (identity + profile + AJO; leaves data lake intact)</option>
+            </select>
+          </label>
+
+          <div id="dataset-picker-wrap" class="f" hidden>
+            <span>Datasets*
+              <span style="font-weight: 400; color: var(--g600); margin-left: 4px">
+                (only Identity-enabled datasets are shown)
+              </span>
+            </span>
+            <div id="dataset-picker-status" style="font-size: 11.5px; color: var(--g600); margin-bottom: 4px">
+              Select a sandbox first
+            </div>
+            <div id="dataset-picker" style="max-height: 220px; overflow: auto; border: 1px solid var(--g300); border-radius: 4px; padding: 4px; display: none"></div>
+            <div style="display: flex; align-items: center; gap: 8px; margin-top: 6px">
+              <button class="btn btn-secondary" id="btn-refresh-datasets" style="padding: 4px 10px; font-size: 11.5px" hidden>↻ Refresh from Adobe</button>
+              <span id="dataset-selection-count" style="font-size: 11.5px; color: var(--g600)"></span>
+            </div>
+          </div>
+
+          <div class="f-row-2">
+            <label class="f"><span>Daily identifier cap</span>
+              <input id="c-daily" type="number" value="1000000"></label>
+            <label class="f"><span>Monthly identifier cap
+              <span style="font-weight:400; color:var(--g600); margin-left:4px">
+                contract-dependent; 0 = unlimited
+              </span></span>
+              <input id="c-monthly" type="number" value="3000000"></label>
+          </div>
+        </div>
+
+        <div class="actions">
+          <button class="btn btn-secondary" id="btn-test"><span class="ico">⚡</span>Test Connection</button>
+          <div class="spacer"></div>
+          <button class="btn btn-primary" id="btn-save-creds" disabled>Save & Continue →</button>
+        </div>
+        <div class="alert-slot" id="cfg-alert"></div>
+      </div>
+
+      <div>
+        <div class="panel">
+          <div class="panel-title">About</div>
+          <p>Resolves <code>hashedKocid</code> identifiers to their full Identity Graph clusters, then submits
+            record-delete work orders up to <b>1,000,000 identifiers/day</b>.</p>
+          <p>Credentials are encrypted at rest with AES-256-GCM. The encryption key lives at
+            <code>data/.key</code> (auto-generated on first run; keep it out of git).</p>
+        </div>
+        <div class="panel">
+          <div class="panel-title">APIs used</div>
+          <div class="api-row"><span class="method post">POST</span><code>/ims/token/v3</code></div>
+          <div class="api-desc">Access token (cached in-memory)</div>
+          <div class="api-row"><span class="method post">POST</span><code>/identity/clusters/members</code></div>
+          <div class="api-desc">Cluster expansion, batch 1000</div>
+          <div class="api-row"><span class="method post">POST</span><code>/hygiene/workorder</code></div>
+          <div class="api-desc">Create record-delete work order</div>
+          <div class="api-row"><span class="method get">GET</span><code>/hygiene/workorder/{id}</code></div>
+          <div class="api-desc">Status poll</div>
+        </div>
+
+        <div class="panel" id="saved-creds-panel" hidden>
+          <div class="panel-title">Saved Credentials</div>
+          <div id="saved-creds-list"></div>
+        </div>
+      </div>
+    </div>
+  </template>
+
+  <template id="tpl-upload">
+    <div class="grid-2">
+      <div class="card">
+        <div class="section">
+          <div class="section-head">CSV Upload</div>
+          <div class="section-sub">Single-column CSV — one identifier per line, no header.</div>
+        </div>
+        <label class="f">
+          <span>Source namespace*
+            <span style="font-weight:400; color:var(--g600); margin-left:4px">
+              what kind of identifiers are in the CSV
+            </span>
+          </span>
+          <div style="display:flex; gap:8px">
+            <select id="c-source-ns" style="flex:1" disabled>
+              <option value="">Pick a sandbox first to load namespaces…</option>
+            </select>
+            <button class="btn btn-secondary" id="btn-refresh-namespaces" disabled title="Refresh from Adobe">↻</button>
+          </div>
+        </label>
+        <label class="dropzone" id="dz" style="margin-top:12px">
+          <input id="file-input" type="file" accept=".csv,.txt,.tsv" hidden>
+          <div class="dz-ico">↑</div>
+          <div class="dz-title">Drop CSV here or click to browse</div>
+          <div class="dz-sub">Up to 4 GB · UTF-8 · streamed to disk (never loaded into memory)</div>
+        </label>
+        <div id="upload-info" hidden></div>
+        <div class="actions">
+          <button class="btn btn-secondary" data-goto="config">← Back</button>
+          <div class="spacer"></div>
+          <button class="btn btn-primary" id="btn-start-expand" disabled>
+            Start Identity Expansion →
+          </button>
+        </div>
+      </div>
+      <div>
+        <div class="panel">
+          <div class="panel-title">Why expansion?</div>
+          <p>A <code>hashedKocid</code> is only <i>one</i> identity node. Deleting it alone leaves the
+            profile intact via other linked namespaces (email, phone, ECID, CRMID).
+            Full deletion requires resolving the <b>identity cluster</b>.</p>
+        </div>
+      </div>
+    </div>
+  </template>
+
+  <template id="tpl-expand">
+    <div class="grid-2">
+      <div class="card">
+        <div class="section">
+          <div class="section-head">Expand Identity Clusters</div>
+          <div class="section-sub">Batches of 1000 to <code>/identity/clusters/members</code></div>
+        </div>
+        <div id="expand-body"></div>
+        <div class="actions">
+          <button class="btn btn-secondary" data-goto="upload">← Back</button>
+          <div class="spacer"></div>
+          <button class="btn btn-secondary" id="btn-export-csv" hidden>Export CSV</button>
+          <button class="btn btn-primary" id="btn-goto-plan" hidden>Plan Work Orders →</button>
+        </div>
+      </div>
+      <div>
+        <div class="panel">
+          <div class="panel-title">How it works</div>
+          <ol style="padding-left: 18px; margin: 0">
+            <li>Stream source IDs from disk</li>
+            <li>Chunk into 1000-ID batches</li>
+            <li>POST each batch in parallel (concurrency 10)</li>
+            <li>Dedup + insert to SQLite</li>
+          </ol>
+        </div>
+        <div class="panel">
+          <div class="panel-title">Throughput</div>
+          <div class="metric"><span>Concurrency</span><b>10</b></div>
+          <div class="metric"><span>Batch size</span><b>1,000</b></div>
+          <div class="metric"><span>Target</span><b>~10k IDs/sec</b></div>
+        </div>
+      </div>
+    </div>
+  </template>
+
+  <template id="tpl-plan">
+    <div class="grid-2">
+      <div class="card">
+        <div class="section">
+          <div class="section-head">Work Order Plan</div>
+          <div class="section-sub">Server packs identities into ≤100k-ID work orders grouped by namespace</div>
+        </div>
+        <div id="plan-body"></div>
+        <div class="actions">
+          <button class="btn btn-secondary" data-goto="expand">← Back</button>
+          <div class="spacer"></div>
+          <button class="btn btn-primary" id="btn-goto-submit" hidden>Proceed to Submission →</button>
+        </div>
+      </div>
+      <div>
+        <div class="panel">
+          <div class="panel-title">Strategy</div>
+          <p>Work orders are grouped by namespace and day-assigned so the submission respects the
+            <b>daily identifier cap</b> (default 1M/day).</p>
+          <p>If the job spans multiple days, re-run submission each UTC day.</p>
+        </div>
+      </div>
+    </div>
+  </template>
+
+  <template id="tpl-submit">
+    <div class="grid-2">
+      <div class="card">
+        <div class="section">
+          <div class="section-head">Submission Control</div>
+          <div class="section-sub">Submits planned work orders to <code>/hygiene/workorder</code></div>
+        </div>
+        <div id="submit-body"></div>
+        <div class="actions">
+          <button class="btn btn-secondary" data-goto="plan">← Back</button>
+          <div class="spacer"></div>
+          <button class="btn btn-primary" id="btn-submit-day">Submit Day 1</button>
+          <button class="btn btn-secondary" id="btn-goto-monitor" hidden>Monitor →</button>
+        </div>
+      </div>
+      <div>
+        <div class="panel">
+          <div class="panel-title">Quota</div>
+          <div id="quota-display">—</div>
+        </div>
+        <div class="panel">
+          <div class="panel-title">Activity log</div>
+          <div class="log" id="activity-log"></div>
+        </div>
+      </div>
+    </div>
+  </template>
+
+  <template id="tpl-monitor">
+    <div>
+      <div class="card" style="margin-bottom: 20px" id="monitor-picker-card" hidden>
+        <div class="job-picker">
+          <label class="f" style="flex: 1">
+            <span>Recent jobs</span>
+            <select id="monitor-job-picker"></select>
+          </label>
+          <div class="job-picker-meta" id="monitor-job-meta"></div>
+        </div>
+      </div>
+      <div id="monitor-empty" class="empty-state" hidden>
+        <div class="big-icon">!</div>
+        <div>No jobs found. Upload a CSV to get started.</div>
+      </div>
+      <div id="monitor-content">
+        <div class="stat-grid" id="stage-stats"></div>
+        <div class="grid-2" style="margin-top: 24px">
+          <div class="card">
+            <div class="section">
+              <div class="section-head">Work Order Pipeline</div>
+              <div class="section-sub">Polled from Adobe every 60s by background monitor</div>
+            </div>
+              <div id="monitor-table"></div>
+          </div>
+          <div>
+            <div class="panel">
+              <div class="panel-title">Processing SLA</div>
+              <p><b>Without Shield:</b><br>Queue up to 15 days · Max 30 days</p>
+              <p><b>With Privacy Shield:</b><br>Queue ~24h · Max 15 days</p>
+            </div>
+            <div class="panel">
+              <div class="panel-title">Downstream services</div>
+              <span class="chip">Data Lake</span>
+              <span class="chip">Identity</span>
+              <span class="chip">Real-Time Profile</span>
+              <span class="chip">AJO</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </template>
+
+  <script src="/app.js"></script>
+</body>
+</html>

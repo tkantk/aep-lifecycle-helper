@@ -1,0 +1,28 @@
+{
+  "name": "aep-lifecycle-helper",
+  "version": "1.0.0",
+  "description": "Local helper for bulk identity deletion via Adobe Experience Platform Data Lifecycle API",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "test": "node --test test"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "better-sqlite3": "^11.0.0",
+    "axios": "^1.7.2",
+    "axios-retry": "^4.3.0",
+    "multer": "^1.4.5-lts.1",
+    "fast-csv": "^5.0.1",
+    "p-limit": "^5.0.0",
+    "uuid": "^9.0.1",
+    "open": "^10.1.0",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "nock": "^13.5.4"
+  },
+  "engines": { "node": ">=20.0.0" }
+}
