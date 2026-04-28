@@ -412,15 +412,17 @@ relies on the loopback-only socket (CLAUDE.md I12).
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| POST | `/api/config/credentials` | Store or update creds (encrypted) |
-| GET  | `/api/config/credentials` | List stored creds (no secrets) |
+| POST | `/api/config/credentials` | Store or upsert creds (encrypts secret at rest, keyed on (env, ims_org, client_id)) |
+| GET  | `/api/config/credentials` | List stored creds (no secrets in response) |
+| PATCH | `/api/config/credentials/:id` | Update label / client_name / region only — never touches the encrypted secret or identity fields. Returns 404 if id not found, 400 if label missing |
 | POST | `/api/config/credentials/test` | IMS auth check via stored id or inline creds |
-| DELETE | `/api/config/credentials/:id` | Remove creds |
+| DELETE | `/api/config/credentials/:id` | Remove creds. Returns **409** with `{error: 'credential_in_use', jobCount}` when any row in `jobs` references this credential — protects status polling and recovery from being orphaned |
 | GET  | `/api/adobe/:credsId/sandboxes` | Live list of sandboxes |
 | GET  | `/api/adobe/:credsId/sandboxes/:sandbox/datasets?refresh=1&identityOnly=1` | Datasets filtered to Identity-enabled |
 | GET  | `/api/adobe/:credsId/sandboxes/:sandbox/namespaces?refresh=1` | Namespace registry |
 | POST | `/api/upload` (multipart) | Create job + start expansion |
-| GET  | `/api/jobs` | List jobs |
+| GET  | `/api/jobs` | List jobs by `created_at DESC` (every status, every sandbox) |
+| GET  | `/api/jobs/monitor?limit&search&sandbox` | Active-submissions feed: jobs with ≥1 Adobe-acked work order. **In-flight-first sort** (recently-completed jobs never push pending work off-screen) then by latest WO activity. Returns `{ rows, totals, sandboxes }` — rows are limit-capped; totals (`in_flight` / `has_failed` / `all_completed` / `total`) span ALL matching jobs; sandboxes is the distinct sandbox list with counts for the filter chip row. Optional `?search` (case-insensitive name LIKE) and `?sandbox` (exact match). |
 | GET  | `/api/jobs/:id` | Job detail + namespace breakdown + quota |
 | GET  | `/api/jobs/:id/progress` | Live expansion progress (fast path) |
 | POST | `/api/jobs/:id/plan` | Build work-order plan |

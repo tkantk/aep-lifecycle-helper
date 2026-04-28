@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>AEP Data Lifecycle Helper</title>
+  <link rel="icon" type="image/svg+xml" href="/aep-icon.svg">
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
@@ -55,9 +56,11 @@
 
     <!-- ─── Main content ─────────────────────────────────────── -->
     <main class="main">
-      <div class="crumbs" id="crumbs"></div>
-      <h1 id="page-title"></h1>
-      <p class="page-sub" id="page-sub"></p>
+      <div class="page-header">
+        <div class="crumbs" id="crumbs"></div>
+        <h1 id="page-title"></h1>
+        <p class="page-sub" id="page-sub"></p>
+      </div>
 
       <div class="view" id="view"></div>
     </main>
@@ -67,6 +70,18 @@
   <template id="tpl-config">
     <div class="grid-2">
       <div class="card">
+        <!-- Active-credential picker bar -->
+        <div class="cred-picker" id="cred-picker-bar" hidden>
+          <label class="f" style="flex:1; min-width:0">
+            <span>Active credential</span>
+            <select id="cred-picker"></select>
+          </label>
+          <div class="cred-picker-actions">
+            <button class="btn btn-secondary" id="btn-cred-add" type="button">+ Add new</button>
+            <button class="btn btn-secondary" id="btn-cred-remove" type="button" title="Remove this saved credential">⊗ Remove</button>
+          </div>
+        </div>
+
         <div class="section">
           <div class="section-head">Credentials</div>
           <div class="section-sub">IMS Server-to-Server OAuth (client_credentials grant)</div>
@@ -101,6 +116,10 @@
               <input id="c-client-secret" type="password" placeholder="••••••••">
               <button class="secret-toggle" id="toggle-secret">show</button>
             </div></label>
+          <div class="identity-lock-row" id="identity-lock-row" hidden>
+            <span>Identity fields (Environment, IMS Org, Client ID) locked. Editing them creates a new credential.</span>
+            <button type="button" class="link-btn" id="btn-edit-identity">✏ Edit identity fields</button>
+          </div>
         </div>
 
         <div class="section">
@@ -126,10 +145,9 @@
           </label>
 
           <div id="dataset-picker-wrap" class="f" hidden>
-            <span>Datasets*
-              <span style="font-weight: 400; color: var(--g600); margin-left: 4px">
-                (only Identity-enabled datasets are shown)
-              </span>
+            <span>Datasets*</span>
+            <span class="f-hint" style="margin-top:0; margin-bottom:4px">
+              Only Identity-enabled datasets are shown.
             </span>
             <div id="dataset-picker-status" style="font-size: 11.5px; color: var(--g600); margin-bottom: 4px">
               Select a sandbox first
@@ -142,13 +160,16 @@
           </div>
 
           <div class="f-row-2">
-            <label class="f"><span>Daily identifier cap</span>
-              <input id="c-daily" type="number" value="1000000"></label>
-            <label class="f"><span>Monthly identifier cap
-              <span style="font-weight:400; color:var(--g600); margin-left:4px">
-                contract-dependent; 0 = unlimited
-              </span></span>
-              <input id="c-monthly" type="number" value="3000000"></label>
+            <label class="f">
+              <span>Daily identifier cap</span>
+              <input id="c-daily" type="number" value="1000000">
+              <span class="f-hint">Adobe default: 1,000,000 / day</span>
+            </label>
+            <label class="f">
+              <span>Monthly identifier cap</span>
+              <input id="c-monthly" type="number" value="3000000">
+              <span class="f-hint">Contract-dependent · 0 = unlimited</span>
+            </label>
           </div>
         </div>
 
@@ -180,10 +201,6 @@
           <div class="api-desc">Status poll</div>
         </div>
 
-        <div class="panel" id="saved-creds-panel" hidden>
-          <div class="panel-title">Saved Credentials</div>
-          <div id="saved-creds-list"></div>
-        </div>
       </div>
     </div>
   </template>
@@ -196,17 +213,14 @@
           <div class="section-sub">Single-column CSV — one identifier per line, no header.</div>
         </div>
         <label class="f">
-          <span>Source namespace*
-            <span style="font-weight:400; color:var(--g600); margin-left:4px">
-              what kind of identifiers are in the CSV
-            </span>
-          </span>
+          <span>Source namespace*</span>
           <div style="display:flex; gap:8px">
             <select id="c-source-ns" style="flex:1" disabled>
               <option value="">Pick a sandbox first to load namespaces…</option>
             </select>
             <button class="btn btn-secondary" id="btn-refresh-namespaces" disabled title="Refresh from Adobe">↻</button>
           </div>
+          <span class="f-hint">What kind of identifiers are in the CSV.</span>
         </label>
         <label class="dropzone" id="dz" style="margin-top:12px">
           <input id="file-input" type="file" accept=".csv,.txt,.tsv" hidden>
@@ -324,26 +338,40 @@
 
   <template id="tpl-monitor">
     <div>
-      <div class="card" style="margin-bottom: 20px" id="monitor-picker-card" hidden>
-        <div class="job-picker">
-          <label class="f" style="flex: 1">
-            <span>Recent jobs</span>
-            <select id="monitor-job-picker"></select>
-          </label>
-          <div class="job-picker-meta" id="monitor-job-meta"></div>
+      <!-- Active submissions dashboard. Lists jobs that have at least one
+           Adobe-acked work order, sorted by latest Adobe activity (NOT job
+           creation time) so in-flight deletions surface first regardless of
+           how many other jobs have been uploaded since. Search input lives
+           in the same card so older jobs can be found by name. -->
+      <div class="card" id="monitor-dashboard" style="margin-bottom: 20px">
+        <div class="dashboard-head">
+          <div>
+            <div class="section-head">Active submissions</div>
+            <div class="section-sub" id="monitor-summary">Loading…</div>
+            <div class="dashboard-totals" id="monitor-totals"></div>
+          </div>
+          <input type="search" id="monitor-search" placeholder="🔍 Search by name…" autocomplete="off">
         </div>
+        <div class="dashboard-sandbox-filter" id="monitor-sandbox-filter"></div>
+        <div id="monitor-list"></div>
       </div>
+
       <div id="monitor-empty" class="empty-state" hidden>
         <div class="big-icon">!</div>
-        <div>No jobs found. Upload a CSV to get started.</div>
+        <div>No submitted jobs to monitor yet.<br>Upload a CSV and run Submit to start tracking deletions here.</div>
       </div>
-      <div id="monitor-content">
+
+      <div id="monitor-content" hidden>
+        <div class="section-divider">
+          <div class="section-head" id="monitor-detail-title">Work order pipeline</div>
+          <div class="section-sub" id="monitor-detail-sub">Polled from Adobe every 60s by background monitor</div>
+        </div>
         <div class="stat-grid" id="stage-stats"></div>
         <div class="grid-2" style="margin-top: 24px">
           <div class="card">
             <div class="section">
               <div class="section-head">Work Order Pipeline</div>
-              <div class="section-sub">Polled from Adobe every 60s by background monitor</div>
+              <div class="section-sub">Per-work-order Adobe status</div>
             </div>
               <div id="monitor-table"></div>
           </div>

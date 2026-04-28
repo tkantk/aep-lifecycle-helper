@@ -122,9 +122,14 @@ a:hover { text-decoration: underline; }
   background: linear-gradient(135deg, var(--blue600), var(--purple500));
   position: relative;
 }
+/* Render Adobe's official Data Cleansing icon (data-cleansing-icon.svg)
+   inside the gradient tile. CSS mask lets us recolor the SVG to white
+   while keeping the gradient as the visible background. */
 .app-icon::after {
-  content: '⌫'; position: absolute; inset: 0; display: flex;
-  align-items: center; justify-content: center; color: white; font-size: 14px;
+  content: ''; position: absolute; inset: 0;
+  background-color: white;
+  -webkit-mask: url('/data-cleansing-icon.svg') center / 18px 18px no-repeat;
+          mask: url('/data-cleansing-icon.svg') center / 18px 18px no-repeat;
 }
 .app-name { font-weight: 600; font-size: 13px; }
 .app-sub  { font-size: 11px; color: var(--g600); }
@@ -150,17 +155,31 @@ a:hover { text-decoration: underline; }
 
 /* ─── Main ────────────────────────────────────────────────── */
 .main { flex: 1; padding: 24px 32px; max-width: 1400px; }
+/* Subtle AEP-style pastel gradient behind the page header only.
+   Cards below stay on the neutral gray content background, so the gradient
+   feels like polish on the title strip without bleeding into working areas
+   (forms, tables) where it would compete with content. */
+.page-header {
+  margin: -24px -32px 24px;          /* extend to the .main padding edges */
+  padding: 24px 32px;
+  background: linear-gradient(
+    135deg,
+    rgba(146, 86, 217, 0.08),        /* Spectrum purple-500 at 8% */
+    rgba(255, 200, 170, 0.10)        /* soft peach at 10% */
+  );
+  border-bottom: 1px solid var(--g100);
+}
 .crumbs {
   display: flex; align-items: center; gap: 6px;
   font-size: 12px; color: var(--g600); margin-bottom: 4px;
 }
 .crumbs .sep { color: var(--g400); }
 .crumbs .current { color: var(--g900); }
-.main h1 {
+.page-header h1 {
   font-size: 26px; font-weight: 700; margin: 8px 0 4px;
   letter-spacing: -0.3px;
 }
-.page-sub { font-size: 13.5px; color: var(--g600); margin: 0 0 24px; }
+.page-sub { font-size: 13.5px; color: var(--g600); margin: 0; }
 
 /* ─── Card ────────────────────────────────────────────────── */
 .card {
@@ -195,7 +214,12 @@ a:hover { text-decoration: underline; }
   transition: border-color 0.15s;
 }
 .f input:focus, .f select:focus { border-color: var(--blue600); }
-.f-row-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.f-hint {
+  font-size: 11.5px; color: var(--g600); margin-top: 4px; line-height: 1.4;
+}
+/* Align inputs at the bottom so label-text wrapping (e.g., long help text on
+   one column) never offsets the input boxes from each other. */
+.f-row-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: end; }
 
 .secret-wrap { position: relative; }
 .secret-wrap input { width: 100%; padding-right: 52px; }
@@ -307,12 +331,14 @@ a:hover { text-decoration: underline; }
 .alert.success { background: rgba(45,157,120,0.08); border-color: var(--green500); }
 .alert.error   { background: rgba(227,72,80,0.08);  border-color: var(--red500); }
 .alert.info    { background: rgba(38,128,235,0.08); border-color: var(--blue500); }
+.alert.warning { background: rgba(230,134,25,0.08); border-color: var(--orange500); }
 .alert-title {
   font-weight: 600; margin-bottom: 2px;
 }
 .alert.success .alert-title { color: var(--green600); }
 .alert.error   .alert-title { color: var(--red600); }
 .alert.info    .alert-title { color: var(--blue700); }
+.alert.warning .alert-title { color: var(--orange500); }
 
 /* ─── Progress ────────────────────────────────────────────── */
 .progress-head {
@@ -449,7 +475,141 @@ td.num  { font-variant-numeric: tabular-nums; font-weight: 500; }
   padding: 2px 8px; font-size: 11px; cursor: pointer;
 }
 
-/* ─── Monitor job picker ──────────────────────────────────── */
+/* ─── Active-credential picker (top of Config card) ──────── */
+.cred-picker {
+  display: flex; align-items: flex-end; gap: 12px;
+  padding-bottom: 16px; margin-bottom: 16px;
+  border-bottom: 1px solid var(--g100);
+}
+.cred-picker-actions {
+  display: flex; gap: 6px; padding-bottom: 1px;
+}
+.cred-picker-actions .btn {
+  padding: 6px 12px; font-size: 12.5px;
+}
+
+/* ─── Identity-fields lock indicator ───────────────────── */
+.identity-lock-row {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; margin-top: 8px; padding: 8px 10px;
+  background: var(--g50); border: 1px dashed var(--g300); border-radius: 4px;
+  font-size: 11.5px; color: var(--g700);
+}
+.link-btn {
+  background: transparent; border: none; padding: 0;
+  color: var(--blue600); font-weight: 600; font-size: 11.5px;
+  cursor: pointer;
+}
+.link-btn:hover { text-decoration: underline; }
+input[readonly], select[disabled].locked,
+input.locked, select.locked {
+  background: var(--g50); color: var(--g700); cursor: not-allowed;
+}
+
+/* ─── Monitor: Active Submissions dashboard ─────────────── */
+.dashboard-head {
+  display: flex; align-items: flex-end; justify-content: space-between;
+  gap: 16px; margin-bottom: 14px;
+}
+.dashboard-totals {
+  display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px;
+}
+.dash-chip {
+  font-size: 11.5px; font-weight: 600;
+  padding: 2px 9px; border-radius: 3px;
+}
+.dash-chip.in-flight { background: rgba(20,115,230,0.12); color: var(--blue700); }
+.dash-chip.completed { background: rgba(45,157,120,0.15); color: var(--green600); }
+.dash-chip.failed    { background: rgba(227,72,80,0.12);  color: var(--red600); }
+
+.dashboard-sandbox-filter {
+  display: flex; flex-wrap: wrap; gap: 6px;
+  margin-bottom: 14px;
+}
+.dashboard-sandbox-filter:empty { display: none; }
+.dash-filter-chip {
+  font-size: 12px; font-weight: 500;
+  padding: 5px 12px; border-radius: var(--radius-pill);
+  background: white; color: var(--g700);
+  border: 1px solid var(--g300);
+  cursor: pointer;
+  transition: background-color 0.15s, border-color 0.15s;
+}
+.dash-filter-chip:hover { background: var(--g50); border-color: var(--g400); }
+.dash-filter-chip.active {
+  background: var(--blue600); color: white; border-color: var(--blue600);
+}
+.dash-filter-chip.active:hover { background: var(--blue700); border-color: var(--blue700); }
+.dashboard-head input[type="search"] {
+  padding: 7px 10px; font-size: 13px;
+  border: 1px solid var(--g300); border-radius: var(--radius);
+  outline: none; min-width: 240px; background: white;
+}
+.dashboard-head input[type="search"]:focus { border-color: var(--blue600); }
+
+#monitor-list {
+  display: flex; flex-direction: column; gap: 8px;
+}
+.sub-card {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 6px 16px;
+  padding: 12px 14px;
+  border: 1px solid var(--g200); border-radius: 6px;
+  background: white;
+  cursor: pointer;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.sub-card:hover {
+  border-color: var(--blue500);
+  box-shadow: 0 1px 6px rgba(38,128,235,0.08);
+}
+.sub-card.selected {
+  border-color: var(--blue600);
+  box-shadow: 0 0 0 2px rgba(20,115,230,0.15);
+}
+.sub-card-name {
+  font-weight: 600; font-size: 13.5px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.sub-card-stats {
+  font-size: 12px; color: var(--g600);
+  display: flex; flex-wrap: wrap; gap: 10px;
+}
+.sub-card-stats b { color: var(--g900); font-weight: 600; }
+.sub-card-stats .in-flight { color: var(--blue700); }
+.sub-card-stats .completed { color: var(--green600); }
+.sub-card-stats .failed    { color: var(--red600); }
+.sub-card-bar {
+  grid-column: 1 / -1;
+  height: 4px; background: var(--g100); border-radius: 2px;
+  overflow: hidden;
+}
+.sub-card-bar-fill {
+  height: 100%; background: var(--green500);
+  transition: width 0.3s;
+}
+.sub-card-meta {
+  grid-column: 1 / -1;
+  font-size: 11.5px; color: var(--g600);
+  display: flex; justify-content: space-between; gap: 8px;
+}
+.sub-card-action {
+  align-self: center;
+  font-size: 12.5px; color: var(--blue600); font-weight: 600;
+  padding: 4px 10px; border: 1px solid var(--g300); border-radius: var(--radius-pill);
+  background: white;
+}
+.sub-card.selected .sub-card-action {
+  background: var(--blue600); color: white; border-color: var(--blue600);
+}
+
+.section-divider {
+  margin: 8px 0 16px; padding-top: 8px;
+  border-top: 1px solid var(--g100);
+}
+
+/* ─── Monitor job picker (legacy class kept for back-compat if used elsewhere) ── */
 .job-picker {
   display: flex; align-items: flex-end; gap: 16px;
 }

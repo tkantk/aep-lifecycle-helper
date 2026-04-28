@@ -203,6 +203,18 @@ function prepared() {
     `),
     touchCred: db.prepare(`UPDATE credentials SET last_used_at = datetime('now') WHERE id = ?`),
     deleteCred: db.prepare('DELETE FROM credentials WHERE id = ?'),
+    countJobsForCred: db.prepare(`SELECT COUNT(*) AS n FROM jobs WHERE creds_id = ?`),
+    // Update non-secret, non-identity fields. Identity fields (environment,
+    // ims_org_id, client_id) define the row's UNIQUE key — changing them =
+    // a different credential, handled via insertCred's ON CONFLICT path,
+    // not via PATCH.
+    updateCredFields: db.prepare(`
+      UPDATE credentials
+         SET label = @label,
+             client_name = @clientName,
+             region = @region
+       WHERE id = @id
+    `),
 
     // ─── Sandbox configs ─────────────────────────────────────────────
     upsertSandboxConfig: db.prepare(`
@@ -238,6 +250,75 @@ function prepared() {
     `),
     getJob: db.prepare('SELECT * FROM jobs WHERE id = ?'),
     listJobs: db.prepare('SELECT * FROM jobs ORDER BY created_at DESC LIMIT ? OFFSET ?'),
+    // Monitor-tab feed: jobs that have at least one Adobe-acked work order,
+    // enriched with aggregate counts and the most recent work-order activity.
+    // Sort priority: jobs with at least one in-flight work order come FIRST
+    // (operators care most about pending work), then by latest WO activity
+    // DESC. Without the in-flight-first sort, a recently-completed job can
+    // push a still-in-flight one off the visible list.
+    // Filters: pass '' for no filter on @search or @sandbox.
+    listMonitorJobs: db.prepare(`
+      SELECT
+        j.*,
+        COUNT(*) FILTER (WHERE w.adobe_workorder_id IS NOT NULL) AS submitted_count,
+        COUNT(*) FILTER (WHERE w.adobe_workorder_id IS NOT NULL
+                           AND (w.adobe_status IS NULL
+                                OR w.adobe_status NOT IN ('completed','failed'))) AS in_flight_count,
+        COUNT(*) FILTER (WHERE w.adobe_status = 'completed')                  AS completed_count,
+        COUNT(*) FILTER (WHERE w.adobe_status = 'failed')                     AS adobe_failed_count,
+        SUM(CASE WHEN w.adobe_workorder_id IS NOT NULL
+                 THEN w.identifier_count ELSE 0 END)                          AS submitted_ids,
+        MAX(w.updated_at)                                                     AS latest_activity_at,
+        MAX(w.day_index)                                                      AS max_day
+      FROM jobs j
+      INNER JOIN work_orders w ON w.job_id = j.id
+      WHERE w.adobe_workorder_id IS NOT NULL
+        AND (@search = '' OR LOWER(j.name) LIKE '%' || LOWER(@search) || '%')
+        AND (@sandbox = '' OR j.sandbox_name = @sandbox)
+      GROUP BY j.id
+      ORDER BY (in_flight_count > 0) DESC, latest_activity_at DESC
+      LIMIT @limit
+    `),
+    // Dashboard-level totals across ALL monitor-eligible jobs matching the
+    // search + sandbox filter (NOT capped by limit). Each job is in exactly
+    // one bucket: in_flight (≥1 in-flight WO), has_failed (no in-flight but
+    // at least one failed WO), or all_completed (no in-flight, no failed).
+    monitorTotals: db.prepare(`
+      SELECT
+        SUM(CASE WHEN sub.in_flight_count > 0                              THEN 1 ELSE 0 END) AS in_flight,
+        SUM(CASE WHEN sub.in_flight_count = 0
+                      AND sub.adobe_failed_count > 0                       THEN 1 ELSE 0 END) AS has_failed,
+        SUM(CASE WHEN sub.in_flight_count = 0
+                      AND sub.adobe_failed_count = 0                       THEN 1 ELSE 0 END) AS all_completed,
+        COUNT(*) AS total
+      FROM (
+        SELECT j.id,
+               COUNT(*) FILTER (WHERE w.adobe_workorder_id IS NOT NULL
+                                  AND (w.adobe_status IS NULL
+                                       OR w.adobe_status NOT IN ('completed','failed'))) AS in_flight_count,
+               COUNT(*) FILTER (WHERE w.adobe_status = 'failed') AS adobe_failed_count
+        FROM jobs j
+        INNER JOIN work_orders w ON w.job_id = j.id
+        WHERE w.adobe_workorder_id IS NOT NULL
+          AND (@search = '' OR LOWER(j.name) LIKE '%' || LOWER(@search) || '%')
+          AND (@sandbox = '' OR j.sandbox_name = @sandbox)
+        GROUP BY j.id
+      ) sub
+    `),
+    // Distinct sandboxes among monitor-eligible jobs, with per-sandbox job
+    // count. Drives the sandbox filter chip row. Honors the search filter
+    // (so a chip count reflects what would show if the chip were clicked
+    // while the search is active) but NOT a sandbox filter — the chips ARE
+    // the sandbox filter.
+    monitorSandboxes: db.prepare(`
+      SELECT j.sandbox_name AS name, COUNT(DISTINCT j.id) AS count
+        FROM jobs j
+        INNER JOIN work_orders w ON w.job_id = j.id
+       WHERE w.adobe_workorder_id IS NOT NULL
+         AND (@search = '' OR LOWER(j.name) LIKE '%' || LOWER(@search) || '%')
+       GROUP BY j.sandbox_name
+       ORDER BY j.sandbox_name
+    `),
     updateJobStatus: db.prepare(`
       UPDATE jobs SET status = ?, updated_at = datetime('now'), last_error = ? WHERE id = ?
     `),

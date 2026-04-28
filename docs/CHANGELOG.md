@@ -9,6 +9,332 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-04-28 (followup) — Two bug fixes after operator testing
+
+After running the new Monitor dashboard against a real workspace with one
+sandbox + one submitted job, two issues surfaced:
+
+### Bug 1 — Authenticated chip disappeared on refresh
+
+**Root cause**: `testConnection`'s outer `catch` was clobbering `state.tokenOk = false`
+when the downstream `loadSandboxes(true)` call threw. After a system restart
+(or any transient network blip), the IMS auth call could succeed and set
+`tokenOk = true`, then the immediately-following `loadSandboxes` Adobe call
+could time out, throw, and reset `tokenOk` to false in the catch — even
+though authentication had genuinely worked. The chip stayed hidden until
+the operator clicked Test Connection manually with a warm network.
+
+**Fix** (`src/web/app.js`): wrap `loadSandboxes(true)` in its own try/catch
+inside the success branch. A sandbox-load failure now surfaces as a warning
+alert ("Authentication is OK, but the sandbox-discovery call failed: …")
+without resetting `tokenOk`.
+
+**Side fix** (`src/web/styles.css`): added `.alert.warning` style (orange
+border + tint) so the new alert kind renders correctly.
+
+### Bug 2 — Sandbox filter row hidden by design with one sandbox
+
+**Root cause**: `renderSandboxFilter` had `if (sandboxes.length <= 1)
+hide`, hiding the entire chip row when there was only one sandbox. The
+intent was "filtering one thing is meaningless" but the side-effect was
+"the feature is invisible to anyone with one sandbox" — i.e., most
+operators starting out.
+
+**Fix** (`src/web/app.js`): change to `if (sandboxes.length === 0)` so
+the row shows when there's at least one sandbox. With one sandbox the
+operator sees `[All sandboxes (N)] [<sandbox-name> (N)]` — both lead to
+the same set, but the affordance is discoverable from the first
+submission.
+
+### Tests
+
+No new tests — these are UI guard / DOM-rendering changes outside the
+SQL contract. 113/113 still passing.
+
+---
+
+## 2026-04-28 (latest) — Monitor: in-flight-first sort + sandbox filter + count chips
+
+Context: with 20-25 submitted jobs across multiple sandboxes (a realistic
+production load for a marketer running deletions across several Adobe
+orgs), the previous "top 10 by latest activity" feed had two problems:
+recently-completed jobs could push still-in-flight ones off the visible
+list, and there was no way to scope to one sandbox. Implemented Options
+1 + 3 from the proposal.
+
+### Backend — SQL + route
+
+- **`src/db.js`** — `listMonitorJobs` now sorts
+  `(in_flight_count > 0) DESC, latest_activity_at DESC` so jobs with
+  pending Adobe work always rank above terminal jobs. Accepts new
+  `@sandbox` param for exact-match filter on `j.sandbox_name`.
+- **`src/db.js`** — new `monitorTotals` prepared statement. Returns
+  job-level dashboard counts across ALL matching jobs (not capped by
+  limit), bucketing each job into exactly one of `in_flight` (≥1
+  in-flight WO), `has_failed` (no in-flight + ≥1 failed WO), or
+  `all_completed` (no in-flight + no failed).
+- **`src/db.js`** — new `monitorSandboxes` prepared statement. Returns
+  distinct sandbox names with per-sandbox job counts among submitted
+  jobs. Honors the search filter (so chip counts reflect the active
+  search) but not the sandbox filter (the chips ARE the filter).
+- **`src/routes/jobs.js`** — `GET /api/jobs/monitor` response shape
+  changed from `[rows]` to `{ rows, totals, sandboxes }`. Default limit
+  bumped from 10 to 20 (cap still 100). Accepts `?sandbox` query param.
+
+### Frontend — chips + filter row
+
+- **`src/web/index.html`** — Monitor template adds two new sub-rows:
+  `#monitor-totals` (horizontal chips for in-flight / completed /
+  failed counts) and `#monitor-sandbox-filter` (filter chip row with
+  "All sandboxes (N)" + one chip per sandbox).
+- **`src/web/styles.css`** — `.dashboard-totals`, `.dash-chip` (with
+  in-flight / completed / failed color variants matching the existing
+  card-stats palette), `.dashboard-sandbox-filter`, `.dash-filter-chip`
+  (pill-shaped with `.active` blue-fill state).
+- **`src/web/app.js`** — `MONITOR_LIST_LIMIT` 10 → 20. `renderMonitor`:
+  - new `sandboxFilter` closure variable; passed to `/jobs/monitor` as
+    `?sandbox=` and used to highlight the active chip
+  - new helpers (closures): `renderTotalsChips`, `renderSandboxFilter`
+    (auto-hides when ≤1 sandbox), `buildSummaryText` (shows
+    "Showing N of M in scope, in-flight first… (K more — use search)")
+  - response shape now `{ rows, totals, sandboxes }`; empty state keys
+    on `totals.total === 0 && !searchTerm && !sandboxFilter`
+
+### Tests — 6 new, 1 rewritten
+
+- **`test/monitorJobs.test.js`** — existing `.all()` calls updated to
+  pass `sandbox: ''`. The "sorts by latest activity" test was rewritten
+  to use two **in-flight** jobs (so the secondary sort is exercised
+  cleanly without confound from the new in-flight-first priority).
+  New tests:
+  - **in-flight jobs sort BEFORE terminal jobs** even when the
+    terminal job has more recent activity (locks in Option 1's fix)
+  - **sandbox filter scopes results** correctly + empty `sandbox`
+    means all sandboxes
+  - **monitorTotals bucketing** — each job lands in exactly one of
+    `in_flight` / `has_failed` / `all_completed`
+  - **monitorTotals filter propagation** — search and sandbox filters
+    apply to the count too
+  - **monitorSandboxes** returns distinct sandboxes with correct counts;
+    decoy job (no Adobe ID) does not contribute
+  - **monitorSandboxes search propagation** — chip counts reflect active
+    name search
+- 113/113 tests pass (107 → 113).
+
+### Docs
+
+- **CLAUDE.md** local API surface table updated: `/jobs/monitor` row
+  expanded to describe the response shape, in-flight-first sort, and
+  the sandbox filter.
+- **docs/ARCHITECTURE.md** `routes/jobs.js` entry updated with the new
+  response shape and sort semantics.
+- **docs/REVIEW.md** endpoint row updated.
+- **docs/DESIGN_DOC.md** §4.8 expanded: in-flight-first ORDER BY
+  rationale, sandbox filter rationale, response-shape rationale (one
+  round-trip per refresh, totals across all matching jobs not just
+  visible ones, sandbox chip counts honor search but not sandbox).
+  Test counts and appendix file map updated.
+
+---
+
+## 2026-04-28 (later) — Monitor tab → Active Submissions dashboard
+
+Context: the Monitor tab's recent-jobs picker pulled from `/api/jobs?limit=20`
+ordered by `created_at DESC`. Two practical problems for marketers tracking
+deletions: (1) heavy expansion activity pushed the still-in-flight submissions
+out of the visible window, and (2) sort-by-creation surfaced new uploads even
+when the most-relevant job was an in-flight deletion that had been submitted
+days earlier. The user asked for a real monitoring dashboard rather than a
+filtered dropdown stop-gap. This is Option C from the proposal — replaces the
+picker with a list of submission cards backed by a dedicated server feed.
+
+### Backend — active-submissions feed
+
+- **`src/db.js`** — new `listMonitorJobs` prepared statement. INNER JOINs
+  `work_orders`, filters to rows where `adobe_workorder_id IS NOT NULL` (jobs
+  Adobe has acknowledged), GROUP BY job, with `FILTER (WHERE …)` aggregates
+  for `submitted_count`, `in_flight_count`, `completed_count`,
+  `adobe_failed_count`, `submitted_ids`, `latest_activity_at`, `max_day`.
+  ORDER BY latest WO activity DESC. Optional case-insensitive name search.
+- **`src/routes/jobs.js`** — new `GET /api/jobs/monitor?limit&search`
+  endpoint backed by `listMonitorJobs`. Limit hard-capped at 100.
+
+### Frontend — dashboard rewrite
+
+- **`src/web/index.html`** — `tpl-monitor` rebuilt:
+  - **Active submissions card** at the top: heading + caption ("Showing top
+    N by latest Adobe activity") + `<input type="search">` + a list region.
+  - **Detail card** below (existing 5-stage stat grid + per-WO pipeline
+    table) becomes the "selected job" view, hidden until a card is opened.
+  - New **empty state**: "No submitted jobs to monitor yet. Upload a CSV
+    and run Submit to start tracking deletions here."
+- **`src/web/styles.css`** — `.dashboard-head`, `.sub-card` (with `.selected`,
+  hover, `:has`-free progress bar via `.sub-card-bar`), `.sub-card-stats`
+  (color-coded `in-flight` / `completed` / `failed`), `.sub-card-action`,
+  `.section-divider`. Search input styled to match form controls.
+- **`src/web/app.js`** — `renderMonitor` rewritten:
+  - `fetchAndRenderList()` hits `/jobs/monitor`, renders cards, manages
+    empty/no-match states.
+  - `selectMonitorJob(id, silent)` fetches full job detail, switches the
+    card highlight, refreshes the detail panel. Auto-selects the
+    most-recently-active job on first render.
+  - `renderSubmissionCard()` produces the per-job card markup.
+  - `formatRelativeTime()` turns SQLite `datetime('now')` into "just now /
+    N min ago / N hr ago / N day(s) ago". Treats stored timestamps as UTC
+    (which is how the prepared statements write them).
+  - Search input has 250ms debounce; refetches with the `search` param.
+  - List polls every 15s (was 5s for the single selected job); detail
+    panel still refreshes every 15s alongside the list.
+
+### Tests — 5 new
+
+- **`test/monitorJobs.test.js`** — locks the SQL contract:
+  - excludes jobs with no Adobe-acked work order (expansion-only stays out)
+  - sorts by latest WO activity DESC, NOT job creation time
+  - aggregate counts (submitted / in_flight / completed / failed) match
+  - case-insensitive substring search on job name
+  - `limit` is honored
+- 107/107 tests pass (102 → 107).
+
+### Docs
+
+- **CLAUDE.md** — local API surface table extends with `/api/jobs` and
+  `/api/jobs/monitor` rows. Test count `102` → `107`.
+- **docs/ARCHITECTURE.md** — `routes/jobs.js` entry expanded with the
+  two list endpoints' semantics. Test description updated.
+- **docs/REVIEW.md** — endpoints table adds the new monitor row.
+- **docs/DESIGN_DOC.md** — new **§4.8 "Why the Monitor tab uses an
+  active-submissions feed, not /jobs"** documents the two original
+  problems (submitted jobs falling out of the picker; wrong sort axis)
+  and the SQL design. Existing §4.8 (credentials picker) renumbered to
+  §4.9; §4.9 (monthly quota) renumbered to §4.10. Test counts and
+  appendix file map updated.
+
+---
+
+## 2026-04-28 — Credentials picker overhaul + UI polish + 7 new route tests
+
+Context: client name was disappearing on refresh, there was no obvious way to
+switch between saved credentials, and no "Add new" UI. Three symptoms, one
+underlying cause: the persistence path was gated on "did the secret change,"
+so non-secret edits to existing creds were never saved, and the saved-
+credentials list was buried in a right-rail panel with no active-cred
+indicator. Also addressed: form alignment bug on Daily/Monthly cap inputs,
+favicon, official Adobe Data Cleansing icon, and AEP-style page-header
+gradient.
+
+### Backend — Option B credentials picker
+
+- **`src/db.js`** — added `countJobsForCred` and `updateCredFields` prepared
+  statements. The latter updates ONLY label / client_name / region; never
+  touches the encrypted secret blob (`client_secret_enc/iv/tag`) or the
+  unique-key identity columns (environment / ims_org_id / client_id).
+- **`src/routes/config.js`** — new `PATCH /api/config/credentials/:id`.
+  Accepts `{ label, clientName, region }`. Returns 404 if id doesn't
+  exist; 400 if label missing. The route deliberately ignores any
+  identity-field keys in the body (those route through the existing POST
+  upsert path).
+- **`src/routes/config.js`** — `DELETE /api/config/credentials/:id` now
+  blocks with HTTP 409 + `{error: 'credential_in_use', jobCount, message}`
+  when any row in `jobs` references the credential. Without this, deleting
+  a cred attached to in-flight or completed jobs would orphan job status
+  polling and recovery routines.
+
+### Frontend — credentials picker UX
+
+- **`src/web/index.html`** — new `.cred-picker` bar at the top of the
+  Configuration card with a dropdown ("Active credential"), **+ Add new**
+  button, **⊗ Remove** button. New `.identity-lock-row` showing a dashed
+  reminder when identity fields are locked, with an "✏ Edit identity
+  fields" link to unlock. Removed the right-rail "Saved Credentials"
+  panel — the new picker is the single source of truth.
+- **`src/web/app.js`** — new `state.identityUnlocked` flag.
+  - `refreshCredPicker()` — fetches `/config/credentials`, populates the
+    dropdown (last-used-first, formatted as `client_name · label · env ·
+    region`), appends "+ Add new credential" sentinel option. Auto-falls
+    back to `list[0]` only when `state.credsId` is unset OR points to a
+    deleted cred AND the user is NOT in Add-new mode.
+  - `addNewCredentialFlow()` — clears form + `state.credsId = null` +
+    `state.identityUnlocked = true`, then `goto('config')`.
+  - `removeCurrentCredential()` — native `confirm()` dialog → DELETE →
+    refreshes picker → switches to next-most-recent or Add-new mode.
+    Surfaces 409 errors clearly.
+  - `applyIdentityLockState()` — readonly + `.locked` class on
+    `c-environment` / `c-ims-org` / `c-client-id` when a saved cred is
+    loaded and the user hasn't explicitly unlocked.
+  - `unlockIdentityFields()` — unlocks + info alert explaining that
+    edits will create a new credential on next save.
+  - `saveAndContinue()` — actually persists now. PATCHes when an
+    existing cred is loaded and identity fields are locked; otherwise
+    falls through to upload (the new-cred case is already POSTed during
+    Test Connection).
+  - `testConnection()` — after creating a brand-new cred, re-locks
+    identity fields and refreshes the picker so the new entry shows.
+- **`src/web/styles.css`** — `.cred-picker`, `.cred-picker-actions`,
+  `.identity-lock-row`, `.link-btn`, `input.locked` / `select.locked`.
+
+### Frontend — visual polish
+
+- **Page-header gradient** (`src/web/index.html` + `styles.css`) — wrapped
+  breadcrumbs / title / subtitle in `.page-header` with a subtle
+  purple→peach gradient (8% / 10% opacities). Matches AEP's new look on
+  the Profile Detail / hub views without bleeding under cards. Reversible
+  in ~5 minutes if it reads as too marketing-y.
+- **Data Cleansing icon** (`src/web/data-cleansing-icon.svg` new) —
+  Adobe's official `dataCleansing` icon, refilled to `currentColor`.
+  Rendered inside the sidebar app-block's gradient tile via CSS mask
+  so it shows in white on the existing blue→purple background. Replaces
+  the placeholder `⌫` glyph.
+- **Favicon** (`src/web/index.html`) — `<link rel="icon" type="image/svg+xml"
+  href="/aep-icon.svg">` so the browser tab shows the AEP "A" mark.
+  Reuses the local SVG already used in the top bar — no extra assets,
+  still offline-only (CLAUDE.md I12).
+- **Form alignment fix** (`src/web/styles.css` + `index.html`) — Daily /
+  Monthly identifier cap inputs were misaligned because the Monthly
+  label had a long inline help-text span that wrapped to two lines and
+  pushed the input down. Fix: introduced `.f-hint` Spectrum-style help
+  text below the input; added matching hint to Daily for symmetry.
+  `.f-row-2` now has `align-items: end` as defense-in-depth so any
+  future label-height mismatch can't repeat the bug. Same anti-pattern
+  fixed proactively on the Datasets field and the Source namespace
+  field (Upload tab).
+
+### Tests
+
+- **`test/credentialsRoutes.test.js` (new, 7 tests)** — boots a minimal
+  Express app on a random localhost port and exercises the routes via
+  Node's built-in `http`. Covers:
+  - PATCH updates label / client_name / region
+  - PATCH never overwrites client_secret_enc/iv/tag (asserts byte-for-byte)
+  - PATCH 404 on unknown id
+  - PATCH 400 when label missing
+  - PATCH ignores identity-field keys (env / ims_org_id / client_id) — the
+    route's contract that those go through the upsert path is locked in
+  - DELETE removes when no jobs reference the cred
+  - DELETE returns 409 with jobCount when jobs reference the cred; cred
+    must still exist after the rejection
+- 102/102 tests pass (95 → 102).
+
+### Docs
+
+- **CLAUDE.md** — file map adds `data-cleansing-icon.svg`. New "Local API
+  surface" table next to the Adobe endpoints cheat sheet, listing PATCH +
+  DELETE 409 behavior. I6 extended to document that PATCH never touches
+  the encrypted secret blob or identity fields. Test count `95` → `102`.
+- **docs/ARCHITECTURE.md** — `routes/config.js` entry expanded with the
+  four route shapes; `web/` entry expanded with picker bar, identity
+  lock, page-header gradient, favicon, Data Cleansing icon, `.f-hint`
+  convention. Test description updated.
+- **docs/REVIEW.md** — endpoints table updated with PATCH row and the
+  DELETE 409 contract.
+- **docs/DESIGN_DOC.md** — new §4.8 ("Why the credentials picker has its
+  own dedicated UX") explaining the three symptoms, the picker design,
+  the identity-fields lock rationale, and the AEC org-switcher analogy.
+  Existing §4.8 (monthly quota) renumbered to §4.9. Test counts and
+  appendix file map updated.
+
+---
+
 ## 2026-04-26 (later) — Documentation refresh after review remediation
 
 Context: brought all four primary docs (`CLAUDE.md`, `docs/ARCHITECTURE.md`,

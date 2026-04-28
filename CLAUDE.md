@@ -97,10 +97,13 @@ src/
 │   └── logger.js               Text or JSON output
 │
 └── web/                        Zero-build static UI
-    ├── index.html              AEP Spectrum-styled templates
-    ├── styles.css              Spectrum tokens (gray scale, blue, red)
+    ├── index.html              AEP Spectrum-styled templates (also referenced
+    │                           as the favicon source via <link rel="icon">)
+    ├── styles.css              Spectrum tokens (gray scale, blue, red) +
+    │                           @font-face decls + page-header gradient
     ├── app.js                  Vanilla JS controller (no React)
-    ├── aep-icon.svg            Local copy of the AEP brand mark (no CDN)
+    ├── aep-icon.svg            Local AEP brand mark (top bar + favicon)
+    ├── data-cleansing-icon.svg Adobe's official Data Cleansing icon (sidebar app block)
     └── fonts/                  Self-hosted Source Sans 3 (.woff2, OFL)
 
 data/                           Created at runtime
@@ -234,6 +237,12 @@ Adobe's actual usage if precise accounting matters.
 The encryption key lives at `data/.key` (auto-generated, chmod 600) or in
 the `ENCRYPTION_KEY` env var. Never log, dump, or emit decrypted secrets
 anywhere. Tokens (short-lived) stay in memory only, never written to disk.
+
+**`PATCH /api/config/credentials/:id` never touches the encrypted secret
+blob** (or the identity fields environment / ims_org_id / client_id —
+those define the row's UNIQUE key). The PATCH route only updates label,
+client_name, and region. Test in `test/credentialsRoutes.test.js` locks
+this in. Re-keying a secret goes through the POST upsert path.
 
 ### I7. Datasets shown to the user are pre-filtered
 
@@ -482,6 +491,18 @@ Full details in `docs/REVIEW.md`. Quick reference:
 | POST   | `/data/core/hygiene/workorder`                                        | Create record-delete work order       |
 | GET    | `/data/core/hygiene/workorder/{id}`                                   | Poll work-order status                |
 
+Local API surface (under `/api/`, loopback only):
+
+| Method | URL                                | Purpose                                                                  |
+|--------|------------------------------------|--------------------------------------------------------------------------|
+| GET    | `/api/config/credentials`          | List saved credentials (no secrets in response)                          |
+| POST   | `/api/config/credentials`          | Create or upsert credential (encrypts secret at rest)                    |
+| PATCH  | `/api/config/credentials/:id`      | Update label / client_name / region only — never touches secret/identity |
+| DELETE | `/api/config/credentials/:id`      | Remove credential. Returns 409 if any job references it.                 |
+| POST   | `/api/config/credentials/test`     | IMS auth check via stored id or inline creds                             |
+| GET    | `/api/jobs?limit&offset`           | List jobs by `created_at DESC` (every status, every sandbox)             |
+| GET    | `/api/jobs/monitor?limit&search&sandbox` | **Active-submissions feed** for the Monitor tab. Returns `{ rows, totals, sandboxes }`. Rows are jobs with ≥1 Adobe-acked work order, sorted **in-flight-first** (`(in_flight_count > 0) DESC`) then by `latest_activity_at DESC` so still-pending jobs never get pushed off-screen by recently-completed ones. Optional sandbox filter. `totals` are job-level dashboard counts (`in_flight` / `has_failed` / `all_completed` / `total`) across ALL matching jobs (not capped by limit). `sandboxes` is the distinct sandbox list (with per-sandbox job counts) for the filter chip row. |
+
 Host: `https://platform.adobe.io` for everything **except** Identity APIs,
 which require `https://platform-{region}.adobe.io` (region ∈ `va7`, `nld2`,
 `aus5`, `can2`).
@@ -503,8 +524,9 @@ which require `https://platform-{region}.adobe.io` (region ∈ `va7`, `nld2`,
    costs a round-trip.
 6. Never add telemetry, analytics, or outbound calls beyond the documented
    Adobe endpoints.
-7. Run `node --test test` before suggesting a change is done. **95 tests
-   should pass** (as of the 2026-04-26 review remediation).
+7. Run `node --test test` before suggesting a change is done. **113 tests
+   should pass** (as of the 2026-04-28 in-flight-first + sandbox-filter
+   session).
 8. **After your change**, append a bullet to the current session in
    `docs/CHANGELOG.md` describing what + why. If you changed the module map,
    data flow, Adobe contract, or DB schema, also update `docs/ARCHITECTURE.md`.

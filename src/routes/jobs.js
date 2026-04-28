@@ -19,6 +19,32 @@ router.get('/', (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+/** Active-submissions feed for the Monitor tab.
+ *  Returns:
+ *    - rows:      list of jobs with ≥1 Adobe-acked work order, enriched
+ *                 with aggregate counts. Sorted in-flight-first, then
+ *                 by latest WO activity DESC. Capped by `limit`.
+ *    - totals:    job-level dashboard counts (in_flight / has_failed /
+ *                 all_completed / total) across ALL monitor-eligible jobs
+ *                 matching the same search + sandbox filter — NOT capped.
+ *    - sandboxes: distinct sandboxes among monitor-eligible jobs (search
+ *                 filter applied, sandbox filter NOT applied) with per-
+ *                 sandbox job count, for the filter chip row.
+ *  Query params: ?limit=N (default 20, cap 100), ?search=…, ?sandbox=…
+ */
+router.get('/monitor', (req, res, next) => {
+  try {
+    const limit = Math.min(Number(req.query.limit) || 20, 100);
+    const search = String(req.query.search || '').trim();
+    const sandbox = String(req.query.sandbox || '').trim();
+    res.json({
+      rows:      q().listMonitorJobs.all({ limit, search, sandbox }),
+      totals:    q().monitorTotals.get({ search, sandbox }) || { in_flight: 0, has_failed: 0, all_completed: 0, total: 0 },
+      sandboxes: q().monitorSandboxes.all({ search }),
+    });
+  } catch (err) { next(err); }
+});
+
 router.get('/:id', async (req, res, next) => {
   try {
     const job = q().getJob.get(req.params.id);

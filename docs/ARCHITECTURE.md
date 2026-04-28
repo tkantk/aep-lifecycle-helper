@@ -177,9 +177,32 @@ src/
 │
 ├── routes/
 │   ├── config.js           Credential CRUD + test.
+│   │                       - POST   /api/config/credentials       (create / upsert)
+│   │                       - PATCH  /api/config/credentials/:id   (update label,
+│   │                         client_name, region only — never touches the
+│   │                         encrypted secret or identity fields)
+│   │                       - DELETE /api/config/credentials/:id   (returns 409 if
+│   │                         any job references this credential — protects job
+│   │                         status polling and recovery from being orphaned)
+│   │                       - POST   /api/config/credentials/test  (IMS auth check)
 │   ├── adobe.js            Sandbox/dataset/namespace discovery endpoints.
 │   ├── upload.js           multipart CSV → job + expansion kickoff.
 │   └── jobs.js             Job detail, plan, submit, progress, export.
+│                           Two list endpoints:
+│                           - GET /api/jobs           — flat list, every status
+│                           - GET /api/jobs/monitor   — active-submissions feed:
+│                             only jobs with ≥1 Adobe-acked work order. Sort
+│                             priority: (in_flight_count > 0) DESC then
+│                             max(work_orders.updated_at) DESC — in-flight
+│                             jobs always come first so a recently-completed
+│                             job can't push pending work off-screen. Returns
+│                             { rows, totals, sandboxes } in one payload:
+│                             rows = enriched (limit-capped); totals = job-
+│                             level counts (in_flight / has_failed /
+│                             all_completed / total) across ALL matching
+│                             jobs; sandboxes = distinct sandbox list with
+│                             per-sandbox counts for the filter chip row.
+│                             Filters: ?search=… ?sandbox=…
 │
 ├── utils/
 │   ├── csv.js              Streaming CSV in/out. First row is data unless the
@@ -192,14 +215,30 @@ src/
 │
 └── web/                    Zero-build vanilla JS UI.
     ├── index.html          AEP Spectrum-styled templates.
+    │                       Active-credential picker bar at the top of the
+    │                       Configuration card with dropdown + "+ Add new" +
+    │                       "⊗ Remove". Identity-fields lock indicator with an
+    │                       "✏ Edit identity fields" link. Page-header wrapper
+    │                       with a subtle purple→peach gradient. Favicon link.
     ├── styles.css          Spectrum tokens. Global [hidden]{display:none!important}
     │                       rule so display:flex doesn't override the hidden attr.
     │                       @font-face declarations for Source Sans 3 (4 weights).
+    │                       .cred-picker / .identity-lock-row / .page-header
+    │                       gradient. .f-hint convention for help text below inputs.
     ├── app.js              State object + fetch-based API calls + step navigator.
-    ├── aep-icon.svg        Local copy of the AdobeExperiencePlatform mark (no CDN).
+    │                       Credential-picker functions: refreshCredPicker,
+    │                       addNewCredentialFlow, removeCurrentCredential,
+    │                       applyIdentityLockState. Save & Continue PATCHes when
+    │                       the active cred has unsaved label/client-name/region
+    │                       edits; POSTs (creates) when in Add-new mode.
+    ├── aep-icon.svg        Local copy of the AdobeExperiencePlatform mark
+    │                       (top bar + favicon).
+    ├── data-cleansing-icon.svg  Adobe's official Data Cleansing icon, used
+    │                       inside the sidebar app block via CSS mask so the
+    │                       gradient tile shows it in white.
     └── fonts/              Self-hosted Source Sans 3 woff2 (OFL-licensed, 4 weights).
 
-test/                       node --test. 95 tests covering hygiene validators,
+test/                       node --test. 113 tests covering hygiene validators,
                             namespace canonicalization, IMS token cache, quota
                             atomicity (incl. monthly-disabled release gating),
                             planWorkOrders cluster packing + day rollover +
@@ -207,7 +246,11 @@ test/                       node --test. 95 tests covering hygiene validators,
                             surfacing, region routing per credential, idempotency-
                             aware retries (5xx/network blocked on hygiene POST),
                             recovery on missing/indeterminate Adobe responses,
-                            adobeClient error-body enrichment.
+                            adobeClient error-body enrichment, credentials
+                            routes (PATCH non-secret-only safety + DELETE 409),
+                            and the Monitor-tab listMonitorJobs feed (filter,
+                            in-flight-first sort, aggregates, search, sandbox
+                            filter, monitorTotals + monitorSandboxes queries).
 
 docs/
 ├── ARCHITECTURE.md         This file. Living overview.

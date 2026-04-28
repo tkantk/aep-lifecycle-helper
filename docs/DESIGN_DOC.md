@@ -349,7 +349,127 @@ lag, a region-specific quirk), and we roll back. To minimize this risk:
 - Any reconciliation error path logs at warn level so the operator can
   investigate.
 
-### 4.8 Why monthly quota is a separate table (not a column on daily)
+### 4.8 Why the Monitor tab uses an "active-submissions" feed, not /jobs
+
+The Monitor tab is fundamentally about tracking deletions Adobe is processing
+— a marketer's question on this tab is *"where is my deletion request and did
+Adobe finish it?"*. Initial implementations of the picker pulled from
+`/api/jobs?limit=20`, which returned every job in `created_at DESC` order
+regardless of status. Two real problems followed:
+
+1. **Submitted jobs disappeared from the picker** as soon as enough new
+   uploads/expansions accumulated. A submitter who had run a 1M-row
+   deletion last week and wanted to check progress would scroll past 20
+   newer "expanding" or "ready" jobs that were irrelevant to monitoring.
+2. **Sort by `created_at`** surfaced the most-recently-uploaded job, not
+   the most-recently-active deletion. An ongoing in-flight submission from
+   3 days ago could be ranked below a brand-new job whose work orders
+   hadn't even shipped to Adobe yet.
+
+The fix: a dedicated `GET /api/jobs/monitor` endpoint backed by
+`db.listMonitorJobs`. The SQL:
+
+- INNER JOINs `work_orders` and filters to rows where
+  `adobe_workorder_id IS NOT NULL` — i.e., Adobe has acknowledged at least
+  one work order for this job. Jobs that never made it past expansion
+  are excluded entirely (they have nothing to monitor).
+- GROUP BY `j.id` with `FILTER (WHERE …)` aggregates so each row carries
+  `submitted_count`, `in_flight_count`, `completed_count`,
+  `adobe_failed_count`, `submitted_ids`, and `latest_activity_at` —
+  everything the dashboard cards need, in a single query.
+- ORDER BY `(in_flight_count > 0) DESC, latest_activity_at DESC`. This
+  two-level sort is the **in-flight-first priority**: jobs that still
+  have work orders Adobe is processing always rank above terminal
+  (fully-completed or fully-failed) jobs, regardless of how recently the
+  terminal jobs were touched. Without this, a freshly-completed job
+  could push a quietly-in-flight one off the visible window. Within each
+  bucket, the secondary sort by latest WO activity surfaces the most
+  recently-touched job first.
+- Optional `search` parameter does case-insensitive substring match on
+  job name; `''` (empty) means no filter.
+- Optional `sandbox` parameter scopes results to a single AEP sandbox.
+  Operators who manage multiple sandboxes per client typically want to
+  filter Monitor to whichever they're working in; the chip row above
+  the dashboard cards drives this filter.
+
+The route returns three things in one payload to keep the Monitor tab
+to a single round-trip per refresh:
+
+- **`rows`** — the limit-capped, in-flight-first-sorted list rendered as
+  cards.
+- **`totals`** — job-level dashboard counts (`in_flight`, `has_failed`,
+  `all_completed`, `total`) across **all** matching jobs (NOT capped
+  by limit). Drives the colored chips in the dashboard header so the
+  operator sees the true picture even when the visible list is paginated.
+  Each job sits in exactly one bucket — a job with both completed and
+  in-flight work orders is `in_flight`; only fully-terminal jobs are
+  `has_failed` (any failed WO + no in-flight) or `all_completed` (no
+  in-flight, no failed).
+- **`sandboxes`** — distinct sandbox names with per-sandbox job counts.
+  Honors the search filter (so the chip count for "americas-uat (3)"
+  reflects what would be shown if that chip were clicked while the
+  current search is active) but NOT the sandbox filter — the chips ARE
+  the sandbox filter, so they're computed across all sandboxes.
+
+The Monitor tab UI:
+
+- **Top card** — list of up to 10 cards, one per job, showing name,
+  sandbox, day range, work-order counts, completion progress bar, and a
+  relative-time "Updated N min ago." Clicking a card selects the job.
+- **Search input** in the same card — debounced, hits the same endpoint
+  with the search param; the limit applies to the search results too,
+  so an operator can find a specific older job by typing its name.
+- **Detail panel below** — the selected job's full per-work-order
+  pipeline table and 5-stage stat grid (`received → validated →
+  submitted → ingested → completed`), refreshed every 15s alongside the
+  list.
+- **Empty state** — when no submitted jobs exist at all, shows a clear
+  "Upload a CSV and run Submit to start tracking deletions here"
+  message.
+
+This separation matches Adobe Experience Platform's own Data Lifecycle
+Monitor view, which also key-orders its work order list by Adobe activity
+rather than upload time.
+
+### 4.9 Why the credentials picker has its own dedicated UX
+
+The Configuration tab manages **one** credential at a time, but most operators
+work across multiple Adobe orgs (or multiple environments per org). Without a
+dedicated picker the form silently encoded "I'm editing whichever credential
+was loaded last," and three problems followed:
+
+1. Edits to non-secret fields like Client Name were lost on refresh because
+   the save path was gated on "did the secret change."
+2. There was no obvious way to switch between saved credentials (the right-
+   rail "Saved Credentials" panel was visible only with ≥1 cred, easy to
+   miss, and didn't indicate which one was loaded).
+3. Adding a new credential required the operator to manually clear every
+   field — not discoverable.
+
+The picker bar at the top of the Configuration card solves all three:
+- Dropdown listing all saved creds, last-used-first, formatted as
+  `Client name · Label · Environment · Region`.
+- Explicit **+ Add new** button (and the same option at the bottom of the
+  dropdown) that resets the form to a blank state and unlocks identity
+  fields.
+- Explicit **⊗ Remove** button (with native `confirm()` dialog) that calls
+  `DELETE /api/config/credentials/:id`. The server returns 409 if any job
+  references the credential, and the UI surfaces a clear "Cannot remove:
+  N job(s) reference this credential" alert.
+- Identity fields (Environment, IMS Org ID, Client ID) are **readonly when
+  a saved cred is loaded**. They form the unique key on the credentials
+  row, so editing them silently routes the next save to a different row
+  via the upsert. Locking by default makes the "I'm creating a new
+  credential" intent explicit; an "✏ Edit identity fields" link unlocks
+  with an info alert that explains the consequence.
+- "Save & Continue" now actually saves: PATCHes the editable fields when
+  the active cred is loaded, POSTs a new row when in Add-new mode.
+
+This separation matches Adobe Experience Cloud's own org-switcher pattern
+(top-right org picker + per-org settings inside the app) without the
+complexity of a separate credentials management page.
+
+### 4.10 Why monthly quota is a separate table (not a column on daily)
 
 - Daily rows churn once per UTC date; monthly rows churn once per UTC month.
   Mixing them in one table complicates rollover queries.
@@ -566,15 +686,19 @@ A second external code review surfaced 7 additional findings (4 P1, 2 P2,
 node --test test
 ```
 
-Expected: **95 tests pass, 0 fail**. Current suite: 10 test files covering
+Expected: **113 tests pass, 0 fail**. Current suite: 12 test files covering
 hygiene validators (27), namespace canonicalization (11), IMS token cache (7),
 quota manager (12, both daily + monthly + monthly-disabled release gating),
 plan logic (12, includes replan guard and deferred-tolerance tests),
 startup recovery (6, includes the 400-indeterminate test),
 adobeClient error enrichment + idempotency-aware retries (11),
 region routing per credential (3), deferred-row surfacing (1),
-and an end-to-end integration test with a fully-mocked Adobe (3) — last
-confirmed green on 2026-04-26.
+credentials routes — PATCH non-secret-only safety + DELETE 409
+when jobs reference the cred (7), Monitor tab feed (filter, in-flight-first
+sort, within-bucket activity sort, sandbox filter, monitorTotals bucketing,
+monitorSandboxes distinct-with-counts, search-filter propagation) (11), and
+an end-to-end integration test with a fully-mocked Adobe (3) — last confirmed
+green on 2026-04-28.
 
 ### 8.3 Recovering from a crash
 
@@ -660,10 +784,17 @@ src/
 │   ├── crypto.js                   AES-256-GCM envelope
 │   └── logger.js                   Structured logger
 └── web/
-    ├── index.html                  UI templates
-    ├── styles.css                  Spectrum tokens + [hidden] fix + @font-face
-    ├── app.js                      Vanilla JS state + fetch orchestrator
-    ├── aep-icon.svg                Local AEP brand mark (no CDN dependency)
+    ├── index.html                  UI templates (favicon + page-header gradient
+    │                               wrapper + cred-picker bar + identity-lock UI)
+    ├── styles.css                  Spectrum tokens + [hidden] fix + @font-face +
+    │                               .cred-picker / .identity-lock-row / .f-hint /
+    │                               .page-header gradient
+    ├── app.js                      Vanilla JS state + fetch orchestrator +
+    │                               cred-picker functions (refresh / add / remove /
+    │                               identity-lock toggle) + Save persistence
+    ├── aep-icon.svg                Local AEP brand mark (top bar + favicon)
+    ├── data-cleansing-icon.svg     Adobe's official Data Cleansing icon
+    │                               (sidebar app block via CSS mask, white on gradient)
     └── fonts/                      Self-hosted Source Sans 3 woff2 (4 weights)
 
 test/
@@ -676,6 +807,8 @@ test/
 ├── adobeClient.test.js             Error enrichment + idempotency-aware retries (11)
 ├── region.test.js                  Per-credential region routing (3)
 ├── deferred.test.js                Deferred-row surfacing (1)
+├── credentialsRoutes.test.js       PATCH non-secret-only + DELETE 409 (7)
+├── monitorJobs.test.js             Monitor feed: filter, in-flight-first sort, within-bucket activity sort, aggregates, search, sandbox filter, monitorTotals bucketing, monitorSandboxes distinct + search propagation (11)
 └── integration.test.js             End-to-end with full Adobe mocks (3 tests)
 
 docs/

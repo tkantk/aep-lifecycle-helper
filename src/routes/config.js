@@ -47,9 +47,45 @@ router.post('/credentials/test', async (req, res) => {
   }
 });
 
+/** Update non-secret fields on an existing credential.
+ *  Never touches the encrypted client_secret or identity fields
+ *  (environment, ims_org_id, client_id) — those changes go through the
+ *  insertCred upsert path. */
+router.patch('/credentials/:id', (req, res, next) => {
+  try {
+    const id = req.params.id;
+    const existing = q().getCred.get(id);
+    if (!existing) return res.status(404).json({ error: 'credential not found' });
+
+    const { label, clientName, region } = req.body;
+    if (!label) return res.status(400).json({ error: 'label is required' });
+
+    q().updateCredFields.run({
+      id,
+      label,
+      clientName: clientName || null,
+      region: region || existing.region,
+    });
+    res.json({ ok: true });
+  } catch (err) { next(err); }
+});
+
 router.delete('/credentials/:id', (req, res, next) => {
-  try { q().deleteCred.run(req.params.id); res.json({ ok: true }); }
-  catch (err) { next(err); }
+  try {
+    const id = req.params.id;
+    // Block deletion if any job references this credential — a deleted cred
+    // breaks status polling, recovery, and audit traceability for those jobs.
+    const { n } = q().countJobsForCred.get(id);
+    if (n > 0) {
+      return res.status(409).json({
+        error: 'credential_in_use',
+        message: `Cannot delete: ${n} job(s) reference this credential. Delete or archive those jobs first.`,
+        jobCount: n,
+      });
+    }
+    q().deleteCred.run(id);
+    res.json({ ok: true });
+  } catch (err) { next(err); }
 });
 
 export default router;

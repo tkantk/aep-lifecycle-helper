@@ -19,7 +19,9 @@
       "Bash(node --test test/planWorkOrders.test.js)",
       "Bash(node --test test/deferred.test.js)",
       "Bash(node --test test/quotaManager.test.js)",
-      "Bash(node --test test/recovery.test.js)"
+      "Bash(node --test test/recovery.test.js)",
+      "Bash(node --test test/credentialsRoutes.test.js)",
+      "Bash(node --test test/monitorJobs.test.js)"
     ]
   }
 }

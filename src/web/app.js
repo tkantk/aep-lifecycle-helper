@@ -25,6 +25,7 @@ const state = {
     sourceNamespaceId: null,         // numeric nsid — filled from the namespace registry
   },
   tokenOk: false,
+  identityUnlocked: false,       // true when user clicked "✏ Edit identity fields"
   sandboxes: [],                 // loaded after Test Connection
   datasets: [],                  // loaded after sandbox pick
   namespaces: [],                // loaded after sandbox pick
@@ -109,24 +110,14 @@ async function renderConfig() {
   $('#btn-refresh-datasets').addEventListener('click', () => loadDatasets(true));
   $('#c-sandbox-picker').addEventListener('change', onSandboxChange);
   $('#c-delete-mode').addEventListener('change', onDeleteModeChange);
+  $('#btn-cred-add').addEventListener('click', addNewCredentialFlow);
+  $('#btn-cred-remove').addEventListener('click', removeCurrentCredential);
+  $('#btn-edit-identity').addEventListener('click', unlockIdentityFields);
+  $('#cred-picker').addEventListener('change', onCredPickerChange);
 
-  // Load existing credentials
-  try {
-    const list = await http('GET', '/config/credentials');
-    if (list.length > 0) {
-      $('#saved-creds-panel').hidden = false;
-      $('#saved-creds-list').innerHTML = list.slice(0, 5).map(c => `
-        <div class="saved-cred-item">
-          <div>
-            <div><b>${escape(c.label)}</b></div>
-            <div class="cred-meta">${c.environment} · ${c.region} · ${c.client_id.slice(0,12)}…</div>
-          </div>
-          <button data-cred-id="${c.id}" class="use-cred">use</button>
-        </div>`).join('');
-      $$('.use-cred').forEach(b => b.addEventListener('click', () =>
-        useCred(b.dataset.credId, list.find(x => x.id === b.dataset.credId))));
-    }
-  } catch (e) { /* db may not exist yet */ }
+  // Load saved-credentials list and populate the active-credential picker.
+  await refreshCredPicker();
+  applyIdentityLockState();
 
   // If we already tested this session, restore picker state
   if (state.tokenOk && state.credsId) {
@@ -217,7 +208,150 @@ async function useCred(id, cred) {
   state.tokenOk = false;
   state.sandboxes = []; state.datasets = [];
   state.config.sandboxName = ''; state.config.datasetIds = [];
+  state.identityUnlocked = false;   // re-lock identity fields when switching creds
   goto('config');
+}
+
+// ─── Active-credential picker ─────────────────────────────────────────
+// Drives the "Active credential" dropdown at the top of the Config card,
+// the "+ Add new" / "⊗ Remove" buttons, and the identity-fields lock that
+// prevents accidental edits to fields that define a credential's identity.
+
+async function refreshCredPicker() {
+  let list = [];
+  try { list = await http('GET', '/config/credentials'); } catch { /* db not ready */ }
+
+  const bar = $('#cred-picker-bar');
+  const picker = $('#cred-picker');
+  const removeBtn = $('#btn-cred-remove');
+
+  if (list.length === 0) {
+    // No saved creds yet — hide the picker entirely; the form is in "new" mode.
+    bar.hidden = true;
+    state.credsId = null;
+    return;
+  }
+
+  bar.hidden = false;
+  // "Add new" mode is signaled by state.credsId === null AND the user having
+  // explicitly unlocked identity fields. Don't auto-fallback to the most
+  // recent cred in that case — it would silently undo the user's intent.
+  const inAddNewMode = !state.credsId && state.identityUnlocked;
+  if (!inAddNewMode && (!state.credsId || !list.some(c => c.id === state.credsId))) {
+    state.credsId = list[0].id;
+  }
+
+  picker.innerHTML = list.map(c => {
+    const label = formatCredOption(c);
+    return `<option value="${c.id}"${c.id === state.credsId ? ' selected' : ''}>${escape(label)}</option>`;
+  }).join('') + `<option value="__new__"${inAddNewMode ? ' selected' : ''}>+ Add new credential</option>`;
+
+  // "Remove" makes sense only when an existing cred is selected.
+  removeBtn.disabled = inAddNewMode || !state.credsId;
+}
+
+function formatCredOption(c) {
+  const parts = [];
+  if (c.client_name) parts.push(c.client_name);
+  parts.push(c.label || '(no label)');
+  parts.push(c.environment);
+  if (c.region) parts.push(c.region);
+  return parts.join(' · ');
+}
+
+async function onCredPickerChange() {
+  const picker = $('#cred-picker');
+  const id = picker.value;
+  if (id === '__new__') {
+    // Sentinel from the dropdown — treat as "+ Add new"
+    addNewCredentialFlow();
+    return;
+  }
+  // Switching to an existing cred: hydrate the form via useCred.
+  let list = [];
+  try { list = await http('GET', '/config/credentials'); } catch { /* */ }
+  const cred = list.find(c => c.id === id);
+  if (!cred) return;
+  await useCred(id, cred);
+}
+
+function addNewCredentialFlow() {
+  // Reset everything that ties the form to a saved credential. The user is
+  // now creating a brand-new entry; the next save POSTs (creates a new row).
+  state.credsId = null;
+  state.config.label        = '';
+  state.config.clientName   = '';
+  state.config.environment  = 'Production';
+  state.config.region       = 'va7';
+  state.config.imsOrgId     = '';
+  state.config.clientId     = '';
+  state.config.clientSecret = '';
+  state.config.sandboxName  = '';
+  state.config.datasetIds   = [];
+  state.tokenOk = false;
+  state.sandboxes = []; state.datasets = []; state.namespaces = [];
+  state.identityUnlocked = true;   // identity fields editable in new-cred mode
+  goto('config');
+}
+
+async function removeCurrentCredential() {
+  if (!state.credsId) return;
+  const picker = $('#cred-picker');
+  const opt = picker.options[picker.selectedIndex];
+  const label = opt ? opt.textContent : 'this credential';
+  // Native confirm — modal would be overkill for a destructive single-action.
+  if (!confirm(`Remove ${label}?\n\nThis only deletes the saved credential entry — it does not affect anything in Adobe.`)) return;
+
+  try {
+    await http('DELETE', `/config/credentials/${state.credsId}`);
+    state.credsId = null;
+    state.tokenOk = false;
+    showAlert('#cfg-alert', 'success', 'Credential removed', 'The saved credential has been deleted from local storage.');
+    await refreshCredPicker();
+    // If there's another saved cred, picker auto-selected it; hydrate the form.
+    const newId = $('#cred-picker').value;
+    if (newId && newId !== '__new__') await onCredPickerChange();
+    else addNewCredentialFlow();
+  } catch (err) {
+    if (err.status === 409) {
+      showAlert('#cfg-alert', 'error', 'Cannot remove credential',
+        err.data?.message || 'This credential is referenced by one or more jobs.');
+    } else {
+      showAlert('#cfg-alert', 'error', 'Remove failed', err.message);
+    }
+  }
+}
+
+// ─── Identity-field lock ──────────────────────────────────────────────
+// Environment / IMS Org ID / Client ID together form the unique key on the
+// credentials row. Editing them on a loaded saved credential silently routes
+// to a different row via the upsert. We lock them by default to make that
+// "I'm creating a new credential" intent explicit.
+
+function applyIdentityLockState() {
+  const lockedByDefault = !!state.credsId && !state.identityUnlocked;
+  const fields = ['c-environment', 'c-ims-org', 'c-client-id'];
+  for (const id of fields) {
+    const el = $('#' + id);
+    if (!el) continue;
+    if (lockedByDefault) {
+      el.setAttribute('readonly', '');
+      if (el.tagName === 'SELECT') el.setAttribute('disabled', '');
+      el.classList.add('locked');
+    } else {
+      el.removeAttribute('readonly');
+      el.removeAttribute('disabled');
+      el.classList.remove('locked');
+    }
+  }
+  $('#identity-lock-row').hidden = !lockedByDefault;
+}
+
+function unlockIdentityFields() {
+  state.identityUnlocked = true;
+  applyIdentityLockState();
+  showAlert('#cfg-alert', 'info', 'Identity fields unlocked',
+    'Editing Environment, IMS Org, or Client ID will create a new credential when you save (the existing one stays untouched).');
 }
 
 async function testConnection() {
@@ -239,6 +373,11 @@ async function testConnection() {
       });
       state.credsId = saved.id;
       state.config.clientSecret = '(unchanged)';
+      // Re-lock identity fields now that the credential is committed, and
+      // refresh the picker so the new entry shows up in the dropdown.
+      state.identityUnlocked = false;
+      await refreshCredPicker();
+      applyIdentityLockState();
     }
 
     const res = await http('POST', '/config/credentials/test', { credsId: state.credsId });
@@ -247,7 +386,17 @@ async function testConnection() {
     if (res.ok) {
       showAlert('#cfg-alert', 'success', 'Connection verified',
         `Access token obtained. Loading sandboxes from Adobe…`);
-      await loadSandboxes(true);
+      // Sandbox loading is a SEPARATE Adobe call — its failure must not
+      // reset tokenOk. After a system restart the OS network stack can be
+      // slow on first outbound, and the bootstrap auto-test would
+      // otherwise leave the Authenticated chip hidden until the user
+      // clicked Test Connection manually with a warm network.
+      try {
+        await loadSandboxes(true);
+      } catch (sbxErr) {
+        showAlert('#cfg-alert', 'warning', 'Sandbox list failed to load',
+          `Authentication is OK, but the sandbox-discovery call failed: ${sbxErr.message}. Click "↻" next to the sandbox picker to retry.`);
+      }
     } else {
       showAlert('#cfg-alert', 'error', 'Connection failed',
         res.error || 'Check your credentials and try again.');
@@ -432,7 +581,25 @@ async function loadDatasets(refresh) {
 }
 
 async function saveAndContinue() {
-  // Creds are already persisted during testConnection(). Just move on.
+  // testConnection() may have already POSTed (when secret was new), but if
+  // the user only edited non-secret fields (client name, label, region) on a
+  // loaded credential, those changes have NOT been persisted yet. PATCH them
+  // now. If we have no credsId (shouldn't happen when Save is enabled, but
+  // guard anyway), this falls through cleanly.
+  try {
+    if (state.credsId && !state.identityUnlocked) {
+      await http('PATCH', `/config/credentials/${state.credsId}`, {
+        label:      state.config.label || 'Untitled',
+        clientName: state.config.clientName || null,
+        region:     state.config.region,
+      });
+      // Refresh the picker so the new label / client name shows in the dropdown.
+      await refreshCredPicker();
+    }
+  } catch (err) {
+    showAlert('#cfg-alert', 'error', 'Save failed', err.message);
+    return;
+  }
   goto('upload');
 }
 
@@ -878,59 +1045,117 @@ function logActivity(level, msg) {
     .join('');
 }
 
-// ─── Monitor ──────────────────────────────────────────────────────────
+// ─── Monitor: Active Submissions dashboard ────────────────────────────
+//
+// The Monitor tab is fundamentally about tracking deletions Adobe is
+// processing. It pulls from /jobs/monitor (jobs with at least one Adobe-
+// acked work order, sorted by latest activity) rather than /jobs (which
+// includes expanding/ready/failed jobs that have nothing to monitor).
+//
+// State for this tab lives in two places:
+//   - state.monitorList: array of dashboard-card payloads from the server
+//   - state.job:         the currently-selected job (full detail panel)
+
 const STAGES = ['received', 'validated', 'submitted', 'ingested', 'completed'];
+const MONITOR_LIST_LIMIT = 20;
+
 async function renderMonitor() {
-  // Step 1: load the recent-jobs list so an operator arriving after a restart
-  // can pick up a prior job. Backend state.db persists across restarts —
-  // /api/jobs is the authoritative source.
-  let jobs = [];
-  try { jobs = await http('GET', '/jobs?limit=20'); } catch { /* treated as empty */ }
-
-  const picker = $('#monitor-job-picker');
-  const pickerCard = $('#monitor-picker-card');
-  const meta = $('#monitor-job-meta');
-  const content = $('#monitor-content');
+  const dashboard = $('#monitor-dashboard');
   const empty = $('#monitor-empty');
+  const content = $('#monitor-content');
+  const summary = $('#monitor-summary');
+  const totalsEl = $('#monitor-totals');
+  const sandboxFilterEl = $('#monitor-sandbox-filter');
+  const listEl = $('#monitor-list');
+  const searchInput = $('#monitor-search');
 
-  if (jobs.length === 0 && !state.job) {
-    content.hidden = true;
-    pickerCard.hidden = true;
-    empty.hidden = false;
-    return;
-  }
+  let searchTerm = '';
+  let sandboxFilter = '';   // '' means All sandboxes
+  let searchDebounce = null;
 
-  pickerCard.hidden = false;
-  empty.hidden = true;
-  content.hidden = false;
+  const fetchAndRenderList = async () => {
+    let payload = { rows: [], totals: { in_flight: 0, has_failed: 0, all_completed: 0, total: 0 }, sandboxes: [] };
+    try {
+      const params = new URLSearchParams({ limit: String(MONITOR_LIST_LIMIT) });
+      if (searchTerm)    params.set('search', searchTerm);
+      if (sandboxFilter) params.set('sandbox', sandboxFilter);
+      payload = await http('GET', `/jobs/monitor?${params.toString()}`);
+    } catch { /* treated as empty */ }
+    const { rows, totals, sandboxes } = payload;
+    state.monitorList = rows;
 
-  // If nothing is selected in-memory yet, fall back to the most recent job
-  // so the Monitor tab is useful on its own after a fresh page load.
-  if (!state.job && jobs.length > 0) {
-    state.job = jobs[0];
-  }
+    // Genuine empty state — no submitted jobs anywhere, no filters active.
+    if (totals.total === 0 && !searchTerm && !sandboxFilter) {
+      dashboard.hidden = true;
+      content.hidden = true;
+      empty.hidden = false;
+      return;
+    }
+    dashboard.hidden = false;
+    empty.hidden = true;
 
-  // If the current state.job isn't in the list (e.g. older than limit=20),
-  // prepend it so the selector still shows a matching option.
-  const selectedId = state.job?.id;
-  if (selectedId && !jobs.some(j => j.id === selectedId)) {
-    jobs = [state.job, ...jobs];
-  }
+    renderTotalsChips(totals);
+    renderSandboxFilter(sandboxes);
 
-  picker.innerHTML = jobs.map(j => `
-    <option value="${j.id}" ${j.id === selectedId ? 'selected' : ''}>
-      ${escape(formatJobOption(j))}
-    </option>`).join('');
+    summary.textContent = buildSummaryText(rows, totals, searchTerm, sandboxFilter);
 
-  const renderMeta = (j) => {
-    meta.innerHTML = `
-      <span class="chip">Status: ${escape(j.status)}</span>
-      <span class="chip">Sandbox: ${escape(j.sandbox_name)}</span>
-      <span class="chip">${(j.total_source_ids || 0).toLocaleString()} source IDs</span>`;
+    if (rows.length === 0) {
+      listEl.innerHTML = `<div class="empty-state" style="padding:20px">No jobs match the current filter.</div>`;
+      return;
+    }
+
+    // Pick the job to display. Three cases:
+    //   1. state.job is set AND still in the new list  → keep showing it
+    //      (covers tab-revisit: the previous selection is still valid)
+    //   2. state.job is null OR fell out of the list   → auto-select the
+    //      most-recently-active row, but only when there's no active search
+    //      (don't yank focus while the operator is narrowing results)
+    //   3. user is searching with no current selection → render cards only;
+    //      detail panel waits for a click
+    const stillSelected = state.job && rows.some(r => r.id === state.job.id);
+    if (!stillSelected && !searchTerm) {
+      await selectMonitorJob(rows[0].id, /*silent=*/true);
+    } else if (stillSelected) {
+      // The DOM was just re-cloned by goto() — the detail card starts hidden
+      // and stale. Re-render it for the existing selection so a tab-revisit
+      // shows the pipeline immediately instead of waiting for the next poll.
+      content.hidden = false;
+      $('#monitor-detail-title').textContent =
+        `${state.job.name || state.job.id.slice(0, 8)} — pipeline detail`;
+      await refreshDetail();
+    }
+
+    listEl.innerHTML = rows.map(r => renderSubmissionCard(r, state.job?.id === r.id)).join('');
+    listEl.querySelectorAll('.sub-card').forEach(card => {
+      card.addEventListener('click', () => selectMonitorJob(card.dataset.jobId));
+    });
   };
-  renderMeta(state.job);
 
-  const refresh = async () => {
+  const selectMonitorJob = async (jobId, silent = false) => {
+    if (state.job?.id === jobId && !silent) return;
+    try {
+      const res = await http('GET', `/jobs/${jobId}`);
+      state.job = res.job;
+      state.workOrders = [];
+    } catch {
+      // Fall back to the dashboard payload if the detail fetch fails.
+      const row = state.monitorList?.find(r => r.id === jobId);
+      if (row) state.job = row;
+    }
+    content.hidden = false;
+    if (!silent) {
+      // Refresh the cards so the selected one gets the .selected highlight.
+      listEl.querySelectorAll('.sub-card').forEach(card => {
+        card.classList.toggle('selected', card.dataset.jobId === jobId);
+      });
+    }
+    $('#monitor-detail-title').textContent = state.job
+      ? `${state.job.name || state.job.id.slice(0, 8)} — pipeline detail`
+      : 'Work order pipeline';
+    await refreshDetail();
+  };
+
+  const refreshDetail = async () => {
     if (!state.job) return;
     const wos = await http('GET', `/jobs/${state.job.id}/work-orders`);
     const withAdobe = wos.filter(w => w.adobe_workorder_id);
@@ -965,29 +1190,116 @@ async function renderMonitor() {
         </div>`;
   };
 
-  picker.addEventListener('change', async () => {
-    const id = picker.value;
-    // Fetch the full job detail so downstream tabs (plan/submit) have the
-    // target_services + breakdown they'd otherwise get from an upload flow.
-    try {
-      const res = await http('GET', `/jobs/${id}`);
-      state.job = res.job;
-      state.workOrders = [];
-    } catch {
-      state.job = jobs.find(j => j.id === id) || null;
+  // ─── Helpers (closure: searchTerm, sandboxFilter, fetchAndRenderList) ─
+
+  function renderTotalsChips(t) {
+    // job-level counts (each job sits in exactly one bucket): in-flight,
+    // has-failed (no in-flight but at least one failed WO), all-completed
+    const chips = [];
+    if (t.in_flight)    chips.push(`<span class="dash-chip in-flight">${t.in_flight} in-flight</span>`);
+    if (t.all_completed)chips.push(`<span class="dash-chip completed">${t.all_completed} completed</span>`);
+    if (t.has_failed)   chips.push(`<span class="dash-chip failed">${t.has_failed} failed</span>`);
+    totalsEl.innerHTML = chips.join('');
+  }
+
+  function renderSandboxFilter(sandboxes) {
+    // Hide only when there are zero submitted sandboxes (the empty-state
+    // renderer takes over upstream anyway). With one sandbox we still show
+    // the row so the feature is discoverable — the operator sees both
+    // "All sandboxes" and the single sandbox chip; both lead to the same
+    // result, but the "filter by sandbox" affordance is visible.
+    if (!sandboxes || sandboxes.length === 0) {
+      sandboxFilterEl.innerHTML = '';
+      sandboxFilter = '';   // collapse a stale filter to All
+      return;
     }
-    if (state.job) renderMeta(state.job);
-    await refresh();
+    const totalAll = sandboxes.reduce((s, sb) => s + sb.count, 0);
+    const chips = [
+      `<button type="button" class="dash-filter-chip${sandboxFilter === '' ? ' active' : ''}" data-sandbox="">All sandboxes (${totalAll})</button>`,
+      ...sandboxes.map(sb => `<button type="button" class="dash-filter-chip${sandboxFilter === sb.name ? ' active' : ''}" data-sandbox="${escape(sb.name)}">${escape(sb.name)} (${sb.count})</button>`),
+    ];
+    sandboxFilterEl.innerHTML = chips.join('');
+    sandboxFilterEl.querySelectorAll('.dash-filter-chip').forEach(b => {
+      b.addEventListener('click', () => {
+        const next = b.dataset.sandbox || '';
+        if (next === sandboxFilter) return;
+        sandboxFilter = next;
+        fetchAndRenderList();
+      });
+    });
+  }
+
+  function buildSummaryText(rows, totals, search, sandbox) {
+    const scope = sandbox ? `sandbox "${sandbox}"` : 'all sandboxes';
+    if (search) {
+      return `${rows.length} of ${totals.total} match${totals.total === 1 ? '' : 'es'} for "${search}" in ${scope}.`;
+    }
+    if (totals.total === 0) {
+      return `No submitted jobs in ${scope}.`;
+    }
+    const visible = rows.length;
+    const total = totals.total;
+    const overflow = total > visible ? ` (${total - visible} more — use search)` : '';
+    return `Showing ${visible} of ${total} in ${scope}, in-flight first then by latest Adobe activity${overflow}.`;
+  }
+
+  searchInput.addEventListener('input', () => {
+    clearTimeout(searchDebounce);
+    searchDebounce = setTimeout(() => {
+      searchTerm = searchInput.value.trim();
+      fetchAndRenderList();
+    }, 250);
   });
 
-  await refresh();
-  state.pollTimer = setInterval(refresh, 5000);
+  await fetchAndRenderList();
+  // Poll: refresh the list every 15s so an operator who leaves the tab open
+  // sees Adobe activity (e.g. orders advancing from received → validated)
+  // without manual refresh. Detail panel polls more often via the same loop.
+  state.pollTimer = setInterval(async () => {
+    await fetchAndRenderList();
+    if (state.job) await refreshDetail();
+  }, 15000);
 }
 
-function formatJobOption(j) {
-  const when = (j.created_at || '').replace('T', ' ').slice(0, 16);
-  const ids = (j.total_source_ids || 0).toLocaleString();
-  return `${when} · ${j.name || j.id.slice(0, 8)} · ${j.sandbox_name} · ${ids} IDs · ${j.status}`;
+function renderSubmissionCard(r, isSelected) {
+  const total = r.submitted_count || 0;
+  const completed = r.completed_count || 0;
+  const inFlight = r.in_flight_count || 0;
+  const failed = r.adobe_failed_count || 0;
+  const pct = total ? Math.round((completed / total) * 100) : 0;
+  const updated = formatRelativeTime(r.latest_activity_at);
+  const dayInfo = r.max_day && r.max_day > 1 ? `Day 1–${r.max_day}` : 'Single-day';
+  const ids = Number(r.submitted_ids || 0).toLocaleString();
+
+  return `
+    <div class="sub-card${isSelected ? ' selected' : ''}" data-job-id="${escape(r.id)}">
+      <div class="sub-card-name">${escape(r.name || r.id.slice(0, 8))}</div>
+      <div class="sub-card-action">${isSelected ? 'Selected' : 'Open →'}</div>
+      <div class="sub-card-stats">
+        <span><b>${total}</b> work order${total === 1 ? '' : 's'}</span>
+        ${inFlight ? `<span class="in-flight">${inFlight} in-flight</span>` : ''}
+        ${completed ? `<span class="completed">${completed} completed</span>` : ''}
+        ${failed ? `<span class="failed">${failed} failed</span>` : ''}
+        <span>${ids} ids</span>
+      </div>
+      <div class="sub-card-bar"><div class="sub-card-bar-fill" style="width:${pct}%"></div></div>
+      <div class="sub-card-meta">
+        <span>${escape(r.sandbox_name || '')} · ${escape(dayInfo)}</span>
+        <span>Updated ${escape(updated)}</span>
+      </div>
+    </div>`;
+}
+
+function formatRelativeTime(sqlTimestamp) {
+  if (!sqlTimestamp) return '—';
+  // SQLite datetime('now') is "YYYY-MM-DD HH:MM:SS" in UTC; treat as such.
+  const ts = new Date(sqlTimestamp.replace(' ', 'T') + 'Z').getTime();
+  if (isNaN(ts)) return sqlTimestamp;
+  const diff = Date.now() - ts;
+  if (diff < 60_000) return 'just now';
+  if (diff < 3_600_000) return `${Math.round(diff / 60_000)} min ago`;
+  if (diff < 86_400_000) return `${Math.round(diff / 3_600_000)} hr ago`;
+  return `${Math.round(diff / 86_400_000)} day(s) ago`;
 }
 
 function stageIdx(s) { const i = STAGES.indexOf(s); return i < 0 ? 0 : i; }
