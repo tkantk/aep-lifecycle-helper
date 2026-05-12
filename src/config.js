@@ -7,6 +7,26 @@ import path from 'node:path';
 
 const cwd = process.cwd();
 
+/**
+ * Detect when `dataDir` lives inside a cloud-sync path (OneDrive, Dropbox,
+ * Google Drive, iCloud). The encryption key + encrypted client secrets live
+ * here, and syncing them to a third-party cloud is exactly what we don't
+ * want. This is informational only — we log a loud warning at boot. See
+ * F3 in the 2026-05-12 security review.
+ */
+export function detectCloudSyncPath(p) {
+  const normalized = p.replace(/\\/g, '/').toLowerCase();
+  const patterns = [
+    { name: 'OneDrive',      re: /\/onedrive([^/]*\/|\/)/ },
+    { name: 'Dropbox',       re: /\/dropbox(\/|$)/ },
+    { name: 'Google Drive',  re: /\/google ?drive(\/|$)/ },
+    { name: 'iCloud Drive',  re: /\/icloud ?drive(\/|$)/ },
+    { name: 'Box',           re: /\/box sync(\/|$)/ },
+  ];
+  for (const { name, re } of patterns) if (re.test(normalized)) return name;
+  return null;
+}
+
 export const config = {
   port: Number(process.env.PORT) || 3000,
   // Default to loopback so the unauthenticated API + destructive submit

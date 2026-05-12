@@ -24,6 +24,8 @@ process.env.OUTPUT_DIR = os.tmpdir();
 const { initDb, q } = await import('../src/db.js');
 const { storeCreds } = await import('../src/utils/crypto.js');
 const configRouter = (await import('../src/routes/config.js')).default;
+const { makeErrorHandler } = await import('../src/middleware/security.js');
+const { logger } = await import('../src/utils/logger.js');
 
 let server;
 let baseUrl;
@@ -32,7 +34,11 @@ before(async () => {
   initDb();
   const app = express();
   app.use(express.json());
+  // configRouter registers UUID param guards on itself (Express 4 doesn't
+  // propagate app.param down to sub-routers). Just mount routers + error
+  // middleware — same shape as production.
   app.use('/api/config', configRouter);
+  app.use(makeErrorHandler(logger));
   await new Promise(resolve => {
     server = app.listen(0, '127.0.0.1', resolve);
   });
@@ -140,11 +146,25 @@ test('PATCH never overwrites the encrypted client secret', async () => {
 });
 
 test('PATCH on a non-existent id returns 404', async () => {
-  const res = await request('PATCH', '/api/config/credentials/does-not-exist', {
+  // Must be a syntactically valid UUID — malformed IDs are now rejected by
+  // the UUID param guard with 400 before reaching the route (F5 fix).
+  const fakeId = '00000000-0000-0000-0000-000000000000';
+  const res = await request('PATCH', `/api/config/credentials/${fakeId}`, {
     label: 'Anything', clientName: null, region: 'va7',
   });
   assert.equal(res.status, 404);
-  assert.match(res.body.error, /not found/i);
+  // Error envelope: { error: 'not_found', message: 'credential not found' }.
+  assert.match(res.body.message, /not found/i);
+});
+
+test('PATCH with malformed UUID returns 400 invalid_id', async () => {
+  // F5 regression test: the UUID param guard rejects non-UUID :id values
+  // before the route runs, so the DB and filesystem never see them.
+  const res = await request('PATCH', '/api/config/credentials/does-not-exist', {
+    label: 'Anything', region: 'va7',
+  });
+  assert.equal(res.status, 400);
+  assert.equal(res.body.error, 'invalid_id');
 });
 
 test('PATCH with missing label returns 400', async () => {
@@ -153,7 +173,9 @@ test('PATCH with missing label returns 400', async () => {
     clientName: 'Whatever', region: 'va7',
   });
   assert.equal(res.status, 400);
-  assert.match(res.body.error, /label/i);
+  // Error envelope splits machine code (`error`) from human message
+  // (`message`). The label-specific text lives in `message`.
+  assert.match(res.body.message, /label/i);
 });
 
 test('PATCH does not change identity fields (env, ims_org, client_id)', async () => {

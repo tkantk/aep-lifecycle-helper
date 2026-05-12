@@ -41,7 +41,37 @@ export async function streamIds(filePath, { column = 0, onRow }) {
 }
 
 /**
- * Write rows to CSV with streaming output.
+ * Defend the exported CSV against spreadsheet-formula injection (a.k.a. CSV
+ * injection). Excel / Google Sheets execute the contents of a cell whose
+ * value starts with =, +, -, @, tab, or CR — so an identifier value of
+ * `=cmd|...` would execute when the operator double-clicks the export. We
+ * prefix flagged values with a leading apostrophe so the spreadsheet treats
+ * them as literal text. Safe for non-spreadsheet consumers because the
+ * apostrophe is part of the CSV value (not a CSV-quoting artefact).
+ *
+ * Reference: F10 in the 2026-05-12 security review; OWASP "CSV Injection".
+ */
+const FORMULA_PREFIX_RE = /^[=+\-@\t\r]/;
+
+export function sanitiseCsvValue(v) {
+  if (v == null) return v;
+  const s = typeof v === 'string' ? v : String(v);
+  return FORMULA_PREFIX_RE.test(s) ? `'${s}` : s;
+}
+
+function sanitiseRow(row) {
+  if (Array.isArray(row)) return row.map(sanitiseCsvValue);
+  if (row && typeof row === 'object') {
+    const out = {};
+    for (const k of Object.keys(row)) out[k] = sanitiseCsvValue(row[k]);
+    return out;
+  }
+  return row;
+}
+
+/**
+ * Write rows to CSV with streaming output. Every value is run through the
+ * formula-injection sanitiser above.
  */
 export async function writeCsv(filePath, headers, rows) {
   await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
@@ -49,7 +79,8 @@ export async function writeCsv(filePath, headers, rows) {
   const csv = format({ headers, writeHeaders: true });
   csv.pipe(out);
   for (const row of rows) {
-    if (!csv.write(row)) await new Promise(r => csv.once('drain', r));
+    const safe = sanitiseRow(row);
+    if (!csv.write(safe)) await new Promise(r => csv.once('drain', r));
   }
   csv.end();
   await new Promise((resolve, reject) => {

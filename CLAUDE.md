@@ -238,6 +238,15 @@ The encryption key lives at `data/.key` (auto-generated, chmod 600) or in
 the `ENCRYPTION_KEY` env var. Never log, dump, or emit decrypted secrets
 anywhere. Tokens (short-lived) stay in memory only, never written to disk.
 
+Key file creation uses `O_EXCL` (`fs.writeFileSync(..., {flag:'wx'})`) so a
+parallel boot can't race two different keys into the file. On Windows the
+`mode: 0o600` is ignored by the OS — the key inherits the parent dir's ACL.
+**Do not place `data/` inside a cloud-sync path (OneDrive / Dropbox / Google
+Drive / iCloud).** Index.js prints a `SECURITY WARNING` at boot when it
+detects one; `config.detectCloudSyncPath` recognises the common providers.
+Operators should set `DATA_DIR` to e.g. `%LOCALAPPDATA%\aep-lifecycle-helper`
+on Windows, or stop the sync for the folder.
+
 **`PATCH /api/config/credentials/:id` never touches the encrypted secret
 blob** (or the identity fields environment / ims_org_id / client_id —
 those define the row's UNIQUE key). The PATCH route only updates label,
@@ -340,6 +349,58 @@ This means:
 If you find yourself wanting to load anything from a third-party origin,
 download it and ship it. Disk space is fine; offline correctness is the
 goal.
+
+### I13. Local API has Host-header + Origin/Referer + helmet guards
+
+The local server binds 127.0.0.1 (I12 / `config.host`) but the API has no
+human authentication and no API token. That alone is not enough to keep a
+random web page the operator has open from driving destructive Adobe
+deletions. Three guards in `src/middleware/security.js` are mandatory:
+
+- `hostHeaderGuard` — rejects requests whose Host header is not localhost
+  / 127.0.0.1 / [::1]. **This is the only defense against DNS rebinding**
+  (a malicious page that resolves attacker.com to its real IP, serves JS,
+  then re-resolves to 127.0.0.1 — the browser then talks to localhost
+  thinking it's still same-origin with attacker.com, but the Host header
+  it sends is still `attacker.com`). Without this guard, the destructive
+  API is reachable from any browser tab the operator opens.
+- `originRefererGuard` — on POST/PUT/PATCH/DELETE, the Origin (or Referer
+  fallback) host must match the request's own Host. Closes simple-form
+  CSRF: a `<form action="http://localhost:3000/api/jobs/:id/submit">`
+  posted from cross-origin would otherwise fire all planned work orders.
+- `makeErrorHandler` — 5xx responses surface a generic message (raw
+  `err.message` from better-sqlite3 / `fs` errors leaks absolute paths);
+  4xx responses use the route-set `code` + `publicMessage`.
+
+helmet is mounted with CSP `script-src 'self'` (no inline scripts;
+`index.html` complies), `style-src 'self' 'unsafe-inline'` (existing
+inline `style="…"` attrs), `frame-ancestors 'none'`, `object-src 'none'`,
+COOP/CORP `same-origin`. **Don't loosen the CSP without justification.**
+
+Regression tests live in `test/security.test.js`.
+
+### I14. Region and environment are allowlisted server-side
+
+`region` and `environment` on a credential row flow into a URL host and
+into validation logic respectively. The UI dropdowns enforce a fixed set
+client-side, but the server MUST also enforce the same lists — otherwise
+a CSRF/rebinding attacker (or any future direct DB write) can set
+`region = "evil.com#"` and template the bearer token into a host they
+control. Validators in `src/routes/config.js`:
+
+```
+ALLOWED_REGIONS       = {va7, nld2, aus5, can2}
+ALLOWED_ENVIRONMENTS  = {Production, Stage, Development}
+```
+
+Belt-and-suspenders allowlist checks in `src/services/identityGraph.js`
+and `src/services/namespaces.js` refuse to build an Identity URL if a
+stale DB row carries a bad region. **Update both the routes/config.js
+list and the two services lists together** when Adobe adds a new region.
+
+Route handlers also validate string lengths and reject control characters
+(CR/LF/null) in `imsOrgId`, `clientId`, `clientSecret`, etc. — those flow
+into HTTP headers downstream.
 
 ---
 

@@ -56,8 +56,8 @@ async function http(method, path, body) {
 // ─── Steps & routing ───────────────────────────────────────────────────
 const STEPS = {
   config:  { title: 'Environment Configuration', sub: 'Configure IMS credentials and sandbox for the Data Lifecycle API.', crumbs: ['Data Management', 'Environment Configuration'], render: renderConfig },
-  upload:  { title: 'Upload Source Identities',  sub: 'Upload a CSV containing hashedKocid values to be deleted.',         crumbs: ['Data Management', 'Source CSV Upload'],     render: renderUpload },
-  expand:  { title: 'Identity Graph Expansion',  sub: 'Resolve all identities linked to each hashedKocid.',                crumbs: ['Identities', 'Identity Expansion'],         render: renderExpand },
+  upload:  { title: 'Upload Source Identities',  sub: 'Upload a CSV of source identifier values to be deleted.',          crumbs: ['Data Management', 'Source CSV Upload'],     render: renderUpload },
+  expand:  { title: 'Identity Graph Expansion',  sub: 'Resolve all identities linked to each source identifier.',         crumbs: ['Identities', 'Identity Expansion'],         render: renderExpand },
   plan:    { title: 'Work Order Batch Planning', sub: 'Group identities into optimally-sized batches respecting daily quotas.', crumbs: ['Identities', 'Batch Planning'],    render: renderPlan },
   submit:  { title: 'Submit Work Orders',        sub: 'Submit record-delete work orders to the Data Hygiene API.',          crumbs: ['Data Lifecycle', 'Work Orders'],            render: renderSubmit },
   monitor: { title: 'Work Order Monitor',        sub: 'Track status of submitted work orders across downstream services.', crumbs: ['Data Lifecycle', 'Monitor'],                render: renderMonitor },
@@ -496,10 +496,13 @@ function populateNamespacePicker() {
     return (a.code || '').localeCompare(b.code || '');
   });
 
+  // Escape every Adobe-supplied field — the namespace registry response is
+  // not under our control. A namespace `code` of `" onfocus=alert(1) x="`
+  // would otherwise break out of the option's value attribute.
   el.innerHTML = sorted.map(n => {
     const label = `${n.code}${n.name && n.name !== n.code ? ` — ${n.name}` : ''}${n.custom ? '  [custom]' : ''}`;
     const selected = n.code === state.config.sourceNamespace ? 'selected' : '';
-    return `<option value="${n.code}" data-nsid="${n.id}" ${selected}>${label}</option>`;
+    return `<option value="${escape(n.code)}" data-nsid="${escape(n.id)}" ${selected}>${escape(label)}</option>`;
   }).join('');
 
   el.disabled = false;
@@ -1180,10 +1183,10 @@ async function renderMonitor() {
             <thead><tr><th>Adobe ID</th><th>Identities</th><th>Pipeline</th><th>Updated</th></tr></thead>
             <tbody>${withAdobe.map(w => `
               <tr>
-                <td class="mono">${w.adobe_workorder_id.slice(0, 24)}…</td>
+                <td class="mono">${escape(String(w.adobe_workorder_id).slice(0, 24))}…</td>
                 <td class="num">${w.identifier_count.toLocaleString()}</td>
-                <td>${pipelineHtml(stageIdx(w.adobe_status))}</td>
-                <td style="color: var(--g600); font-size: 11.5px">${w.updated_at}</td>
+                <td>${pipelineHtml(stageIdx(w.adobe_status), w.adobe_status)}</td>
+                <td style="color: var(--g600); font-size: 11.5px">${escape(w.updated_at)}</td>
               </tr>`).join('')}
             </tbody>
           </table>
@@ -1302,19 +1305,46 @@ function formatRelativeTime(sqlTimestamp) {
   return `${Math.round(diff / 86_400_000)} day(s) ago`;
 }
 
-function stageIdx(s) { const i = STAGES.indexOf(s); return i < 0 ? 0 : i; }
+// Returns -1 for any status not in STAGES — pipelineHtml then renders no
+// "current" dot rather than silently lighting position 0 (which would falsely
+// imply Adobe reported "received").
+function stageIdx(s) { return STAGES.indexOf(s); }
 function stageColor(s) {
   return { received: 'var(--g500)', validated: 'var(--orange500)',
     submitted: 'var(--blue500)', ingested: 'var(--purple500)', completed: 'var(--green500)' }[s];
 }
-function pipelineHtml(current) {
+// AEP's Data Lifecycle UI collapses received/validated/submitted/ingested
+// into a single "Processing" label and exposes only Processing/Completed/
+// Failed to operators. We mirror that vocabulary on the pill so a user
+// looking at this tool and at AEP side-by-side sees matching wording. The
+// 5-stage pipeline dots remain for engineer-level diagnosis; hover the pill
+// to see the raw API status.
+function friendlyStatus(raw) {
+  if (raw === 'completed') return 'Completed';
+  if (raw === 'failed')    return 'Failed';
+  if (STAGES.includes(raw)) return 'Processing';
+  return raw || 'Unknown';
+}
+function friendlyStatusClass(raw) {
+  if (raw === 'completed') return 'completed';
+  if (raw === 'failed')    return 'failed';
+  if (STAGES.includes(raw)) return 'processing';
+  return 'unknown';
+}
+function pipelineHtml(current, rawStatus) {
+  const friendly = friendlyStatus(rawStatus);
+  const cls = friendlyStatusClass(rawStatus);
+  const tooltip = rawStatus
+    ? `Adobe API status: ${rawStatus}`
+    : 'Adobe has not reported a status yet';
   let html = '<div class="pipeline">';
   STAGES.forEach((s, i) => {
-    const done = i <= current;
-    html += `<div class="node ${i === current ? 'current' : done ? 'done' : ''}"></div>`;
-    if (i < STAGES.length - 1) html += `<div class="link ${i < current ? 'done' : ''}"></div>`;
+    const done = current >= 0 && i <= current;
+    const isCurrent = current >= 0 && i === current;
+    html += `<div class="node ${isCurrent ? 'current' : done ? 'done' : ''}" title="${escape(s)}"></div>`;
+    if (i < STAGES.length - 1) html += `<div class="link ${current >= 0 && i < current ? 'done' : ''}"></div>`;
   });
-  html += `<span class="pipeline-label">${STAGES[current]}</span></div>`;
+  html += `<span class="pill ${cls}" title="${escape(tooltip)}">${escape(friendly)}</span></div>`;
   return html;
 }
 

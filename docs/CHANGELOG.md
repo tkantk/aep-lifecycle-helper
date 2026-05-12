@@ -9,6 +9,249 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-05-12 — Security review fixes (F1–F14)
+
+Context: a full security review of the codebase (see security report from
+the 2026-05-07/08 session in the project root, attached to the review PR)
+turned up 14 findings ranging from critical (DNS rebinding / unauthenticated
+local API) to informational. This session lands the fixes for F1–F14 in one
+bundle so the gaps don't sit while we triage individually.
+
+### Backend — request guards and helmet (F1, F8)
+
+- **`src/middleware/security.js`** — new module hosting three middleware
+  primitives and a centralised error handler:
+  - `hostHeaderGuard` — rejects requests whose Host header is not
+    localhost / 127.0.0.1 / [::1]. Closes DNS rebinding (an attacker.com
+    page that rebinds to 127.0.0.1 keeps `Host: attacker.com` after
+    rebinding, so we can detect and 421-reject it).
+  - `originRefererGuard` — for POST/PUT/PATCH/DELETE, requires the Origin
+    (or, fallback, Referer) host to match the request's own Host. Closes
+    simple-form CSRF: a `<form>` POST from a cross-origin page now gets
+    403 instead of triggering destructive submission. Requests with
+    neither header (curl / programmatic clients) are allowed since they
+    can't be CSRF.
+  - `registerUuidParamGuards(router)` — calls `router.param('id', …)` /
+    `router.param('credsId', …)` to validate that both UUID-shaped path
+    params actually parse as v4 UUIDs. F5 fix. **Must be called on each
+    router** because Express 4 doesn't propagate `app.param()` into
+    mounted sub-routers.
+  - `makeErrorHandler(logger)` — 5xx responses get a generic
+    "internal_error" message (no raw `err.message` — better-sqlite3 and
+    `fs` errors otherwise leak absolute paths); 4xx responses surface a
+    `code` + `publicMessage` set by the route handler.
+- **`src/index.js`** — wires `hostHeaderGuard`, `originRefererGuard`,
+  `helmet` (with a tight CSP: `script-src 'self'`, no inline scripts;
+  `style-src 'self' 'unsafe-inline'` to permit the existing inline
+  `style="…"` attrs; `frame-ancestors 'none'`, `object-src 'none'`,
+  COOP/CORP `same-origin`), and the centralised error handler.
+
+### Backend — region allowlist + cred field validation (F2, F7)
+
+- **`src/routes/config.js`** — POST/PATCH/test all validate strings
+  against length caps + control-character rejection, and lock `region` to
+  `{va7, nld2, aus5, can2}` and `environment` to `{Production, Stage,
+  Development}` server-side. The UI dropdown already enforced this
+  client-side, but the server accepted any string — which made a stored
+  `region = "evil.com#"` (set via a CSRF or rebinding attack) into an
+  SSRF that templated into the Identity host with the bearer token
+  attached. Belt-and-suspenders allowlists in
+  `src/services/identityGraph.js` and `src/services/namespaces.js`
+  refuse to build the URL if a stale DB row carries a bad region.
+
+### Backend — encryption key hardening (F3, F12)
+
+- **`src/utils/crypto.js`** — first-run key creation now opens with
+  `O_EXCL` (`flag: 'wx'`) so two concurrent boot processes can't each
+  generate a different key and silently strand secrets. On POSIX we also
+  verify+`chmod` the file to 0600 if the umask masked our request.
+- **`src/config.js`** — new exported `detectCloudSyncPath(p)` helper
+  recognises OneDrive / Dropbox / Google Drive / iCloud / Box paths.
+- **`src/index.js`** — startup banner emits a loud `SECURITY WARNING` log
+  line when `dataDir` resolves under a cloud-sync path. The encryption
+  key and encrypted client secrets live in `data/`; syncing them to a
+  third-party cloud co-locates key + ciphertext off-machine. Doesn't
+  auto-relocate (would silently break existing setups) — operators set
+  `DATA_DIR` or stop the sync.
+
+### Backend — multer 2.x upgrade + bounded limits (F4)
+
+- **`package.json`** — `multer` ^1.4.5-lts.1 → ^2.0.0 (current 2.1.1).
+  Multer 1.x is end-of-life and has several DoS / uncaught-exception
+  advisories.
+- **`src/routes/upload.js`** — added per-request limits beyond just
+  `fileSize`: `files: 1`, `fields: 20`, `parts: 25`, `headerPairs: 100`,
+  `fieldNameSize: 100`, `fieldSize: 64 KiB`. Also added a wrapper that
+  converts `MulterError` into a 400 with the multer code as `error`
+  instead of letting it fall through to the 500 handler.
+- **`src/routes/upload.js`** — random filename now uses a sanity-checked
+  extension (`.csv`/`.txt`/`.tsv` only, default `.csv`) instead of
+  whatever `path.extname(originalname)` returned.
+
+### Backend — dotenv pinned, errors sanitised, graceful shutdown (F6, F11, F14)
+
+- **`src/index.js`** — replaced `import 'dotenv/config'` (CWD-relative)
+  with `dotenv.config({ path: '<package-root>/.env' })`. A stray `.env`
+  in the current working directory can no longer override `HOST`,
+  `ENCRYPTION_KEY`, `IMS_HOST`, or `AEP_GATEWAY`.
+- **`src/index.js`** — SIGTERM/SIGINT now: (a) stops accepting new
+  connections, (b) gives in-flight requests up to 10s, (c) checkpoints
+  + closes SQLite (`pragma wal_checkpoint(TRUNCATE)`, `db.close()`), then
+  exits. The old `process.exit(0)` left the WAL un-checkpointed and
+  forced extra recovery work on next boot.
+
+### Backend — CSV formula-injection guard (F10)
+
+- **`src/utils/csv.js`** — `writeCsv` now runs every value through
+  `sanitiseCsvValue` before emitting it: any value starting with `=`,
+  `+`, `-`, `@`, tab, or CR is prefixed with `'` so Excel/Sheets treat it
+  as literal text instead of executing a formula. Applies to the
+  identifier export endpoint and any future CSV writer that uses this
+  helper.
+
+### Frontend — escaped HTML sinks (F9)
+
+- **`src/web/app.js:499–503`** — namespace `<option>` builder now passes
+  `n.code`, `n.id`, and the combined `label` through `escape()`. A
+  namespace whose `code` contained quote or angle-bracket characters
+  could previously break out of the option attribute / inject markup.
+- **`src/web/app.js:1186`** — monitor table now escapes
+  `w.adobe_workorder_id` and `w.updated_at` before inserting into HTML.
+  Defence-in-depth against malformed/malicious Adobe responses.
+
+### Tests
+
+- **`test/security.test.js`** — new file. 19 cases cover: host-header
+  guard accepts loopback variants and rejects attacker.com Host,
+  origin guard accepts same-origin POST and rejects cross-origin POST
+  and mismatched-Referer, UUID guard rejects non-UUID `:id`, region
+  allowlist rejects evil.com and accepts case-insensitive members,
+  environment allowlist, CRLF in fields rejected, oversized
+  clientSecret rejected, missing label rejected, PATCH region
+  allowlist, CSV formula sanitiser correctness.
+- **`test/credentialsRoutes.test.js`** — updated two tests to match the
+  new error envelope (`error` is now a machine code, human text moved
+  to `message`) and the new UUID guard semantics (malformed `:id` now
+  returns 400 `invalid_id` before the route runs; the 404 case must
+  pass a valid UUID that doesn't exist). Added one new test:
+  `PATCH with malformed UUID returns 400 invalid_id`.
+- **133/133 pass.**
+
+### Infra / docs
+
+- **`package.json`** — added `helmet` ^8.1.0.
+- **`docs/ARCHITECTURE.md`** — module map gained `src/middleware/`;
+  §3 step-1 augmented with the security-middleware order.
+- **`CLAUDE.md`** — added invariants I13 (security middleware order)
+  and I14 (region allowlist enforced server-side, not just in the UI).
+
+---
+
+## 2026-05-06 (followup) — Generic source-identifier copy in UI
+
+Context: operator pointed out that several UI strings still treated
+`hashedKocid` as the canonical/only input namespace, even though the tool's
+Upload-tab namespace dropdown has been fully generic for some time (works
+with email, phone, ECID, CRMID, GAID, IDFA, or any custom namespace in the
+sandbox's registry — see CLAUDE.md "Single source namespace per job"
+limitation, which clarifies that any single namespace is supported, just
+not multiple at once). The `hashedKocid` references read as factual claims
+about what the tool does, which would mislead any operator running it
+against a non-Coca-Cola sandbox.
+
+### Frontend — copy generalisation
+
+- **`src/web/index.html`** — About panel on the Environment page now reads
+  "Resolves source identifiers (any AEP namespace — hashedKocid, email,
+  CRMID, etc.) to their full Identity Graph clusters…". Lists a few common
+  namespace codes as examples so the copy is still concrete enough to
+  ground first-time readers, without claiming hashedKocid is special.
+- **`src/web/index.html`** — "Why expansion?" panel on the Source CSV tab
+  rewritten as "Your source identifier is only one identity node…" — the
+  rest of the warning (about linked email/phone/ECID/CRMID, full deletion
+  requiring cluster resolution) is unchanged.
+- **`src/web/app.js`** — Upload and Expand step headers (used in
+  breadcrumb subtitles) generalised: "Upload a CSV of source identifier
+  values to be deleted." / "Resolve all identities linked to each source
+  identifier."
+
+### Not changed (deliberate)
+
+- **`src/web/app.js:24`** — `state.sourceNamespace = 'hashedKocid'` default.
+  This is the form's pre-selected dropdown value, not user-facing claim
+  text. Kept for backwards compat with existing operator muscle memory;
+  any saved sandbox namespace registry will repopulate this on Upload-tab
+  entry anyway.
+- **`src/web/app.js:1360-1362`** and **`src/web/styles.css:411`** — namespace
+  badge color hints (`hashedKocid: purple`, `email: blue`, etc.). These are
+  presentation conveniences for known namespaces, not claims about
+  supported input. Custom namespaces fall through to a neutral gray.
+
+### Tests
+
+- 113/113 still pass (text-only frontend changes, no test fixtures or
+  payload contracts touched).
+
+---
+
+## 2026-05-06 — Monitor Pipeline label matches AEP UI vocabulary
+
+Context: operator noticed the Monitor tab's per-work-order Pipeline column
+showed `received` (with the first dot lit) for a work order that AEP's own
+Data Lifecycle UI was showing as `Processing`. Investigation confirmed both
+sources were consistent at the data layer — Adobe's
+`GET /data/core/hygiene/workorder/{id}` literally returns
+`status: "received"`, which we store and render verbatim — but AEP's UI
+collapses every non-terminal API stage (`received` / `validated` /
+`submitted` / `ingested`) into a single user-facing **Processing** label.
+Operators comparing the two screens reasonably ask "which is right?". Both
+were, but in different vocabularies.
+
+Compounding this: `stageIdx` previously fell back to `0` for any
+non-recognised status, which would silently render an unknown status as if
+Adobe had reported `received`. If Adobe ever does add a new API status, the
+old code would have hidden it behind a fake "received" label.
+
+### Frontend
+
+- **`src/web/app.js`** — added `friendlyStatus()` and `friendlyStatusClass()`
+  helpers that map the 6 documented API statuses to AEP's UI vocabulary
+  (`received` / `validated` / `submitted` / `ingested` → **Processing**;
+  `completed` → **Completed**; `failed` → **Failed**; anything else →
+  surfaced verbatim as **Unknown**, never silently flattened).
+- **`src/web/app.js`** — `pipelineHtml(current, rawStatus)` now takes the
+  raw status as a second argument, replaces the old `<span class="pipeline-label">`
+  with a colour-coded `<span class="pill">`, and writes the raw API status
+  into the pill's `title` tooltip for engineer-level diagnosis. Each dot
+  also carries its own stage name as a `title` attribute so hovering an
+  individual node shows the granular API stage.
+- **`src/web/app.js`** — `stageIdx` now returns `-1` for unrecognised
+  statuses rather than `0`. `pipelineHtml` treats `-1` by lighting no
+  "current" dot — a future unknown status would no longer be misrendered as
+  `received`. The stage stats grid above the table benefits identically:
+  unknown statuses no longer count toward any stage bucket.
+- **`src/web/app.js`** — call site at the Monitor table updated to pass
+  `w.adobe_status` through to `pipelineHtml` so the new tooltip works.
+- **`src/web/styles.css`** — added `.pill.processing` (blue, grouped with
+  the existing `.pill.received` rule) and `.pill.unknown` (gray, grouped
+  with `.pill.planned`/`.pill.queued`). Replaced the now-unused
+  `.pipeline-label` rule with `.pipeline .pill { margin-left: 10px; }` so
+  the pill spaces correctly after the last dot.
+
+### Tests
+
+- 113/113 still pass (no backend behaviour changed; the friendly-label
+  layer is purely presentational and frontend-only — the Monitor SQL
+  contract still keys on the raw `adobe_status` values).
+
+### Docs
+
+- This changelog entry. No invariant change (the API contract docs in
+  `CLAUDE.md` / `REVIEW.md` are correct as-is — the API really does emit
+  the 6 documented statuses; the label change is a UI-only courtesy).
+
+---
+
 ## 2026-04-28 (followup) — Two bug fixes after operator testing
 
 After running the new Monitor dashboard against a real workspace with one

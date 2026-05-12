@@ -10,14 +10,52 @@ import { logger } from '../utils/logger.js';
 
 const router = Router();
 
+// multer is bounded on every dimension so a malformed multipart stream can't
+// cause unbounded memory growth or fill the disk. fileSize 4 GiB keeps the
+// documented "up to 4 GB CSV" UX; the rest are sized for our single-file
+// upload form (one CSV + a handful of plain text fields).
 const upload = multer({
   storage: multer.diskStorage({
     destination: config.uploadDir,
-    filename: (_req, file, cb) =>
-      cb(null, `${Date.now()}_${uuid()}${path.extname(file.originalname) || '.csv'}`),
+    filename: (_req, file, cb) => {
+      // Filenames are random; we only borrow the user-supplied extension and
+      // sanity-check it so the extname doesn't smuggle weird characters into
+      // the filesystem. The original filename is preserved as the job name
+      // in the route handler, not on disk.
+      const ext = path.extname(file.originalname || '').toLowerCase();
+      const safeExt = /^\.(csv|txt|tsv)$/.test(ext) ? ext : '.csv';
+      cb(null, `${Date.now()}_${uuid()}${safeExt}`);
+    },
   }),
-  limits: { fileSize: 4 * 1024 * 1024 * 1024 },
+  limits: {
+    fileSize: 4 * 1024 * 1024 * 1024,   // 4 GiB
+    files: 1,
+    fields: 20,
+    parts: 25,
+    headerPairs: 100,
+    fieldNameSize: 100,
+    fieldSize: 64 * 1024,               // 64 KiB per non-file field; well above what any form field carries today
+  },
 });
+
+/**
+ * Convert MulterError into a 400 with a friendly message instead of letting
+ * the generic 500 handler swallow the cause.  Multer 2.x exposes a stable
+ * `code` we can return — e.g. LIMIT_FILE_SIZE, LIMIT_PART_COUNT.
+ */
+function uploadMiddleware(req, res, next) {
+  upload.single('file')(req, res, err => {
+    if (!err) return next();
+    if (err instanceof multer.MulterError) {
+      const e = new Error(err.message);
+      e.status = 400;
+      e.code = err.code.toLowerCase();
+      e.publicMessage = err.message;
+      return next(e);
+    }
+    next(err);
+  });
+}
 
 /**
  * POST /api/upload
@@ -35,7 +73,7 @@ const upload = multer({
  *   column            0-based index or header name (default 0)
  *   name              optional job label
  */
-router.post('/', upload.single('file'), async (req, res, next) => {
+router.post('/', uploadMiddleware, async (req, res, next) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'file required' });
 

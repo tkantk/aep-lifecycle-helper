@@ -184,8 +184,9 @@
       <div>
         <div class="panel">
           <div class="panel-title">About</div>
-          <p>Resolves <code>hashedKocid</code> identifiers to their full Identity Graph clusters, then submits
-            record-delete work orders up to <b>1,000,000 identifiers/day</b>.</p>
+          <p>Resolves source identifiers (any AEP namespace — <code>hashedKocid</code>, <code>email</code>,
+            <code>CRMID</code>, etc.) to their full Identity Graph clusters, then submits record-delete
+            work orders up to <b>1,000,000 identifiers/day</b>.</p>
           <p>Credentials are encrypted at rest with AES-256-GCM. The encryption key lives at
             <code>data/.key</code> (auto-generated on first run; keep it out of git).</p>
         </div>
@@ -240,8 +241,8 @@
       <div>
         <div class="panel">
           <div class="panel-title">Why expansion?</div>
-          <p>A <code>hashedKocid</code> is only <i>one</i> identity node. Deleting it alone leaves the
-            profile intact via other linked namespaces (email, phone, ECID, CRMID).
+          <p>Your source identifier is only <i>one</i> identity node. Deleting it alone leaves the
+            profile intact via other linked namespaces (email, phone, ECID, CRMID, etc.).
             Full deletion requires resolving the <b>identity cluster</b>.</p>
         </div>
       </div>

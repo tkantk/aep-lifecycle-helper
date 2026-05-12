@@ -7,9 +7,11 @@ import { liveProgress } from '../runner/expansion.js';
 import { writeCsv } from '../utils/csv.js';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
+import { registerUuidParamGuards } from '../middleware/security.js';
 import path from 'node:path';
 
 const router = Router();
+registerUuidParamGuards(router);   // :id is the job UUID (used by /export, /plan, /submit, etc.)
 
 router.get('/', (req, res, next) => {
   try {

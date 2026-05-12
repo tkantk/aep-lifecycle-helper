@@ -29,13 +29,21 @@ import { logger } from '../utils/logger.js';
  * by the input array and assume missing entries have empty identities.
  */
 
+// Defence-in-depth allowlist — see services/namespaces.js for the rationale.
+// Templating an unvalidated region into the host is SSRF: with the bearer
+// token attached, a request to platform-evil.com# leaks credentials.
+const ALLOWED_REGIONS = new Set(['va7', 'nld2', 'aus5', 'can2']);
+
 function endpoint(region) {
   // Region MUST come from the credential row (creds.region). The previous
   // process-wide default silently routed non-VA7 sandboxes to platform-va7,
   // and Adobe returns 200 with empty clusters for cross-region calls — that
   // would let an operator delete only the source kocid while linked
   // identities (email/phone/CRMID) silently survived.
-  const r = region || config.aep.identityRegion;
+  const r = (region || config.aep.identityRegion || '').toString().toLowerCase();
+  if (!ALLOWED_REGIONS.has(r)) {
+    throw new Error(`refusing to build Identity host with disallowed region "${region}"`);
+  }
   return `${config.aep.gateway.replace(
     '://platform.',
     `://platform-${r}.`

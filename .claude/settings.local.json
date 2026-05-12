@@ -21,7 +21,15 @@
       "Bash(node --test test/quotaManager.test.js)",
       "Bash(node --test test/recovery.test.js)",
       "Bash(node --test test/credentialsRoutes.test.js)",
-      "Bash(node --test test/monitorJobs.test.js)"
+      "Bash(node --test test/monitorJobs.test.js)",
+      "Bash(node -e ' *)",
+      "WebFetch(domain:experienceleague.adobe.com)",
+      "Bash(npm audit *)",
+      "Bash(npm ls *)",
+      "Bash(npm install *)",
+      "Bash(node --test test/security.test.js)",
+      "Bash(DB_PATH=:memory: OPEN_BROWSER=0 PORT=33099 timeout 6 node src/index.js)",
+      "Bash(git add *)"
     ]
   }
 }

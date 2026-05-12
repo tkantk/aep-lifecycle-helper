@@ -425,12 +425,12 @@ td.num  { font-variant-numeric: tabular-nums; font-weight: 500; }
 }
 .pill.pending    { background: var(--g100); color: var(--g700); }
 .pill.submitting { background: rgba(38,128,235,0.1); color: var(--blue600); }
-.pill.submitted, .pill.received, .pill.validated, .pill.ingested
-                 { background: rgba(38,128,235,0.1); color: var(--blue600); }
+.pill.submitted, .pill.received, .pill.validated, .pill.ingested,
+.pill.processing { background: rgba(38,128,235,0.1); color: var(--blue600); }
 .pill.completed  { background: rgba(45,157,120,0.15); color: var(--green600); }
 .pill.failed     { background: rgba(227,72,80,0.1); color: var(--red600); }
 .pill.deferred   { background: rgba(230,134,25,0.12); color: var(--orange500); }
-.pill.planned, .pill.queued { background: var(--g100); color: var(--g700); }
+.pill.planned, .pill.queued, .pill.unknown { background: var(--g100); color: var(--g700); }
 
 .day-chip {
   padding: 2px 8px; background: var(--g100); border-radius: 10px;
@@ -462,7 +462,7 @@ td.num  { font-variant-numeric: tabular-nums; font-weight: 500; }
   width: 18px; height: 2px; background: var(--g200);
 }
 .pipeline .link.done { background: var(--blue500); }
-.pipeline-label { margin-left: 10px; font-size: 11.5px; color: var(--g700); text-transform: capitalize; }
+.pipeline .pill { margin-left: 10px; }
 
 .saved-cred-item {
   display: flex; justify-content: space-between; align-items: center;

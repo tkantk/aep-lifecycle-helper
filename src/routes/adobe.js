@@ -4,8 +4,10 @@ import { listDatasets } from '../services/datasets.js';
 import { listNamespaces } from '../services/namespaces.js';
 import { decryptCreds } from '../utils/crypto.js';
 import { q } from '../db.js';
+import { registerUuidParamGuards } from '../middleware/security.js';
 
 const router = Router();
+registerUuidParamGuards(router);   // :credsId is the credential UUID
 
 /**
  * Dynamic discovery endpoints. These hit Adobe directly (with in-process

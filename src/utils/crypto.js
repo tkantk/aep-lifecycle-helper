@@ -4,6 +4,7 @@ import path from 'node:path';
 import { v4 as uuid } from 'uuid';
 import { config } from '../config.js';
 import { q } from '../db.js';
+import { logger } from './logger.js';
 
 /**
  * AES-256-GCM encryption for IMS client secrets at rest.
@@ -12,8 +13,12 @@ import { q } from '../db.js';
  *   1. ENCRYPTION_KEY env var (64 hex chars), OR
  *   2. data/.key file (auto-generated on first run)
  *
- * The file is created with 0600 permissions. Keep it out of version control
- * (the included .gitignore excludes data/).
+ * The file is created with 0600 permissions on POSIX. On Windows the mode
+ * argument is largely ignored — the key inherits the parent directory's ACL.
+ * If you're on Windows, prefer running with `data/` outside any cloud-sync
+ * path (OneDrive, Dropbox, Google Drive) so the key is not synced. The startup
+ * banner emits a warning when it detects a cloud-sync path. (F3 in the
+ * 2026-05-12 security review.)
  */
 
 let cachedKey = null;
@@ -35,9 +40,31 @@ function getKey() {
     return cachedKey;
   }
 
-  // First run: generate and persist
+  // First run: generate and persist with O_EXCL so a parallel boot can't race
+  // us into two different keys (F12 in the 2026-05-12 security review). If
+  // someone else won the race, fall through to the read path on the next call.
   const keyHex = randomBytes(32).toString('hex');
-  fs.writeFileSync(keyPath, keyHex, { mode: 0o600 });
+  try {
+    fs.writeFileSync(keyPath, keyHex, { mode: 0o600, flag: 'wx' });
+  } catch (err) {
+    if (err.code === 'EEXIST') {
+      // Another process won the race; re-read the file they wrote.
+      cachedKey = Buffer.from(fs.readFileSync(keyPath, 'utf8').trim(), 'hex');
+      return cachedKey;
+    }
+    throw err;
+  }
+  // On POSIX, double-check the file mode in case umask masked our 0600 request.
+  if (process.platform !== 'win32') {
+    try {
+      const stat = fs.statSync(keyPath);
+      const mode = stat.mode & 0o777;
+      if (mode !== 0o600) {
+        try { fs.chmodSync(keyPath, 0o600); }
+        catch (e) { logger.warn({ err: e.message, mode: mode.toString(8) }, 'could not tighten .key permissions'); }
+      }
+    } catch { /* stat is best-effort */ }
+  }
   cachedKey = Buffer.from(keyHex, 'hex');
   return cachedKey;
 }

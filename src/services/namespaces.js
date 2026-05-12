@@ -33,17 +33,29 @@ import { createAdobeClient } from './adobeClient.js';
  *   status: "ACTIVE"
  * }
  */
+// Allowlist enforced at every Identity URL builder as defence-in-depth.
+// The credentials route validates `region` on write (F2), but if a DB row
+// from before the validation landed contains an unexpected value — or if a
+// future code path writes to `credentials.region` without the route guards —
+// we still refuse to build the URL. An invalid region routes the request at
+// the process-wide default rather than letting it template into the host.
+const ALLOWED_REGIONS = new Set(['va7', 'nld2', 'aus5', 'can2']);
+
+function safeIdentityHost(region) {
+  const r = (region || config.aep.identityRegion || '').toString().toLowerCase();
+  if (!ALLOWED_REGIONS.has(r)) {
+    throw new Error(`refusing to build Identity host with disallowed region "${region}"`);
+  }
+  return config.aep.gateway.replace('://platform.', `://platform-${r}.`);
+}
+
 export async function listNamespaces({ creds, sandboxName }) {
   const client = createAdobeClient(creds, sandboxName);
 
   // Region-specific identity host. Prefer the per-credential region (saved
   // when the operator picked a sandbox in the Config tab); fall back to the
   // process-wide default only if it's not set on the credential.
-  const region = creds.region || config.aep.identityRegion;
-  const base = config.aep.gateway.replace(
-    '://platform.',
-    `://platform-${region}.`
-  );
+  const base = safeIdentityHost(creds.region);
   const url = `${base}/data/core/idnamespace/identities`;
 
   const { data } = await client.get(url);

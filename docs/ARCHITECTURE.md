@@ -65,6 +65,15 @@ demo — never for production. See CLAUDE.md I12.
 ## 3. Data flow (happy path)
 
 ```
+  0. INBOUND HTTP    Every request passes the security middleware before any
+                     handler: hostHeaderGuard → originRefererGuard → helmet
+                     (CSP, COOP/CORP, etc.) → express.json → router. UUID
+                     param guards run inside each router (Express 4 doesn't
+                     propagate `app.param`). See CLAUDE.md I13/I14.
+                     The error handler at the end normalises 5xx into a
+                     generic "internal_error" so raw stack/path traces
+                     don't leak.
+
   1. CONFIG          User enters IMS creds; we encrypt+persist in SQLite.
      │               Test Connection → IMS token obtained & cached in memory.
      ▼               Sandbox list loaded. Sandbox picked → datasets + namespaces
@@ -124,6 +133,11 @@ src/
 │                           concurrency knobs, daily cap, timeouts).
 ├── db.js                   SQLite open + schema init + prepared statements.
 │                           MUST mkdir data/ before connecting (ESM hoist gotcha).
+│
+├── middleware/             Security middleware: hostHeaderGuard, origin/
+│   └── security.js         referer guard, UUID param guards, centralised
+│                           error handler. Wired in src/index.js. See
+│                           CLAUDE.md I13/I14 for the rationale.
 │
 ├── services/               Thin wrappers over Adobe APIs. No business logic.
 │   ├── imsAuth.js          In-memory token cache + thundering-herd guard.
@@ -322,6 +336,8 @@ columns (nullable; null monthly = "don't track monthly for this job").
 10. Re-planning is forbidden once any work order has shipped — `ReplanForbiddenError` (HTTP 409) prevents duplicate irreversible deletes.
 11. Adobe POST retries are gated by per-request idempotency — hygiene POST never retries on 5xx/network; identity-graph POST opts in.
 12. UI loads only local assets — no third-party CDN fonts/scripts/images. Loopback-bound by default.
+13. Local API has Host-header + Origin/Referer + helmet/CSP guards. Defeats DNS rebinding and simple-form CSRF.
+14. Region and environment are allowlisted server-side (not just in the UI) — a stale or attacker-set `region` would template into the Identity API host and exfiltrate the bearer token.
 
 ---
 
