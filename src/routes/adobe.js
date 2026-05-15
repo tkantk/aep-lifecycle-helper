@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { listSandboxes } from '../services/sandboxes.js';
 import { listDatasets } from '../services/datasets.js';
 import { listNamespaces } from '../services/namespaces.js';
+import { getOrgQuota } from '../services/quotaApi.js';
 import { decryptCreds } from '../utils/crypto.js';
 import { q } from '../db.js';
 import { registerUuidParamGuards } from '../middleware/security.js';
@@ -103,6 +104,39 @@ router.get('/:credsId/sandboxes/:sandbox/namespaces', async (req, res, next) => 
 
     res.json({ cached: false, refreshedAt: new Date().toISOString(), namespaces });
   } catch (err) { next(err); }
+});
+
+/**
+ * GET /api/adobe/:credsId/quota?refresh=1
+ *
+ * Returns the org's live Adobe Data Hygiene quota numbers (daily + monthly
+ * identifier caps and current consumption). Pass refresh=1 to force-bust the
+ * 1-hour in-memory cache. The response always includes:
+ *   - daily / monthly / datasetExpiration: { consumed, quota, remaining }
+ *   - fetchedAt:  ISO timestamp of the actual cached/fresh fetch
+ *   - stale:      true when served from cache past TTL or after a live failure
+ *   - error:      last live-fetch error message (may coexist with stale data)
+ *
+ * Returns 503 with code 'quota_unavailable' only when there's no cache at all
+ * AND the live call failed (e.g. first run + Adobe outage). UIs then block
+ * submission until Adobe is reachable — per the 2026-05-15 design.
+ */
+router.get('/:credsId/quota', async (req, res, next) => {
+  try {
+    const creds = await decryptCreds(req.params.credsId);
+    const refresh = req.query.refresh === '1';
+    const result = await getOrgQuota(creds, { refresh });
+    res.json(result);
+  } catch (err) {
+    if (err.code === 'quota_unavailable') {
+      const e = new Error(err.message);
+      e.status = 503;
+      e.code   = 'quota_unavailable';
+      e.publicMessage = err.message;
+      return next(e);
+    }
+    next(err);
+  }
 });
 
 export default router;

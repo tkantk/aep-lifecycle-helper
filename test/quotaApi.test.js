@@ -1,0 +1,153 @@
+/**
+ * Unit + integration tests for src/services/quotaApi.js.
+ *
+ * Uses nock to mock both IMS (so token refresh works) and Adobe's
+ * /data/core/hygiene/quota endpoint. Covers: shape parsing, 1-hour cache,
+ * forced refresh, stale fallback when a live call fails, and the hard-floor
+ * 24-hour rule that re-raises the error when the cache is too old.
+ */
+
+import { test, beforeEach } from 'node:test';
+import assert from 'node:assert/strict';
+import nock from 'nock';
+
+const IMS_HOST     = 'https://ims-na1.adobelogin.com';
+const AEP_GATEWAY  = 'https://platform.adobe.io';
+const QUOTA_PATH   = '/data/core/hygiene/quota';
+
+const { getOrgQuota, _clearCache } = await import('../src/services/quotaApi.js');
+
+function mockIms() {
+  return nock(IMS_HOST).persist().post('/ims/token/v3')
+    .reply(200, { access_token: 'tok', token_type: 'bearer', expires_in: 3600 });
+}
+
+function baseCreds(overrides = {}) {
+  return {
+    clientId: 'client-q',
+    imsOrgId: 'org-q@AcmeOrg',
+    clientSecret: 'sec',
+    region: 'va7',
+    ...overrides,
+  };
+}
+
+const SAMPLE_BODY = {
+  quotas: [
+    { name: 'dailyConsumerDeleteIdentitiesQuota',   consumed: 314,  quota: 700_000,    description: 'daily' },
+    { name: 'monthlyConsumerDeleteIdentitiesQuota', consumed: 2764, quota: 12_000_000, description: 'monthly' },
+    { name: 'datasetExpirationQuota',               consumed: 11,   quota: 75,          description: 'expiration' },
+  ],
+};
+
+beforeEach(() => {
+  nock.cleanAll();
+  _clearCache();
+});
+
+// ─── Shape parsing ────────────────────────────────────────────────────────
+
+test('getOrgQuota parses the documented response shape', async () => {
+  mockIms();
+  nock(AEP_GATEWAY).get(QUOTA_PATH).reply(200, SAMPLE_BODY);
+
+  const result = await getOrgQuota(baseCreds());
+  assert.deepEqual(result.daily,
+    { consumed: 314,  quota: 700_000,    remaining: 699_686,    description: 'daily' });
+  assert.deepEqual(result.monthly,
+    { consumed: 2764, quota: 12_000_000, remaining: 11_997_236, description: 'monthly' });
+  assert.deepEqual(result.datasetExpiration,
+    { consumed: 11,   quota: 75,          remaining: 64,          description: 'expiration' });
+  assert.equal(result.stale, false);
+  assert.equal(result.error, null);
+  assert.ok(result.fetchedAt);
+});
+
+test('getOrgQuota handles missing quotas gracefully', async () => {
+  mockIms();
+  nock(AEP_GATEWAY).get(QUOTA_PATH).reply(200, { quotas: [] });
+
+  const result = await getOrgQuota(baseCreds());
+  assert.equal(result.daily, null);
+  assert.equal(result.monthly, null);
+  assert.equal(result.datasetExpiration, null);
+});
+
+test('getOrgQuota handles missing remaining (consumed=0 case)', async () => {
+  mockIms();
+  nock(AEP_GATEWAY).get(QUOTA_PATH).reply(200, {
+    quotas: [
+      { name: 'dailyConsumerDeleteIdentitiesQuota', consumed: 0, quota: 1_000_000 },
+    ],
+  });
+  const result = await getOrgQuota(baseCreds());
+  assert.equal(result.daily.remaining, 1_000_000);
+});
+
+// ─── Caching ──────────────────────────────────────────────────────────────
+
+test('getOrgQuota: second call within TTL is served from cache (no extra Adobe hit)', async () => {
+  mockIms();
+  // Only ONE interceptor — if cache is missed, nock will throw on the 2nd call.
+  nock(AEP_GATEWAY).get(QUOTA_PATH).reply(200, SAMPLE_BODY);
+
+  const a = await getOrgQuota(baseCreds());
+  const b = await getOrgQuota(baseCreds());
+  assert.equal(a.fetchedAt, b.fetchedAt, 'both calls should share the same fetchedAt');
+  assert.equal(b.stale, false);
+});
+
+test('getOrgQuota: refresh=true forces a new live fetch even within TTL', async () => {
+  mockIms();
+  nock(AEP_GATEWAY).get(QUOTA_PATH).reply(200, SAMPLE_BODY);
+  nock(AEP_GATEWAY).get(QUOTA_PATH).reply(200, {
+    ...SAMPLE_BODY,
+    quotas: SAMPLE_BODY.quotas.map(q =>
+      q.name === 'dailyConsumerDeleteIdentitiesQuota' ? { ...q, consumed: 500 } : q),
+  });
+
+  const a = await getOrgQuota(baseCreds());
+  const b = await getOrgQuota(baseCreds(), { refresh: true });
+  assert.equal(a.daily.consumed, 314);
+  assert.equal(b.daily.consumed, 500);
+  assert.notEqual(a.fetchedAt, b.fetchedAt);
+});
+
+// ─── Stale fallback ───────────────────────────────────────────────────────
+
+test('getOrgQuota: live fetch failure falls back to last cache with stale=true', async () => {
+  mockIms();
+  // First call succeeds and populates cache.
+  nock(AEP_GATEWAY).get(QUOTA_PATH).reply(200, SAMPLE_BODY);
+  const first = await getOrgQuota(baseCreds());
+
+  // Second call (forced refresh) fails. Adobe returns 500.
+  nock(AEP_GATEWAY).get(QUOTA_PATH).reply(500, { message: 'boom' });
+  const second = await getOrgQuota(baseCreds(), { refresh: true });
+
+  assert.equal(second.stale, true);
+  assert.ok(second.error, 'error message should be populated');
+  // The numbers should be the cached ones from the first call.
+  assert.equal(second.daily.consumed, first.daily.consumed);
+  assert.equal(second.fetchedAt, first.fetchedAt);
+});
+
+test('getOrgQuota: failure with no cache at all raises quota_unavailable', async () => {
+  mockIms();
+  nock(AEP_GATEWAY).get(QUOTA_PATH).reply(500, { message: 'boom' });
+
+  await assert.rejects(
+    () => getOrgQuota(baseCreds()),
+    err => {
+      assert.equal(err.code, 'quota_unavailable');
+      return true;
+    }
+  );
+});
+
+test('getOrgQuota throws when imsOrgId is missing', async () => {
+  await assert.rejects(
+    () => getOrgQuota({ clientId: 'x', clientSecret: 'y' }),
+    /imsOrgId is required/i
+  );
+});

@@ -159,16 +159,31 @@
             </div>
           </div>
 
+          <!-- Adobe org quota — populated after Test Connection succeeds.
+               Source of truth is GET /data/core/hygiene/quota (org-wide).
+               Daily and Monthly cap inputs below are auto-filled from the
+               live quota response; operator can lower them but not raise
+               above Adobe's reported entitlement. -->
+          <div id="org-quota-block" class="org-quota" hidden>
+            <div class="org-quota-head">
+              <span class="org-quota-title">Adobe org quota</span>
+              <span class="org-quota-meta" id="org-quota-meta">—</span>
+              <button class="link-btn" id="btn-refresh-quota" type="button" title="Force a fresh quota fetch (the cached value refreshes hourly)">↻ Refresh</button>
+            </div>
+            <div class="org-quota-bars" id="org-quota-bars"></div>
+            <div class="org-quota-stale" id="org-quota-stale" hidden></div>
+          </div>
+
           <div class="f-row-2">
             <label class="f">
               <span>Daily identifier cap</span>
               <input id="c-daily" type="number" value="1000000">
-              <span class="f-hint">Adobe default: 1,000,000 / day</span>
+              <span class="f-hint" id="c-daily-hint">Adobe default: 1,000,000 / day</span>
             </label>
             <label class="f">
               <span>Monthly identifier cap</span>
               <input id="c-monthly" type="number" value="3000000">
-              <span class="f-hint">Contract-dependent · 0 = unlimited</span>
+              <span class="f-hint" id="c-monthly-hint">Contract-dependent · 0 = unlimited</span>
             </label>
           </div>
         </div>

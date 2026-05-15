@@ -9,6 +9,187 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-05-15 — Quota Phase 1: live Adobe org quota in the Config UI
+
+Context: client asked us to address a series of quota-handling concerns
+on a job that may run 6M+ source identifiers (~10M+ expanded). The
+previous hardcoded defaults (1M daily / 3M monthly) gave us no way to
+plan against the actual org entitlement, and quota changes mid-run (other
+tools consuming from the same org-wide pool) were invisible to us.
+Phase 1 — locked in 2026-05-15 — wires up live `GET /data/core/hygiene/quota`
+so the operator and the planner share Adobe's source of truth. Phases 2
+(month-aware re-bucketing + plan/submit modals) and 3 (configurable
+auto-resume scheduler) are queued for separate commits.
+
+### Backend — quota service + route
+
+- **`src/services/quotaApi.js`** — new module. `getOrgQuota(creds, {refresh})`
+  calls `GET https://platform.adobe.io/data/core/hygiene/quota` (org-wide,
+  no `x-sandbox-name`; the doc doesn't list it as required, and we matched
+  the same shape as `services/sandboxes.js`). Returns
+  `{ daily, monthly, datasetExpiration, fetchedAt, stale, error }`. In-memory
+  cache keyed on `imsOrgId`; TTL 1 hour. `refresh=true` force-busts the
+  cache. On a live fetch failure the function returns the last cached value
+  with `stale: true` and the error message attached — UI surfaces a warning
+  banner but doesn't have to block. **Hard floor**: if the cache is older
+  than 24 h (or there's no cache at all), the error is re-thrown with
+  `err.code = 'quota_unavailable'` so submission paths can hard-block. This
+  matches the RQ-3 decision from the design conversation.
+- **`src/routes/adobe.js`** — new endpoint `GET /api/adobe/:credsId/quota?refresh=1`.
+  Returns the shape above. On `quota_unavailable` it returns HTTP 503 with
+  the same machine code. UUID param guard still applies to `:credsId`.
+- **`src/services/hygiene.js`** — drift-detection log. When Adobe's response
+  to `POST /workorder` carries an `operationCount` and it disagrees with our
+  locally-computed `total`, we emit a single WARN line (`workorderId`,
+  `ourCount`, `adobeOperationCount`, `delta`). This is the safe replacement
+  for the live-delete identifier-counting test the user (rightly) rejected:
+  we get the comparison for free on every real submission, with no extra
+  quota consumed.
+
+### Frontend — Config card quota banner + auto-populate
+
+- **`src/web/index.html`** — new `#org-quota-block` panel above the Daily /
+  Monthly cap inputs in the Config card. Shows two bars (Daily, Monthly)
+  with consumed / quota / remaining, a "↻ Refresh" link button, and a
+  stale-warning strip when applicable. Initially hidden; revealed after Test
+  Connection succeeds.
+- **`src/web/app.js`** — new `loadOrgQuota(force)` + `renderOrgQuota(q)` +
+  `renderOrgQuotaError(err)` + `autoPopulateCapsFromQuota(q)`. The auto-
+  populate function only overrides the cap inputs when they're still at the
+  hardcoded defaults (1,000,000 / 3,000,000), so it never clobbers an
+  explicit operator override. Quota is fetched after Test Connection
+  succeeds (fire-and-forget) and again whenever the Config tab is mounted
+  with an already-trusted session. Hints under each cap input now read
+  "Adobe-reported entitlement: N / day" instead of the generic placeholder.
+- **`src/web/styles.css`** — `.org-quota`, `.org-quota-head`,
+  `.org-quota-bars`, `.org-quota-bar*`, `.org-quota-stale`. The progress bar
+  reuses the existing `.progress-bar` / `.progress-fill` classes; colour
+  shifts to orange at >70% and red at >90% so the operator notices when
+  monthly headroom is getting tight. Adds a `.link-btn:disabled` state to
+  the existing helper class.
+
+### What this does NOT do yet (Phase 2 + 3)
+
+- Planner still uses the static `daily_limit` / `monthly_limit` columns on
+  the job row. It does NOT dynamically re-bucket un-shipped work orders
+  against the live quota — that lands in Phase 2.
+- The Plan tab does NOT show the projected "Month 1 / Month 2 / Month 3"
+  timeline yet. Plan and Submit modals also pending Phase 2.
+- Auto-resume on month rollover is NOT implemented. Deferred WOs still
+  require an operator click to retry. Phase 3.
+
+### Tests
+
+- **`test/quotaApi.test.js`** — 8 new cases: documented response shape
+  parses correctly, empty `quotas` array degrades gracefully, in-memory
+  cache prevents a second Adobe hit within TTL, `refresh: true` forces a
+  new fetch, live-fetch failure falls back to last cached with `stale: true`,
+  no-cache + failure raises `quota_unavailable`, missing `imsOrgId` rejects
+  early. **141/141 total pass.**
+
+### Infra / docs
+
+- This changelog entry. No invariant change yet — Phase 2 will update I3
+  (the monthly cap discussion) and I10 (re-planning rules).
+
+---
+
+## 2026-05-12 (followup) — Per-work-order detail cards on Monitor tab
+
+Context: operator showed AEP's "Data lifecycle requests" detail screen (the
+one Adobe surfaces after clicking into a single work order: Work order
+request ID, Created at, Updated at, Time elapsed, Number of identities,
+plus a "Status by service" breakdown — Identity Service / Profile Service
+/ Journey Optimizer / Data Management each with their own Pending / Processing
+/ Completed state). We were already polling this data via the 60s monitor
+tick and storing the raw `productStatusDetails` JSON on the `work_orders`
+table, but the Monitor tab only rendered a 4-column dense table that
+collapsed it all into a single "Pipeline" cell. This session surfaces the
+detail without cluttering the page when many work orders are in flight.
+
+### Frontend — rich work-order cards (`src/web/app.js`)
+
+- **`renderWorkOrderCard(w, job)`** — new function that produces one card
+  per work order, replacing the old table row. Shows:
+  - Adobe Work Order ID (full DI-… string) with a "copy" button that uses
+    the Clipboard API. The DI- handle is what you quote when escalating
+    to Adobe support, so making it one-click-copy is the small UX win.
+  - Status pill (Processing / Completed / Failed — friendly vocabulary
+    already established for the existing pipeline indicator).
+  - Identifier count, day index, Created at (absolute time tooltip),
+    Updated at (relative "1 hr ago"), Time elapsed ("18 days").
+  - Bundle ID truncated with the full value in a `title=` tooltip —
+    Adobe's bundle handle is occasionally useful for cross-referencing
+    work orders that ran in the same batch.
+  - "Profile-only" chip when `targetServices` is set, so the operator
+    can sanity-check that they really did request the profile-only mode
+    they think they did. (Profile-only leaves the data lake intact;
+    forgetting that has bitten ops before.)
+  - "Error" callout strip when `last_error` is non-null — the failure
+    text appears inline on the card instead of requiring a log dive.
+- **`<details>` for the "Status by service" block** — collapsed by
+  default to keep the page light when a job has many WOs. A `Set`
+  (`expandedWoIds`) tracks which cards the operator opened and re-applies
+  the `open` attribute on each 15s poll re-render, so the panel doesn't
+  snap back closed mid-read. Auto-opens the single card on a single-WO
+  job (no click needed).
+- **`renderServicesBreakdown(services)`** — buckets the per-service rows
+  the same way AEP groups them: Pending/Processing first, Completed
+  second, Failed last (so a regression bubbles to the bottom where it's
+  most visible). Each row shows an icon (`✓` / `○` / `⟳` / `✗`), the
+  service name from Adobe's `productName`, the friendly status text
+  ("Request pending" / "Request completed" / "Processing" / "Failed"),
+  and the per-service `createdAt` as a relative time. If
+  `productStatusDetails` is null (work order submitted but Adobe hasn't
+  reported per-service status yet), we render a "Waiting for Adobe's
+  first per-service status update… (monitor polls every 60s)" hint.
+- **`parseProductStatusDetails(input)`** — small helper that accepts
+  either the JSON string (as stored on `work_orders.product_status_details`)
+  or a pre-parsed array, normalises every entry to a UI-ready shape
+  (`{name, raw, status, friendly, cls, updatedAt}`), and handles both
+  the `productStatus` field per `docs/REVIEW.md §3.7` and a fallback
+  `status` field for older response shapes.
+- **`parseTimestamp` + `formatDuration` + `formatAbsoluteTime` +
+  `formatElapsed`** — small new helpers that handle SQLite's "YYYY-MM-DD
+  HH:MM:SS" UTC format, Adobe's ISO timestamps, and epoch numbers all
+  through the same parser. `formatRelativeTime` was reimplemented on
+  top of `formatDuration` so the "5 min ago" / "2 hr ago" / "18 days
+  ago" vocabulary is consistent everywhere.
+
+### Frontend — sandbox visibility (multi-sandbox safety)
+
+- **`#monitor-detail-sub`** now reads `Sandbox <b>{name}</b> · polled from
+  Adobe every 60s…` when a job is selected. With multiple sandboxes
+  flowing into the dashboard at once, the existing chip-row filter is
+  the right way to scope the LIST, but the operator can still get lost
+  when bouncing between job detail panels — having the sandbox visible
+  right above the work-order cards anchors the view.
+- Per-card sandbox would be redundant inside the detail panel (one
+  job = one sandbox by schema), so we don't repeat it on each card.
+
+### Frontend — styles (`src/web/styles.css`)
+
+- New rules under `/* ─── Work-order detail cards … */`: `.wo-card`,
+  `.wo-card-head`, `.wo-card-meta` (responsive grid), `.wo-services`
+  (custom-marker `<details>` summary with a rotating `▸`), `.wo-service`
+  rows colour-coded by status (`completed` / `pending` / `processing` /
+  `failed`), `.wo-error`, `.wo-services-empty`, `.copy-btn`. All use
+  the existing Spectrum tokens so colours stay consistent with the rest
+  of the UI.
+
+### Tests
+
+- 133/133 still pass. No backend contract changed; the data has been on
+  the wire for a while via `/api/jobs/:id/work-orders` (the route already
+  passes `product_status_details` through as part of `...r`).
+
+### Docs
+
+- This changelog entry. No invariant change (the polled data was already
+  there; this is purely a UI presentation upgrade).
+
+---
+
 ## 2026-05-12 — Security review fixes (F1–F14)
 
 Context: a full security review of the codebase (see security report from

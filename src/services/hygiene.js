@@ -1,5 +1,6 @@
 import { config } from '../config.js';
 import { createAdobeClient } from './adobeClient.js';
+import { logger } from '../utils/logger.js';
 
 /**
  * Adobe Data Hygiene record-delete work orders.
@@ -176,6 +177,24 @@ export async function submitWorkOrder({
   const { data } = await client.post(`${config.aep.gateway}${PATH}`, body, {
     headers: { 'Content-Type': 'application/json' },
   });
+
+  // Drift detection (CLAUDE.md quota-counting verification, F-block 2026-05-15):
+  // Adobe's `operationCount` is THEIR count of submitted identifiers — the
+  // authoritative value that goes against the monthly quota. We computed
+  // `total` locally by summing each namespace group's unique-ids length.
+  // They SHOULD match exactly because our payload is dedup'd inside
+  // normalizeNamespacesIdentities, but if Adobe ever changes how they count
+  // (e.g. cross-group dedup, ignoring nsid:N entries, etc.) we want a
+  // breadcrumb in the logs so the quota math can be reconciled without
+  // running a live delete to discover it.
+  if (typeof data.operationCount === 'number' && data.operationCount !== total) {
+    logger.warn({
+      workorderId: data.workorderId,
+      ourCount: total,
+      adobeOperationCount: data.operationCount,
+      delta: data.operationCount - total,
+    }, 'identifier-count drift: Adobe operationCount differs from our pre-submit count — quota accounting may diverge');
+  }
 
   return {
     workorderId: data.workorderId,

@@ -29,6 +29,8 @@ const state = {
   sandboxes: [],                 // loaded after Test Connection
   datasets: [],                  // loaded after sandbox pick
   namespaces: [],                // loaded after sandbox pick
+  orgQuota: null,                // GET /api/adobe/:credsId/quota response
+                                 // shape: { daily, monthly, datasetExpiration, fetchedAt, stale, error }
   file: null,
   job: null,
   progress: null,
@@ -108,6 +110,7 @@ async function renderConfig() {
   $('#btn-save-creds').addEventListener('click', saveAndContinue);
   $('#btn-refresh-sandboxes').addEventListener('click', () => loadSandboxes(true));
   $('#btn-refresh-datasets').addEventListener('click', () => loadDatasets(true));
+  $('#btn-refresh-quota').addEventListener('click', () => loadOrgQuota(true));
   $('#c-sandbox-picker').addEventListener('change', onSandboxChange);
   $('#c-delete-mode').addEventListener('change', onDeleteModeChange);
   $('#btn-cred-add').addEventListener('click', addNewCredentialFlow);
@@ -126,6 +129,15 @@ async function renderConfig() {
       $('#c-sandbox-picker').value = state.config.sandboxName;
       await loadDatasets(false);
     }
+    // Re-render the cached quota immediately (avoids a flicker while the
+    // background refresh is in flight). If the cache is < 1h it stays as-is;
+    // otherwise loadOrgQuota will refresh in the background.
+    if (state.orgQuota) {
+      $('#org-quota-block').hidden = false;
+      renderOrgQuota(state.orgQuota);
+      autoPopulateCapsFromQuota(state.orgQuota);
+    }
+    loadOrgQuota(false).catch(() => { /* renderOrgQuotaError already showed */ });
   }
   onDeleteModeChange();
   updateConfigState();
@@ -397,6 +409,10 @@ async function testConnection() {
         showAlert('#cfg-alert', 'warning', 'Sandbox list failed to load',
           `Authentication is OK, but the sandbox-discovery call failed: ${sbxErr.message}. Click "↻" next to the sandbox picker to retry.`);
       }
+      // Live Adobe org-quota fetch. Fire-and-forget so a /quota outage
+      // doesn't block the rest of the Config flow; the banner self-renders
+      // once the call returns (or shows a stale/error state).
+      loadOrgQuota(false).catch(() => { /* renderOrgQuota already surfaced the error */ });
     } else {
       showAlert('#cfg-alert', 'error', 'Connection failed',
         res.error || 'Check your credentials and try again.');
@@ -410,6 +426,138 @@ async function testConnection() {
     updateEnvChip();
     updateConfigState();
   }
+}
+
+// ─── Adobe org quota ──────────────────────────────────────────────────
+// Fetches GET /api/adobe/:credsId/quota (server-side proxy to Adobe's
+// /data/core/hygiene/quota). Renders the daily + monthly counters and
+// auto-populates the form's cap inputs so what the operator sees is what
+// Adobe sees. The first phase of the 2026-05-15 quota work: pure visibility.
+// The planner doesn't consume these values yet (that's Phase 2); for now
+// they update the inputs and the banner.
+async function loadOrgQuota(force) {
+  if (!state.credsId) return;
+  const block = $('#org-quota-block');
+  const meta  = $('#org-quota-meta');
+  const refreshBtn = $('#btn-refresh-quota');
+  if (!block) return;   // not in DOM yet (Config tab not mounted)
+
+  if (meta) meta.textContent = 'Fetching from Adobe…';
+  if (refreshBtn) refreshBtn.disabled = true;
+  block.hidden = false;
+
+  try {
+    const q = await http('GET',
+      `/adobe/${state.credsId}/quota${force ? '?refresh=1' : ''}`);
+    state.orgQuota = q;
+    renderOrgQuota(q);
+    autoPopulateCapsFromQuota(q);
+  } catch (err) {
+    state.orgQuota = null;
+    renderOrgQuotaError(err);
+  } finally {
+    if (refreshBtn) refreshBtn.disabled = false;
+  }
+}
+
+function renderOrgQuota(q) {
+  const meta  = $('#org-quota-meta');
+  const bars  = $('#org-quota-bars');
+  const stale = $('#org-quota-stale');
+
+  if (meta) {
+    const when = q.fetchedAt ? new Date(q.fetchedAt) : null;
+    const ago  = when ? formatRelativeTime(when.toISOString()) : '—';
+    meta.textContent = `Refreshed ${ago}`;
+  }
+
+  const renderBar = (label, e) => {
+    if (!e) return `
+      <div class="org-quota-bar">
+        <div class="org-quota-bar-label">${escape(label)}</div>
+        <div class="org-quota-bar-value">Not reported by Adobe</div>
+      </div>`;
+    const pct = e.quota > 0 ? (e.consumed / e.quota) * 100 : 0;
+    const color = pct > 90 ? 'var(--red500)' : pct > 70 ? 'var(--orange500)' : 'var(--blue500)';
+    return `
+      <div class="org-quota-bar">
+        <div class="org-quota-bar-label">${escape(label)}</div>
+        <div class="org-quota-bar-value">
+          <b>${e.consumed.toLocaleString()}</b> / ${e.quota.toLocaleString()}
+          <span class="org-quota-bar-rem">· ${e.remaining.toLocaleString()} remaining</span>
+        </div>
+        <div class="progress-bar">
+          <div class="progress-fill" style="width:${Math.min(100, pct).toFixed(1)}%; background:${color}"></div>
+        </div>
+      </div>`;
+  };
+
+  if (bars) {
+    bars.innerHTML =
+      renderBar('Daily',   q.daily) +
+      renderBar('Monthly', q.monthly);
+  }
+
+  if (stale) {
+    if (q.stale) {
+      stale.hidden = false;
+      stale.innerHTML = `⚠ Showing cached values${q.error ? ` (live fetch failed: ${escape(q.error)})` : ''}. Click ↻ Refresh to retry.`;
+    } else {
+      stale.hidden = true;
+      stale.textContent = '';
+    }
+  }
+}
+
+function renderOrgQuotaError(err) {
+  // Hard failure with no cache → block submission paths by showing the
+  // error prominently. Phase 1 just renders the message; Phase 2 will wire
+  // this into the Submit button's enabled state.
+  const meta  = $('#org-quota-meta');
+  const bars  = $('#org-quota-bars');
+  const stale = $('#org-quota-stale');
+  if (meta) meta.textContent = 'Unavailable';
+  if (bars) bars.innerHTML = '';
+  if (stale) {
+    stale.hidden = false;
+    const detail = err?.data?.message || err?.message || 'Unknown error';
+    stale.innerHTML = `⚠ Adobe quota fetch failed: ${escape(detail)}. Submissions should not proceed until Adobe is reachable.`;
+  }
+}
+
+// Mirror Adobe's reported entitlement into the form's cap inputs. The
+// operator can still lower these (e.g. to throttle), but raising above
+// Adobe's value would just cause Adobe to reject — there's no value in
+// allowing it. Phase 2 will add the per-input clamp; here we only update.
+function autoPopulateCapsFromQuota(q) {
+  const dailyInput   = $('#c-daily');
+  const monthlyInput = $('#c-monthly');
+  const dailyHint    = $('#c-daily-hint');
+  const monthlyHint  = $('#c-monthly-hint');
+
+  if (q.daily && dailyInput) {
+    // Only auto-populate when the input is at the hardcoded default — don't
+    // clobber an explicit operator override.
+    const current = parseInt(dailyInput.value, 10) || 0;
+    if (current === 0 || current === 1_000_000) {
+      dailyInput.value = q.daily.quota;
+      state.config.dailyLimit = q.daily.quota;
+    }
+    if (dailyHint) {
+      dailyHint.textContent = `Adobe-reported entitlement: ${q.daily.quota.toLocaleString()} / day`;
+    }
+  }
+  if (q.monthly && monthlyInput) {
+    const current = parseInt(monthlyInput.value, 10) || 0;
+    if (current === 0 || current === 3_000_000) {
+      monthlyInput.value = q.monthly.quota;
+      state.config.monthlyLimit = q.monthly.quota;
+    }
+    if (monthlyHint) {
+      monthlyHint.textContent = `Adobe-reported entitlement: ${q.monthly.quota.toLocaleString()} / month · 0 = unlimited`;
+    }
+  }
+  updateConfigState();
 }
 
 // ─── Sandbox / dataset pickers ─────────────────────────────────────────
@@ -1062,6 +1210,11 @@ function logActivity(level, msg) {
 const STAGES = ['received', 'validated', 'submitted', 'ingested', 'completed'];
 const MONITOR_LIST_LIMIT = 20;
 
+// Tracks which per-work-order cards the operator has opened. We preserve
+// this across the 15-second auto-poll so re-rendering the detail panel
+// doesn't snap every card closed. Keyed by local work-order UUID.
+const expandedWoIds = new Set();
+
 async function renderMonitor() {
   const dashboard = $('#monitor-dashboard');
   const empty = $('#monitor-empty');
@@ -1152,9 +1305,22 @@ async function renderMonitor() {
         card.classList.toggle('selected', card.dataset.jobId === jobId);
       });
     }
-    $('#monitor-detail-title').textContent = state.job
+    // Detail header: job name + sandbox + day range. When multiple sandboxes
+    // are in flight at once, having the sandbox right next to the job name
+    // (rather than only as a filter chip up top) is what keeps operators
+    // from confusing two similarly-named jobs.
+    const headerTitle = state.job
       ? `${state.job.name || state.job.id.slice(0, 8)} — pipeline detail`
       : 'Work order pipeline';
+    $('#monitor-detail-title').textContent = headerTitle;
+    const sb = state.job?.sandbox_name;
+    if (sb) {
+      $('#monitor-detail-sub').innerHTML =
+        `Sandbox <b>${escape(sb)}</b> · polled from Adobe every 60s by the background monitor`;
+    } else {
+      $('#monitor-detail-sub').textContent =
+        'Polled from Adobe every 60s by background monitor';
+    }
     await refreshDetail();
   };
 
@@ -1176,21 +1342,41 @@ async function renderMonitor() {
         <div class="stat-track"><div class="stat-track-fill" style="width:${withAdobe.length ? (counts[s]/withAdobe.length*100) : 0}%; background:${stageColor(s)}"></div></div>
       </div>`).join('');
 
+    // Auto-open the first card on a single-WO job so the operator doesn't
+    // have to click. With multiple WOs we keep them collapsed by default
+    // to avoid a wall of cards — operators expand the ones they care about.
+    if (withAdobe.length === 1) expandedWoIds.add(withAdobe[0].id);
+
     $('#monitor-table').innerHTML = withAdobe.length === 0
       ? '<div class="empty-state">No submitted work orders yet.</div>'
-      : `<div class="table-wrap">
-          <table>
-            <thead><tr><th>Adobe ID</th><th>Identities</th><th>Pipeline</th><th>Updated</th></tr></thead>
-            <tbody>${withAdobe.map(w => `
-              <tr>
-                <td class="mono">${escape(String(w.adobe_workorder_id).slice(0, 24))}…</td>
-                <td class="num">${w.identifier_count.toLocaleString()}</td>
-                <td>${pipelineHtml(stageIdx(w.adobe_status), w.adobe_status)}</td>
-                <td style="color: var(--g600); font-size: 11.5px">${escape(w.updated_at)}</td>
-              </tr>`).join('')}
-            </tbody>
-          </table>
-        </div>`;
+      : withAdobe.map(w => renderWorkOrderCard(w, state.job)).join('');
+
+    // <details> doesn't bubble click → toggle event up through React-like
+    // re-renders, so we wire it on every refresh. The expanded-state Set is
+    // the source of truth and is consulted on render to set `open`.
+    $$('.wo-card', $('#monitor-table')).forEach(card => {
+      const id = card.dataset.woId;
+      const det = card.querySelector('details.wo-services');
+      if (!det) return;
+      det.addEventListener('toggle', () => {
+        if (det.open) expandedWoIds.add(id);
+        else expandedWoIds.delete(id);
+      });
+    });
+    // Copy-to-clipboard for the Adobe work-order ID (handy when escalating
+    // to Adobe support; the full DI-... string is the unique handle).
+    $$('.wo-card .copy-btn', $('#monitor-table')).forEach(btn => {
+      btn.addEventListener('click', async (e) => {
+        e.preventDefault();
+        const text = btn.dataset.copy;
+        try { await navigator.clipboard.writeText(text); }
+        catch { /* clipboard may be blocked — fail quietly, the ID is also visible */ }
+        const orig = btn.textContent;
+        btn.textContent = 'copied';
+        setTimeout(() => { btn.textContent = orig; }, 1200);
+      });
+    });
+
   };
 
   // ─── Helpers (closure: searchTerm, sandboxFilter, fetchAndRenderList) ─
@@ -1293,16 +1479,235 @@ function renderSubmissionCard(r, isSelected) {
     </div>`;
 }
 
-function formatRelativeTime(sqlTimestamp) {
-  if (!sqlTimestamp) return '—';
-  // SQLite datetime('now') is "YYYY-MM-DD HH:MM:SS" in UTC; treat as such.
-  const ts = new Date(sqlTimestamp.replace(' ', 'T') + 'Z').getTime();
-  if (isNaN(ts)) return sqlTimestamp;
-  const diff = Date.now() - ts;
-  if (diff < 60_000) return 'just now';
-  if (diff < 3_600_000) return `${Math.round(diff / 60_000)} min ago`;
-  if (diff < 86_400_000) return `${Math.round(diff / 3_600_000)} hr ago`;
-  return `${Math.round(diff / 86_400_000)} day(s) ago`;
+// ─── Per-work-order detail card (Monitor tab) ──────────────────────────
+//
+// Mirrors the information AEP's "Data lifecycle requests" detail page shows:
+//   - Adobe Work Order ID (full, with copy-to-clipboard)
+//   - Created / Updated / Time elapsed
+//   - Status pill + identifier count + day
+//   - "Status by service" buckets (Pending/Processing vs Completed vs Failed)
+//
+// Multi-sandbox safety: cards live inside the per-job detail panel, which
+// is scoped to ONE job (and therefore one sandbox). The sandbox shows once
+// in `#monitor-detail-sub` above the cards — see refreshDetail header copy.
+//
+// Anti-clutter: each card uses native `<details>` so the service breakdown
+// is collapsed by default. We auto-expand the only card on a single-WO job
+// (no click required) and otherwise preserve open/closed state in
+// `expandedWoIds` across the 15-second poll re-renders.
+function renderWorkOrderCard(w, job) {
+  const adobeId = String(w.adobe_workorder_id || '');
+  const status = w.adobe_status;
+  const friendly = friendlyStatus(status);
+  const cls = friendlyStatusClass(status);
+  const isOpen = expandedWoIds.has(w.id);
+
+  // Adobe's createdAt for this work order comes back in submitted_at.
+  // updated_at + completed_at are our local timestamps from monitor.js.
+  const created = w.submitted_at || w.created_at;
+  const updated = w.updated_at;
+  const ended   = (status === 'completed' || status === 'failed') ? w.completed_at : null;
+
+  // The displayName + description we sent at submission time. We don't store
+  // them separately, so rebuild from job + WO — kept in sync with the values
+  // in runner/submission.js. AEP's detail page surfaces these prominently.
+  const jobShortId = (job?.id || '').slice(0, 8);
+  const woShortId  = w.id.slice(0, 8);
+  const displayName = `Delete ${job?.name || jobShortId} - WO ${woShortId}`;
+  const description = `Bulk delete (Job ${jobShortId}, Day ${w.day_index})`;
+
+  // Profile-only mode: when targetServices is set, AEP routes through
+  // identity/profile/AJO only (the data lake is NOT touched). Worth
+  // surfacing so the operator can sanity-check what was actually requested.
+  let targetServices = null;
+  try { targetServices = w.target_services_json ? JSON.parse(w.target_services_json) : null; } catch { /* */ }
+  const isProfileOnly = Array.isArray(targetServices) && targetServices.length > 0;
+
+  const services = parseProductStatusDetails(w.product_status_details);
+  const servicesHtml = renderServicesBreakdown(services);
+
+  // Failure surface: if Adobe reported failed OR our local submission errored,
+  // pull the message into the card so it doesn't need to be hunted for in logs.
+  const errorHtml = w.last_error
+    ? `<div class="wo-error"><b>Error</b>: ${escape(w.last_error)}</div>`
+    : '';
+
+  return `
+    <div class="wo-card" data-wo-id="${escape(w.id)}">
+      <div class="wo-card-head">
+        <div class="wo-card-id-row">
+          <span class="wo-card-id" title="${escape(adobeId)}">${escape(adobeId)}</span>
+          <button class="copy-btn" type="button" data-copy="${escape(adobeId)}" title="Copy Adobe work-order ID">copy</button>
+        </div>
+        <span class="pill ${cls}" title="${escape(status ? 'Adobe API status: ' + status : 'Adobe has not reported a status yet')}">${escape(friendly)}</span>
+      </div>
+
+      <div class="wo-card-meta">
+        <div><span class="wo-meta-k">Identities</span><span class="wo-meta-v num">${w.identifier_count.toLocaleString()}</span></div>
+        <div><span class="wo-meta-k">Day</span><span class="wo-meta-v">${w.day_index}</span></div>
+        <div><span class="wo-meta-k">Created</span><span class="wo-meta-v" title="${escape(formatAbsoluteTime(created))}">${escape(formatAbsoluteTime(created))}</span></div>
+        <div><span class="wo-meta-k">Updated</span><span class="wo-meta-v" title="${escape(formatAbsoluteTime(updated))}">${escape(formatRelativeTime(updated))}</span></div>
+        <div><span class="wo-meta-k">${ended ? 'Elapsed (final)' : 'Time elapsed'}</span><span class="wo-meta-v">${escape(formatElapsed(created, ended))}</span></div>
+        ${w.bundle_id ? `<div><span class="wo-meta-k">Bundle</span><span class="wo-meta-v mono" title="${escape(w.bundle_id)}">${escape(String(w.bundle_id).slice(0, 16))}…</span></div>` : ''}
+        ${isProfileOnly ? `<div><span class="wo-meta-k">Mode</span><span class="wo-meta-v"><span class="chip">Profile-only</span></span></div>` : ''}
+      </div>
+
+      ${errorHtml}
+
+      <details class="wo-services" ${isOpen ? 'open' : ''}>
+        <summary>Status by service${services ? ` (${services.length})` : ''}</summary>
+        <div class="wo-services-body">
+          <div class="wo-desc">
+            <div><span class="wo-meta-k">Name</span> ${escape(displayName)}</div>
+            <div><span class="wo-meta-k">Description</span> ${escape(description)}</div>
+          </div>
+          ${servicesHtml}
+        </div>
+      </details>
+    </div>`;
+}
+
+// Render the "Status by service" section grouped the same way AEP does:
+// pending/processing on top, completed below, failed last (so a regression
+// pops to the bottom where it's most visible).
+function renderServicesBreakdown(services) {
+  if (!services) {
+    return `<div class="wo-services-empty">Waiting for Adobe's first per-service status update… (monitor polls every 60s)</div>`;
+  }
+  const buckets = {
+    pending:    services.filter(s => s.status === 'pending'),
+    processing: services.filter(s => s.status === 'processing'),
+    completed:  services.filter(s => s.status === 'completed'),
+    failed:     services.filter(s => s.status === 'failed'),
+    other:      services.filter(s => !['pending','processing','completed','failed'].includes(s.status)),
+  };
+
+  const renderRow = (s) => `
+    <div class="wo-service ${s.cls}">
+      <span class="wo-service-icon" aria-hidden="true">${
+        s.cls === 'completed' ? '✓' :
+        s.cls === 'failed'    ? '✗' :
+        s.cls === 'processing'? '⟳' : '○'
+      }</span>
+      <span class="wo-service-name">${escape(s.name)}</span>
+      <span class="wo-service-status">${escape(s.friendly)}</span>
+      ${s.updatedAt ? `<span class="wo-service-time" title="${escape(formatAbsoluteTime(s.updatedAt))}">${escape(formatRelativeTime(s.updatedAt))}</span>` : ''}
+    </div>`;
+
+  const renderGroup = (label, list) => list.length === 0 ? '' : `
+    <div class="wo-services-group">
+      <div class="wo-services-group-label">${escape(label)}</div>
+      ${list.map(renderRow).join('')}
+    </div>`;
+
+  // Combine pending + processing into AEP's "PENDING/PROCESSING" header.
+  const inProgress = [...buckets.pending, ...buckets.processing];
+  return `
+    ${renderGroup('Pending / processing', inProgress)}
+    ${renderGroup('Completed', buckets.completed)}
+    ${renderGroup('Failed', buckets.failed)}
+    ${renderGroup('Other', buckets.other)}
+  `;
+}
+
+// Parse the two timestamp shapes we deal with into a JS Date:
+//   1. SQLite datetime('now')      -> "YYYY-MM-DD HH:MM:SS" (UTC, no T/Z)
+//   2. Adobe API + ISO-8601 strings -> standard ISO
+//   3. epoch milliseconds           -> number
+// Returns null for anything unparseable so callers can render "—".
+function parseTimestamp(v) {
+  if (v == null || v === '') return null;
+  if (v instanceof Date) return isNaN(v) ? null : v;
+  if (typeof v === 'number') { const d = new Date(v); return isNaN(d) ? null : d; }
+  const s = String(v);
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(s)) {
+    const d = new Date(s.replace(' ', 'T') + 'Z');
+    return isNaN(d) ? null : d;
+  }
+  const d = new Date(s);
+  return isNaN(d) ? null : d;
+}
+
+// Format a duration in ms as a single human-readable unit.
+// `suffix` lets the caller turn "2 hr" into "2 hr ago" without us caring
+// whether the duration is in the past or future.
+function formatDuration(ms, { suffix = '' } = {}) {
+  if (ms == null || isNaN(ms)) return '—';
+  const abs = Math.abs(ms);
+  if (abs < 60_000) return 'just now';
+  const tail = suffix ? ' ' + suffix : '';
+  if (abs < 3_600_000) {
+    const n = Math.round(abs / 60_000);
+    return `${n} min${tail}`;
+  }
+  if (abs < 86_400_000) {
+    const n = Math.round(abs / 3_600_000);
+    return `${n} hr${tail}`;
+  }
+  const days = Math.round(abs / 86_400_000);
+  return `${days} day${days === 1 ? '' : 's'}${tail}`;
+}
+
+function formatRelativeTime(v) {
+  const d = parseTimestamp(v);
+  if (!d) return '—';
+  return formatDuration(Date.now() - d.getTime(), { suffix: 'ago' });
+}
+
+// Absolute time matching AEP's display style: "4/23/2026, 7:30 PM".
+// Uses the browser's locale via `toLocaleString`, which keeps month/day order
+// correct for non-US users without us hardcoding a format.
+function formatAbsoluteTime(v) {
+  const d = parseTimestamp(v);
+  if (!d) return '—';
+  return d.toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'short' });
+}
+
+// Time elapsed between start and end. If end is missing, measures against
+// now — that's the "Time elapsed: 18 days" case while the work order is
+// still processing. If both are missing, returns "—".
+function formatElapsed(startV, endV) {
+  const start = parseTimestamp(startV);
+  if (!start) return '—';
+  const end = parseTimestamp(endV) || new Date();
+  return formatDuration(end.getTime() - start.getTime());
+}
+
+// Normalise Adobe's productStatusDetails array (or our stringified copy of
+// it) into a UI-ready shape: { name, raw, status, friendly, cls, updatedAt }.
+// Adobe uses `productStatus` (per docs/REVIEW.md §3.7); some older responses
+// use `status`. We accept either. Returns null when there's nothing to render
+// so the caller can show a "waiting for first status update" hint.
+function parseProductStatusDetails(input) {
+  if (!input) return null;
+  let arr = input;
+  if (typeof input === 'string') {
+    try { arr = JSON.parse(input); } catch { return null; }
+  }
+  if (!Array.isArray(arr) || arr.length === 0) return null;
+  return arr.map(it => {
+    const raw = String(it.productStatus || it.status || '').toLowerCase();
+    let status, friendly, cls;
+    if (raw === 'success' || raw === 'completed') {
+      status = 'completed'; friendly = 'Request completed'; cls = 'completed';
+    } else if (raw === 'failed' || raw === 'failure' || raw === 'error') {
+      status = 'failed';    friendly = 'Failed';             cls = 'failed';
+    } else if (raw === 'processing' || raw === 'in_progress' || raw === 'in-progress') {
+      status = 'processing'; friendly = 'Processing';        cls = 'processing';
+    } else if (raw === 'pending' || raw === 'queued' || raw === '') {
+      status = 'pending';   friendly = 'Request pending';   cls = 'pending';
+    } else {
+      status = raw;
+      friendly = raw.charAt(0).toUpperCase() + raw.slice(1);
+      cls = 'unknown';
+    }
+    return {
+      name: it.productName || 'Unknown service',
+      raw,
+      status, friendly, cls,
+      updatedAt: it.createdAt || it.updatedAt || null,
+    };
+  });
 }
 
 // Returns -1 for any status not in STAGES — pipelineHtml then renders no

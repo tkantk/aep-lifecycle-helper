@@ -628,8 +628,219 @@ input.locked, select.locked {
   font-size: 24px; color: white;
 }
 
+/* ─── Adobe org-quota banner (Config card) ────────────────────
+   Live values from GET /data/core/hygiene/quota. Shown after Test
+   Connection succeeds; auto-populates the Daily / Monthly cap inputs
+   below it. Stale state surfaces when the live fetch failed but a
+   cached value < 24h old is still trustable enough to render. */
+.org-quota {
+  border: 1px solid var(--g200);
+  border-radius: 6px;
+  background: var(--g50);
+  padding: 12px 14px;
+  margin-bottom: 14px;
+}
+.org-quota-head {
+  display: flex; align-items: center; gap: 10px;
+  margin-bottom: 10px;
+}
+.org-quota-title {
+  font-size: 12px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.4px;
+  color: var(--g700);
+}
+.org-quota-meta {
+  flex: 1; font-size: 11.5px; color: var(--g600);
+}
+.org-quota-bars {
+  display: grid; grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+@media (max-width: 720px) {
+  .org-quota-bars { grid-template-columns: 1fr; }
+}
+.org-quota-bar { font-size: 12px; }
+.org-quota-bar-label {
+  font-size: 10.5px; text-transform: uppercase;
+  letter-spacing: 0.3px; color: var(--g600);
+  margin-bottom: 3px;
+}
+.org-quota-bar-value {
+  color: var(--g900); margin-bottom: 5px;
+  font-variant-numeric: tabular-nums;
+}
+.org-quota-bar-rem { color: var(--g600); }
+.org-quota-stale {
+  margin-top: 10px;
+  padding: 8px 10px;
+  background: rgba(230,134,25,0.10);
+  border: 1px solid rgba(230,134,25,0.30);
+  border-radius: 4px;
+  color: var(--orange500);
+  font-size: 11.5px;
+}
+/* Extend the existing .link-btn rule (defined ~line 498) with a disabled
+   state — used by the quota Refresh button while a fetch is in flight. */
+.link-btn:disabled { color: var(--g500); cursor: not-allowed; text-decoration: none; }
+
 /* ─── Animations ─────────────────────────────────────────── */
 .spin { display: inline-block; animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .pulse { animation: pulse 2s ease-in-out infinite; }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+
+/* ─── Work-order detail cards (Monitor → selected job) ────────
+   Each card surfaces one work order at the level of detail AEP shows on its
+   "Data lifecycle requests" detail screen. Uses native <details> to
+   collapse the per-service breakdown so the page doesn't become a wall of
+   rows when a job has 10+ work orders. */
+.wo-card {
+  border: 1px solid var(--g200);
+  border-radius: 6px;
+  background: white;
+  margin-bottom: 12px;
+  overflow: hidden;
+}
+.wo-card-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  background: var(--g50);
+  border-bottom: 1px solid var(--g100);
+}
+.wo-card-id-row {
+  display: flex; align-items: center; gap: 8px;
+  min-width: 0; flex: 1;
+}
+.wo-card-id {
+  font-family: Menlo, Monaco, monospace;
+  font-size: 12.5px;
+  color: var(--g800);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.copy-btn {
+  font-size: 10.5px;
+  padding: 2px 6px;
+  border: 1px solid var(--g300);
+  border-radius: 3px;
+  background: white;
+  color: var(--g700);
+  cursor: pointer;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+.copy-btn:hover { background: var(--g100); border-color: var(--g500); }
+
+/* Metadata strip: 2–6 cells laid out responsively. AEP's screen uses a
+   grid of "label / value" cells too — mirror that for visual parity. */
+.wo-card-meta {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px 24px;
+  padding: 12px 14px;
+}
+.wo-card-meta > div { display: flex; flex-direction: column; min-width: 0; }
+.wo-meta-k {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  color: var(--g600);
+  margin-bottom: 2px;
+}
+.wo-meta-v {
+  font-size: 12.5px;
+  color: var(--g900);
+  font-weight: 500;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.wo-meta-v.num  { font-variant-numeric: tabular-nums; }
+.wo-meta-v.mono { font-family: Menlo, Monaco, monospace; font-size: 11.5px; font-weight: 400; }
+
+.wo-error {
+  margin: 0 14px 12px;
+  padding: 8px 10px;
+  background: rgba(227,72,80,0.08);
+  border: 1px solid rgba(227,72,80,0.25);
+  border-radius: 4px;
+  color: var(--red600);
+  font-size: 11.5px;
+}
+
+/* The collapsible service-status section. Uses <details>/<summary> so the
+   open/closed state is browser-native. The Set in app.js syncs across
+   re-renders from the 15s poll loop. */
+.wo-services {
+  border-top: 1px solid var(--g100);
+  padding: 10px 14px 14px;
+}
+.wo-services > summary {
+  list-style: none;          /* hide default disclosure triangle */
+  cursor: pointer;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--g700);
+  padding: 4px 0;
+  user-select: none;
+}
+.wo-services > summary::-webkit-details-marker { display: none; }
+.wo-services > summary::before {
+  content: '▸';
+  display: inline-block;
+  width: 14px;
+  color: var(--g500);
+  transition: transform 0.15s ease;
+}
+.wo-services[open] > summary::before { transform: rotate(90deg); }
+
+.wo-services-body { padding-top: 10px; }
+.wo-desc {
+  margin-bottom: 14px;
+  padding: 10px;
+  background: var(--g50);
+  border-radius: 4px;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--g800);
+}
+.wo-desc > div + div { margin-top: 4px; }
+
+.wo-services-group { margin-bottom: 10px; }
+.wo-services-group-label {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--g600);
+  margin-bottom: 4px;
+  padding-bottom: 4px;
+  border-bottom: 1px dashed var(--g200);
+}
+.wo-service {
+  display: grid;
+  grid-template-columns: 22px 1fr auto auto;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 4px;
+  font-size: 12.5px;
+}
+.wo-service + .wo-service { border-top: 1px solid var(--g100); }
+.wo-service-icon {
+  width: 18px; height: 18px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 50%;
+  font-size: 11px; font-weight: 700;
+}
+.wo-service.completed  .wo-service-icon { background: rgba(45,157,120,0.15); color: var(--green600); }
+.wo-service.pending    .wo-service-icon { background: var(--g100);            color: var(--g600); }
+.wo-service.processing .wo-service-icon { background: rgba(38,128,235,0.12);  color: var(--blue600); }
+.wo-service.failed     .wo-service-icon { background: rgba(227,72,80,0.12);   color: var(--red600); }
+.wo-service.unknown    .wo-service-icon { background: var(--g100);            color: var(--g600); }
+.wo-service-name   { color: var(--g900); font-weight: 500; }
+.wo-service-status { color: var(--g700); font-size: 11.5px; }
+.wo-service-time   { color: var(--g500); font-size: 11px; font-variant-numeric: tabular-nums; }
+
+.wo-services-empty {
+  font-size: 11.5px;
+  color: var(--g600);
+  font-style: italic;
+  padding: 8px 0;
+}
