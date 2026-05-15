@@ -19,13 +19,15 @@ const { logger } = await import('./utils/logger.js');
 const { initDb, db } = await import('./db.js');
 const { startMonitor } = await import('./runner/monitor.js');
 const { runStartupRecovery } = await import('./runner/recovery.js');
+const { startScheduler, stopScheduler } = await import('./runner/scheduler.js');
 const { hostHeaderGuard, originRefererGuard, makeErrorHandler } =
   await import('./middleware/security.js');
 
-const configRouter = (await import('./routes/config.js')).default;
-const uploadRouter = (await import('./routes/upload.js')).default;
-const jobsRouter   = (await import('./routes/jobs.js')).default;
-const adobeRouter  = (await import('./routes/adobe.js')).default;
+const configRouter   = (await import('./routes/config.js')).default;
+const uploadRouter   = (await import('./routes/upload.js')).default;
+const jobsRouter     = (await import('./routes/jobs.js')).default;
+const adobeRouter    = (await import('./routes/adobe.js')).default;
+const settingsRouter = (await import('./routes/settings.js')).default;
 
 // ─── Ensure data directories exist ──────────────────────────────────────
 fs.mkdirSync(config.uploadDir, { recursive: true });
@@ -92,6 +94,7 @@ app.use('/api/config', configRouter);
 app.use('/api/upload', uploadRouter);
 app.use('/api/jobs', jobsRouter);
 app.use('/api/adobe', adobeRouter);
+app.use('/api/settings', settingsRouter);
 
 app.get('/health', (_req, res) => res.json({ ok: true, uptime: process.uptime() }));
 
@@ -106,6 +109,14 @@ startMonitor();
 // Recover any jobs / work orders that were mid-flight when the process last
 // stopped. Runs once, asynchronously — doesn't block the HTTP server start.
 runStartupRecovery();
+
+// Auto-resume scheduler (Phase 3). Always start the timer so the operator
+// can toggle the setting from the UI without restarting; the tick is a
+// no-op unless the operator has explicitly enabled auto-resume. The
+// startup tick handles "laptop was closed at the scheduled time" — if the
+// fire window passed today and we have un-shipped work, the catch-up
+// fire happens immediately.
+startScheduler();
 
 // ─── Start server ───────────────────────────────────────────────────────
 const server = app.listen(config.port, config.host, () => {
@@ -130,6 +141,11 @@ function shutdown(sig) {
     logger.warn('shutdown timeout exceeded, exiting');
     process.exit(1);
   }, forceExitMs).unref();
+
+  // Stop the scheduler first so its setInterval doesn't keep the event loop
+  // alive (and doesn't spawn a fresh tick mid-shutdown). The monitor's
+  // setInterval is implicitly stopped by process.exit at the bottom.
+  try { stopScheduler(); } catch (e) { logger.warn({ err: e.message }, 'stopScheduler failed'); }
 
   server.close(err => {
     if (err) logger.error({ err: err.message }, 'server close error');

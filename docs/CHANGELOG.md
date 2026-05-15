@@ -9,6 +9,115 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-05-15 — Quota Phase 3: configurable auto-resume scheduler
+
+Context: Phase 2 (same day) made multi-month plans visible and re-bucketed
+un-shipped work orders against live `/quota` on every plan + submit. But
+the operator still had to come back manually on the 1st of each month to
+click Submit again. Phase 3 closes that gap: a 60-second background tick
+checks whether it's the operator-configured local HH:MM today on an allowed
+weekday, and if so re-submits every job that still has un-shipped work.
+The redistribute + reserve plumbing is unchanged; only the trigger is new.
+
+### Backend — scheduler module
+
+- **`src/runner/scheduler.js`** — new module. Three pieces:
+  - `shouldFireNow(settings, now = new Date())` — pure function. Returns
+    true exactly when `enabled === true` AND today passes the days
+    filter (every-day / weekdays / first-of-month) AND `now` is at or
+    past today's HH:MM AND we haven't fired since today's HH:MM (per
+    `lastRunAt`). Injectable `now` makes it trivially unit-testable
+    without freezing the system clock.
+  - `nextFireTime(settings, now)` — walks forward day-by-day looking
+    for the next datetime that satisfies the schedule. Exposed via the
+    API so the UI's "Next run: …" label always agrees with the actual
+    tick logic.
+  - `startScheduler()` / `stopScheduler()` — lifecycle. The startup
+    immediately runs one catch-up tick so the "laptop was closed at
+    the scheduled time" case (which the client called out explicitly)
+    is handled: if today's window has already passed and we haven't
+    fired today, the very first tick fires. `running` flag guards
+    against reentrancy when ticks overlap (paused machines can stack
+    setIntervals).
+  - `runResumeForAllJobs()` — iterates jobs with un-shipped WOs via a
+    new `listJobsWithUnshippedWOs` prepared statement, calls
+    `runSubmission({ jobId })` for each (which re-fetches `/quota`
+    and re-buckets, see Phase 2). One bad job is logged and skipped;
+    the rest still get processed. Per-tick summary
+    (`jobsProcessed`, `totalSubmitted`, `totalDeferred`, `totalFailed`,
+    `errors[]`) is persisted to `app_settings.auto_resume_last_run_summary`.
+- **`src/db.js`** — new `CREATE TABLE app_settings (key TEXT PRIMARY KEY,
+  value TEXT NOT NULL)`. Generic key/value bag. First users: `auto_resume_enabled`,
+  `auto_resume_local_time`, `auto_resume_days`, `auto_resume_last_run_at`,
+  `auto_resume_last_run_summary`. Two new prepared statements:
+  `listAppSettingsByPrefix`, `upsertAppSetting`. Plus
+  `listJobsWithUnshippedWOs` for the scheduler.
+- **`src/routes/settings.js`** — new router mounted at `/api/settings`.
+  `GET /auto-resume` returns the current settings + a `nextFireAt`
+  projection. `PUT /auto-resume` accepts a partial body
+  (`{ enabled?, localTime?, days? }`) and validates each field —
+  HH:MM regex for time, enum membership for days, boolean type for
+  enabled — using the same 400 envelope as F7's other route validators.
+  `lastRunAt` / `lastRunSummary` are deliberately not writable from
+  the route; only the scheduler itself updates them.
+- **`src/index.js`** — mounts `settingsRouter`, starts the scheduler
+  after `runStartupRecovery()`, and adds `stopScheduler()` to the
+  graceful-shutdown path so the setInterval doesn't keep the event
+  loop alive during shutdown.
+
+### Frontend — Submit tab sidebar panel
+
+- **`src/web/index.html`** — new `#auto-resume-panel` in the Submit
+  tab's sidebar. Toggle + HH:MM `<input type="time">` + days `<select>`
+  + a Save button gated on a dirty-check, plus a "next run" status
+  line and an optional last-run summary strip.
+- **`src/web/app.js`** — new `initAutoResumePanel()` called from
+  `renderSubmit`. Fetches settings on mount, renders, tracks dirty
+  state across input changes, persists via `PUT /settings/auto-resume`
+  on Save. `formatRelativeTime` reused for the "Last ran X ago" line.
+- **`src/web/styles.css`** — `.auto-resume-row`, `.f-toggle` (small
+  checkbox + label combo using the existing Spectrum tokens).
+
+### Invariants
+
+- **`docs/ARCHITECTURE.md` §4** updated — `runner/scheduler.js` and
+  `runner/redistributor.js` added to the module map. No new
+  `CLAUDE.md` invariant required: the scheduler routes every action
+  through `runSubmission`, which already preserves I5 (quota
+  reserve/release), I10 (re-bucket-not-re-emit), and I11 (non-
+  idempotent retry guards).
+
+### Tests
+
+- **`test/scheduler.test.js`** — 20 new cases. Pure-function
+  coverage: `shouldFireNow` returns false when disabled, fires when
+  past HH:MM with no prior run, doesn't fire before HH:MM, doesn't
+  fire twice in one day, fires the next day when yesterday's run is
+  stale, weekdays-only skips Sat/Sun and fires Monday, first-of-month
+  fires only on the 1st, malformed `localTime` fails closed.
+  `nextFireTime` projections for every-day, weekdays Friday→Monday,
+  and first-of-month mid-month→1st-of-next-month. Routes: GET
+  returns defaults; PUT accepts complete + partial valid payloads;
+  PUT rejects bad HH:MM / unknown days / non-boolean enabled;
+  PUT silently ignores caller-supplied `lastRunAt` /
+  `lastRunSummary`.
+- **169/169 pass.**
+
+### What this completes
+
+The three quota phases close out the multi-month-job feature set:
+- Phase 1: live Adobe `/quota` visibility + drift detection (`operationCount`).
+- Phase 2: month-aware re-bucketing + Plan/Submit modals.
+- Phase 3 (this session): operator-configurable auto-resume scheduler.
+
+A 10M-id job against a 2M/month entitlement now reliably ships across 5
+months without manual intervention beyond the initial Plan + Submit click,
+provided the operator's laptop is on at the configured local time at least
+once a month. The startup catch-up tick handles the "laptop was off at
+the scheduled time" edge case.
+
+---
+
 ## 2026-05-15 — Quota Phase 2: month-aware re-bucketer + Plan/Submit modals
 
 Context: Phase 1 (same day) wired live Adobe `/quota` into the Config UI.

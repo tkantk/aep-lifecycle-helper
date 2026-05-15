@@ -1288,9 +1288,105 @@ async function renderSubmit() {
   });
   $('#btn-goto-monitor').addEventListener('click', () => goto('monitor'));
 
+  // Auto-resume scheduler panel (Phase 3). Loads current settings, lets
+  // the operator toggle/edit, and shows "next run" + last-run summary.
+  void initAutoResumePanel();
+
   if (submitPollTimer) clearInterval(submitPollTimer);
   submitPollTimer = setInterval(refresh, 2000);
   state.pollTimer = submitPollTimer;
+}
+
+// ─── Auto-resume scheduler UI (Phase 3) ───────────────────────────────
+// Reads /api/settings/auto-resume on Submit-tab mount, wires inputs to a
+// "dirty" tracker, persists via PUT on Save. The Save button is gated until
+// the operator has actually changed something — avoids accidental writes
+// that overwrite the lastRunAt timestamp the scheduler relies on.
+async function initAutoResumePanel() {
+  const en = $('#ar-enabled'); const time = $('#ar-time'); const days = $('#ar-days');
+  const status = $('#ar-status'); const saveBtn = $('#btn-ar-save'); const lastRunEl = $('#ar-last-run');
+  if (!en || !time || !days) return;   // template not mounted
+
+  let original = null;
+  try {
+    original = await http('GET', '/settings/auto-resume');
+  } catch (err) {
+    status.textContent = `Failed to load settings: ${err.message}`;
+    return;
+  }
+
+  en.checked = !!original.enabled;
+  time.value = original.localTime || '09:00';
+  days.value = original.days || 'every-day';
+
+  const renderStatus = (settings) => {
+    if (!settings.enabled) {
+      status.textContent = 'Disabled. Enable to auto-resume deferred work on the schedule below.';
+      return;
+    }
+    if (settings.nextFireAt) {
+      const when = new Date(settings.nextFireAt);
+      const rel = formatRelativeTime(when.toISOString());
+      // formatRelativeTime returns "X ago"; for future dates we want "in X".
+      const inText = when > new Date() ? `in ${rel.replace(' ago', '')}` : rel;
+      status.textContent = `Next run: ${when.toLocaleString()} (${inText}).`;
+    } else {
+      status.textContent = 'Scheduled.';
+    }
+  };
+
+  const renderLastRun = (settings) => {
+    if (!settings.lastRunAt) { lastRunEl.hidden = true; return; }
+    const s = settings.lastRunSummary || {};
+    const when = new Date(settings.lastRunAt);
+    lastRunEl.hidden = false;
+    lastRunEl.innerHTML = `
+      <span class="f-hint">
+        Last ran ${escape(formatRelativeTime(when.toISOString()))}
+        ${s.jobsConsidered != null ? `· considered ${s.jobsConsidered} job${s.jobsConsidered === 1 ? '' : 's'}` : ''}
+        ${s.totalSubmitted ? `· submitted ${s.totalSubmitted} WO${s.totalSubmitted === 1 ? '' : 's'}` : ''}
+        ${s.totalDeferred  ? `· deferred ${s.totalDeferred}` : ''}
+        ${s.totalFailed    ? `· failed ${s.totalFailed}` : ''}
+        ${s.jobsSkipped    ? `· skipped ${s.jobsSkipped} (error)` : ''}
+      </span>`;
+  };
+
+  renderStatus(original);
+  renderLastRun(original);
+
+  const markDirty = () => {
+    const changed = en.checked !== !!original.enabled
+      || time.value !== (original.localTime || '09:00')
+      || days.value !== (original.days || 'every-day');
+    saveBtn.disabled = !changed;
+  };
+  [en, time, days].forEach(el => {
+    el.addEventListener('change', markDirty);
+    el.addEventListener('input', markDirty);
+  });
+
+  saveBtn.addEventListener('click', async () => {
+    saveBtn.disabled = true;
+    const oldText = saveBtn.textContent;
+    saveBtn.textContent = 'Saving…';
+    try {
+      const next = await http('PUT', '/settings/auto-resume', {
+        enabled:   en.checked,
+        localTime: time.value,
+        days:      days.value,
+      });
+      original = next;
+      renderStatus(next);
+      renderLastRun(next);
+      logActivity('info', `Auto-resume settings saved (${next.enabled ? 'enabled' : 'disabled'}, ${next.localTime}, ${next.days}).`);
+      saveBtn.textContent = 'Saved';
+      setTimeout(() => { saveBtn.textContent = oldText; markDirty(); }, 1500);
+    } catch (err) {
+      logActivity('error', `Auto-resume save failed: ${err.message}`);
+      saveBtn.textContent = oldText;
+      saveBtn.disabled = false;
+    }
+  });
 }
 
 function logActivity(level, msg) {

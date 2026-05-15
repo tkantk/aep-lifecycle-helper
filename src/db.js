@@ -153,6 +153,19 @@ export function initDb() {
       used            INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (ims_org_id, utc_year_month)
     );
+
+    -- ─── App-global settings (Phase 3, 2026-05-15) ──────────────────
+    -- Generic key/value bag for settings that aren't tied to a credential
+    -- or a job. Initial users:
+    --   auto_resume_enabled        'true' | 'false'
+    --   auto_resume_local_time     'HH:MM' (24-hour, operator's local timezone)
+    --   auto_resume_days           'every-day' | 'weekdays' | 'first-of-month'
+    --   auto_resume_last_run_at    ISO-8601 timestamp of the most recent fire
+    --   auto_resume_last_run_summary  JSON: { jobsProcessed, totalSubmitted, ... }
+    CREATE TABLE IF NOT EXISTS app_settings (
+      key   TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
   `);
 
   // ─── Additive migrations for existing DBs ─────────────────────────────
@@ -485,6 +498,24 @@ function prepared() {
     rollbackWorkOrderToPlanned: db.prepare(`
       UPDATE work_orders SET status = 'planned', last_error = ?, updated_at = datetime('now')
        WHERE id = ?
+    `),
+
+    // ─── App settings (Phase 3) ────────────────────────────────────
+    listAppSettingsByPrefix: db.prepare(
+      `SELECT key, value FROM app_settings WHERE key LIKE ?`
+    ),
+    upsertAppSetting: db.prepare(`
+      INSERT INTO app_settings (key, value) VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `),
+    // Jobs with at least one un-shipped work order — the set the auto-resume
+    // scheduler iterates on each tick. DISTINCT because one job has many WOs.
+    listJobsWithUnshippedWOs: db.prepare(`
+      SELECT DISTINCT j.id, j.name, j.sandbox_name, j.creds_id
+        FROM jobs j
+        JOIN work_orders w ON w.job_id = j.id
+       WHERE w.status IN ('planned', 'deferred')
+       ORDER BY j.created_at ASC
     `),
   };
   return stmts;

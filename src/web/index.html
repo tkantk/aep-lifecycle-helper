@@ -344,6 +344,40 @@
           <div class="panel-title">Quota</div>
           <div id="quota-display">—</div>
         </div>
+        <!-- Auto-resume scheduler panel (Phase 3) — global setting, applies
+             to every job with un-shipped work orders. Disabled by default;
+             operators opt in explicitly because the action is destructive. -->
+        <div class="panel">
+          <div class="panel-title">Auto-resume</div>
+          <div id="auto-resume-panel">
+            <div class="auto-resume-row">
+              <label class="f-toggle">
+                <input type="checkbox" id="ar-enabled">
+                <span>Enable</span>
+              </label>
+              <span class="f-hint" id="ar-status">Loading…</span>
+            </div>
+            <div class="auto-resume-row">
+              <label class="f">
+                <span>Time (local)</span>
+                <input type="time" id="ar-time" value="09:00">
+              </label>
+              <label class="f">
+                <span>Days</span>
+                <select id="ar-days">
+                  <option value="every-day">Every day</option>
+                  <option value="weekdays">Weekdays only</option>
+                  <option value="first-of-month">1st of month only</option>
+                </select>
+              </label>
+            </div>
+            <div class="auto-resume-row" id="ar-last-run" hidden></div>
+            <div class="actions" style="padding-top: 8px; border-top: 1px solid var(--g100); margin-top: 8px">
+              <div class="spacer"></div>
+              <button class="btn btn-secondary" id="btn-ar-save" disabled>Save</button>
+            </div>
+          </div>
+        </div>
         <div class="panel">
           <div class="panel-title">Activity log</div>
           <div class="log" id="activity-log"></div>

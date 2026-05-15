@@ -180,6 +180,19 @@ src/
 │   │                       actually retry after rollover.
 │   ├── monitor.js          setInterval(60s). Picks up from wo.j_creds_id /
 │   │                       wo.j_sandbox_name (joined alias columns).
+│   ├── scheduler.js        Configurable auto-resume scheduler (Phase 3,
+│   │                       2026-05-15). setInterval(60s) tick that fires
+│   │                       when shouldFireNow() agrees with the operator's
+│   │                       HH:MM-local-time + days policy and we haven't
+│   │                       already fired since today's window. Iterates
+│   │                       every job with un-shipped WOs and calls
+│   │                       runSubmission(jobId), which itself re-fetches
+│   │                       /quota + re-buckets via the redistributor.
+│   ├── redistributor.js    Month-aware re-bucketer (Phase 2). Walks un-
+│   │                       shipped WOs in rowid order and assigns
+│   │                       (month_index, day_index) from live Adobe quota
+│   │                       remaining + fresh future-period caps. Atomic
+│   │                       SQLite transaction. Shipped WOs are immutable.
 │   └── recovery.js         Startup reconciliation: resumes jobs stuck in
 │                           'expanding' (with skipSourceIds), and reconciles
 │                           'submitting' work orders with no adobe_workorder_id

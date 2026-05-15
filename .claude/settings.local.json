@@ -32,7 +32,8 @@
       "Bash(git add *)",
       "Bash(git commit -m ' *)",
       "Bash(node --test test/quotaApi.test.js)",
-      "Bash(node --test test/redistributor.test.js)"
+      "Bash(node --test test/redistributor.test.js)",
+      "Bash(node --test test/scheduler.test.js)"
     ]
   }
 }
