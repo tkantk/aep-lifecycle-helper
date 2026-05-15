@@ -940,7 +940,7 @@ Documented in `CLAUDE.md` but critical for review:
 - UUID param guard rejects malformed IDs before routes run.
 - CSP header present on all responses.
 
-### What is NOT covered (remaining gaps the reviewer should flag)
+### What is NOT covered (remaining gaps)
 
 - **Canonicalization corner cases**: what happens when the Identity Graph
   returns a namespace not in our index (e.g. a namespace added between our
@@ -962,6 +962,12 @@ Documented in `CLAUDE.md` but critical for review:
   between `startScheduler` and the jobs table is untested end-to-end.
 - **`quotaApi` + route integration**: the `GET /api/adobe/:credsId/quota`
   route has no dedicated test; the Phase 1 tests cover the service directly.
+- **`failed` WO orphan recovery gap** (Q12): `listSubmittingOrphanOrders`
+  only selects `status='submitting'`. A WO that timed out and was marked
+  `failed` (quota released) won't be reconciled at startup. If Adobe
+  actually processed that POST, the operator seeing a `failed` WO and
+  re-submitting could create a duplicate delete. Low probability (requires
+  a network timeout exactly at the POST boundary) but worth adding a test.
 
 ---
 

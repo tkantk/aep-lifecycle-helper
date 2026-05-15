@@ -9,6 +9,78 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-05-15 — Security & correctness fixes from code review
+
+Context: post-Phase-3 full functionality + security audit surfaced a set of
+correctness gaps. All 12 findings (F-001 through F-012) were addressed. Full
+review report in `docs/REVIEW.md`. 169/169 tests continue to pass.
+
+### Backend
+
+- **F-001 / `src/runner/redistributor.js`** — Removed the `SAFE_MIN_DAILY_CAP`
+  / `SAFE_MIN_MONTHLY_CAP` floors (100k each) that were applied to the initial
+  `dayRem` / `monthRem` values. These floors caused the redistributor to skip
+  remaining capacity that wasn't large enough to hold a max-size WO (100k),
+  but WOs are typically much smaller. A 30k WO would be pushed to the next
+  day/month even with 80k remaining — wasting up to 99k of quota per period.
+  Replaced with a simple clamp to 0 (defensive; Adobe's API can't return a
+  negative). Also added a comment to `safeInt` explaining the `quota=0`
+  treatment (F-008).
+- **F-003 / `src/runner/submission.js`** — `reserve()` and `release()` now use
+  the live Adobe quota cap values (`quotaSnapshot.daily.quota` /
+  `quotaSnapshot.monthly.quota`) instead of the static `job.daily_limit` /
+  `job.monthly_limit` stored at upload time. Job-row values are fallbacks only.
+  This keeps the local quota ledger consistent with what the redistributor
+  already used.
+- **F-005 / `src/runner/submission.js`** — `runSubmission` now returns early
+  (`{submitted:0}`) when `job.status === 'expanding'`. The scheduler's
+  `listJobsWithUnshippedWOs` can include a job still expanding after a crash
+  + restart; submitting its old planned WOs while expansion is in progress
+  is confusing even though content is frozen.
+- **F-006 / `src/runner/expansion.js`** — Added an `aborted` flag shared
+  across the `p-limit` task pool. When any batch throws, `aborted = true`
+  is set before re-throwing; subsequent in-queue tasks exit immediately
+  without writing progress counters to SQLite. Prevents the UI from
+  showing an ever-growing progress count on a job already marked `failed`.
+- **F-007 / `src/routes/config.js`** — `POST /credentials/test` now validates
+  `req.body.credsId` against `UUID_RE` before calling `decryptCreds`. Non-UUID
+  strings are rejected immediately with a generic response, eliminating
+  timing-based credential enumeration.
+- **F-009 / `src/runner/submission.js` + `recovery.js`** — Work-order
+  `displayName` now embeds the full local UUID (`WO ${wo.id}` instead of
+  `WO ${wo.id.slice(0,8)}`). Recovery lookup uses exact-match (`=== prefix`)
+  instead of `startsWith`. This makes orphan matching unambiguous even if a
+  job name contains ` - WO `.
+- **F-010 / `src/utils/csv.js`** — Added `\n` (LF) to `FORMULA_PREFIX_RE`
+  alongside the existing `\r` (CR), per OWASP CSV Injection guidance.
+- **F-004 / `src/runner/scheduler.js`** — `stopScheduler()` now resets
+  `running = false` so a subsequent `startScheduler()` call gets a clean
+  state. Without this, a test (or production restart) that cycles the
+  scheduler while a tick is awaiting would suppress the next catch-up tick.
+  Added a comment documenting the DST fall-back double-fire edge case (Q7
+  from the review): acceptable because `runSubmission` is idempotent for
+  already-submitted WOs.
+
+### Tests
+
+- **`test/recovery.test.js`** — Updated the "finds matching work order" test
+  to use the full `localId` as the displayName (was `localId.slice(0, 8)`
+  plus a suffix checked via `startsWith`), matching F-009.
+
+### What was NOT changed (false positive or non-issue)
+
+- **F-002** — `originRefererGuard` allows requests with neither Origin nor
+  Referer. Confirmed not a practical bypass: `hostHeaderGuard` runs first
+  and blocks any non-local Host. The gap is limited to content served from
+  the same loopback port, which already implies same-origin privilege.
+- **F-012** — `app.js` uses `escape(label)` in the credential picker.
+  The local `function escape(s)` declaration at line 1963 hoists to the top
+  of the script scope and shadows the browser global throughout — so
+  `escape(label)` was already calling the correct HTML-escape helper. No
+  change needed.
+
+---
+
 ## 2026-05-15 — Quota Phase 3: configurable auto-resume scheduler
 
 Context: Phase 2 (same day) made multi-month plans visible and re-bucketed
