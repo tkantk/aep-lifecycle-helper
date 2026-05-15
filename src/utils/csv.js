@@ -51,7 +51,7 @@ export async function streamIds(filePath, { column = 0, onRow }) {
  *
  * Reference: F10 in the 2026-05-12 security review; OWASP "CSV Injection".
  */
-const FORMULA_PREFIX_RE = /^[=+\-@\t\r]/;
+const FORMULA_PREFIX_RE = /^[=+\-@\t\r\n]/;
 
 export function sanitiseCsvValue(v) {
   if (v == null) return v;
