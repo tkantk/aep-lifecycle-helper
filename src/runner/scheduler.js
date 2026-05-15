@@ -134,6 +134,12 @@ export function shouldFireNow(settings, now = new Date()) {
   if (now < fire) return false;
 
   // Already fired since today's fire time? Skip.
+  // Both `last` (ISO string → UTC-absolute) and `fire` (local setHours →
+  // UTC-absolute) are compared as absolute timestamps, so the comparison is
+  // timezone-consistent. Known edge case: on DST fall-back days the scheduler
+  // may fire twice at the same HH:MM local time (clock repeats that hour).
+  // This is acceptable; a duplicate submission run is idempotent because
+  // runSubmission skips already-submitted WOs.
   if (settings.lastRunAt) {
     const last = new Date(settings.lastRunAt);
     if (!isNaN(last) && last >= fire) return false;
@@ -275,6 +281,11 @@ export function stopScheduler() {
   if (timer) {
     clearInterval(timer);
     timer = null;
+    // Reset the reentrancy flag so a subsequent startScheduler() call gets a
+    // clean state. Without this, if a tick was still awaiting when stop() was
+    // called (e.g. in tests that cycle the scheduler), running=true would
+    // silently suppress the next catch-up tick (F-004).
+    running = false;
     logger.info('auto-resume scheduler stopped');
   }
 }
