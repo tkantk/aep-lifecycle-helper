@@ -9,6 +9,144 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-05-15 — Quota Phase 2: month-aware re-bucketer + Plan/Submit modals
+
+Context: Phase 1 (same day) wired live Adobe `/quota` into the Config UI.
+Phase 2 makes the planner actually use those numbers. The headline change
+is that the planner now buckets un-shipped work orders into `(day_index,
+month_index)` pairs computed from the live `daily.remaining` and
+`monthly.remaining` Adobe reports — and every Submit re-fetches `/quota`
+and re-buckets before shipping anything. So if another tool consumes
+org-wide monthly quota between Plan and Submit, our previously-Month-2
+work gets pushed to Month 3 automatically; we never ship blind and let
+Adobe reject. Pre-plan and pre-submit modals add operator confirmation
+points before any destructive call goes out.
+
+### Backend — re-bucketer + planner / submission integration
+
+- **`src/runner/redistributor.js`** — new module exporting
+  `redistributeUnshippedOrders(jobId, quota)`. Walks all un-shipped
+  (status ∈ {planned, deferred}) work orders for the job in rowid order
+  and assigns `(month_index, day_index)` based on the live quota:
+  the first month consumes `quota.monthly.remaining` (the live Adobe
+  value, which already excludes whatever has been shipped this month);
+  subsequent months consume the full `quota.monthly.quota` entitlement.
+  Today consumes `quota.daily.remaining`; subsequent days consume full
+  `quota.daily.quota`. All updates run inside a single SQLite
+  transaction so a crash mid-redistribute leaves the previous labels
+  intact. Returns `{ months, days, totalUnshipped, totalIdentifiers,
+  perMonthCounts }`. **Never touches shipped WOs** — their historical
+  `(day_index, month_index)` is preserved.
+- **`src/runner/submission.js::planWorkOrders`** — accepts a new
+  `quota` parameter; after the legacy day-by-day pass writes the
+  initial rough plan, calls `redistributeUnshippedOrders` to assign
+  the authoritative month/day labels. Returns
+  `{ planned, days, months, perMonthCounts, totalIdentifiers,
+  shiftedFromPrevious, previousMonths }`. The Replan-Forbidden guard
+  for shipped WOs is unchanged.
+- **`src/runner/submission.js::runSubmission`** — accepts a new
+  `monthIndex` alongside `dayIndex`. Always re-fetches `/quota` with
+  `refresh: true` before picking work; if `/quota` fails AND there's no
+  cached value within the 24 h hard floor, throws `quota_unavailable`
+  and refuses to submit. The pre-submission redistribute updates the
+  un-shipped pool to reflect any drift; the per-WO `reserve()` /
+  `release()` ledger is unchanged.
+- **`src/routes/jobs.js`** — Plan and Submit handlers fetch `/quota`
+  via `getOrgQuota` and pass it to the planner / runner. Plan returns
+  503 with code `quota_unavailable` when Adobe is unreachable AND no
+  cache (caller blocks the UI). Submit returns 200 immediately and
+  records crashes via the existing logger.
+- **`src/db.js`** — additive migrations: `work_orders.month_index`
+  (nullable; computed by the redistributor) and `jobs.projected_months`
+  (nullable; the redistributor's max month_index for this job —
+  used by the UI to detect "plan extended by N months" shifts).
+  Five new prepared statements: `getOrdersByMonthAndDay`,
+  `getUnshippedOrdersForJob`, `setOrderMonthDay`, `setProjectedMonths`,
+  plus an update to `getAllOrdersForJob` / `getPlannedOrders` to sort
+  by `COALESCE(month_index, 1)`.
+
+### Backend — invariant update
+
+- **`CLAUDE.md` I10** rewritten. The old rule "re-planning is forbidden
+  once any WO has shipped" stands. The Phase 2 refinement clarifies
+  that "re-bucketing" (updating `day_index` / `month_index` on
+  un-shipped WOs) is explicitly allowed — the
+  `namespaces_identities` JSON of any existing WO never changes; only
+  the bucket label moves.
+
+### Frontend — Plan UI grouped by Month → Day
+
+- **`src/web/app.js::renderPlanResults`** — table replaced with a
+  collapsible `<details>` per month showing per-month identifier total
+  and percentage of monthly cap. Top stat-grid surfaces "Spans N
+  months" (orange-tinted when > 1) so the multi-month case is obvious
+  at a glance. Re-plan button label updated to "↻ Re-plan against
+  live quota".
+- **`src/web/app.js::buildOrRebuildPlan`** — handles the new server
+  return shape, calls `showPlanModal(plan)` when the plan spans more
+  than one month or when re-planning extended the timeline. Operator
+  cancel keeps the previous plan unchanged in the DB.
+
+### Frontend — Pre-plan modal, pre-submit modal, re-bucket toast
+
+- **`src/web/index.html`** — new `#modal-root` and `#toast-container`
+  at the bottom of the page; single shared modal instance to keep
+  state simple.
+- **`src/web/app.js`** — new helpers `showModal({title, bodyHtml,
+  actions}) → Promise<value>` and `showToast(message, {kind,
+  durationMs})`. The modal closes on backdrop click / Escape / close
+  button (returns null). Toasts auto-dismiss after 6–9 s and stack
+  in the top-right corner.
+- **`showPlanModal(plan)`** — confirmation before a multi-month plan
+  is locked in. Per the 2026-05-15 RQ-2 decision: shows a toast for
+  a 1-month extension; shows the modal for ≥ 2-month extensions or
+  any fresh multi-month plan. Body lists per-month identifier
+  counts and notes that monthly quota only resets at 00:00 GMT on
+  the 1st.
+- **`showSubmitModal({wosToSubmit, monthLabel, dayLabel, quota})`** —
+  always shown before each Submit click. Includes the live daily and
+  monthly remaining numbers, warns when the requested batch exceeds
+  either (excess will be deferred), and warns when the quota numbers
+  are stale.
+- **Submit-tab poll** — on every 2-second refresh, compares
+  `Math.max(...workOrders.map(w => w.month_index))` against
+  `state.lastKnownMonths`. A 1-month drift triggers a toast; ≥ 2
+  triggers a modal explaining the shift.
+
+### Frontend — styles
+
+- **`src/web/styles.css`** — new `.plan-month` accordion, `.stat.warn`
+  variant, `.modal-root` / `.modal-card` / `.modal-quota`, `.toast`
+  / `.toast-warn` / `.toast-in`, `.btn-danger`. All built from the
+  existing Spectrum tokens.
+
+### Tests
+
+- **`test/redistributor.test.js`** — 8 new cases: 4M with 2M/mo →
+  2 months / 20+20 split; 10M → 5 months × 2 days; live monthly
+  remaining of 500k pushes excess to month 2; partial daily.remaining
+  produces a small Day 1; shipped WOs keep their labels; monthly cap
+  disabled → single-month spread across days; `projected_months` is
+  persisted; empty job is a no-op.
+- **`test/integration.test.js`** — added `mockOrgQuota()` helper +
+  `clearQuotaCache()` in afterEach so the new `runSubmission`
+  pre-flight passes. Same end-to-end coverage as before.
+- **`test/planWorkOrders.test.js`** — updated the
+  "empty expanded_identities" assertion to expect `days: 0,
+  months: 0` (the redistributor's correct empty-pool behaviour;
+  previously the planner returned `days: 1` even with no work, a
+  quirk of always starting `dayIndex` at 1).
+- **149/149 pass.**
+
+### What's deliberately deferred to Phase 3
+
+- Auto-resume scheduler (configurable HH:MM + weekdays-only /
+  1st-of-month toggle). For now the operator manually clicks Submit
+  at the start of each month; the Plan UI's multi-month banner makes
+  this expectation explicit.
+
+---
+
 ## 2026-05-15 — Quota Phase 1: live Adobe org quota in the Config UI
 
 Context: client asked us to address a series of quota-handling concerns

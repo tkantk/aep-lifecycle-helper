@@ -1,0 +1,164 @@
+import { db, q } from '../db.js';
+import { config } from '../config.js';
+import { logger } from '../utils/logger.js';
+
+/**
+ * Month-aware re-bucketer for un-shipped work orders.
+ *
+ * Phase 2 (2026-05-15) — see docs/CHANGELOG.md.
+ *
+ * The planner emits work orders in deterministic creation order. Each work
+ * order is ≤ 100,000 identifiers (Adobe hard cap, CLAUDE.md I3). The job of
+ * the redistributor is to assign each un-shipped work order a `(day_index,
+ * month_index)` label that respects the org's CURRENT Adobe quota state
+ * (fetched live via `services/quotaApi.js`).
+ *
+ * Why we re-bucket instead of computing once at plan time:
+ *   - Adobe quota is org-wide. If someone else also deletes against the org
+ *     between Plan and Submit, the live `remaining` shrinks. The
+ *     originally-planned "Day 2 → Month 2" might no longer fit; redistribute
+ *     pushes it to Month 3.
+ *   - Monthly rollover (1st of month at 00:00 GMT) refreshes the cap.
+ *     Redistribute run after rollover sees the fresh `monthly.remaining` and
+ *     packs more work into the current month.
+ *   - Daily rollover (00:00 GMT) likewise refreshes the daily cap.
+ *
+ * What stays immutable:
+ *   - The identity content of a work order. Once a WO is inserted into
+ *     `work_orders`, its `namespaces_identities` JSON never changes — that
+ *     would be re-emitting (CLAUDE.md I10).
+ *   - Shipped work orders' `(day_index, month_index)`. Their historical
+ *     submission window is preserved; only the un-shipped tail is re-labelled.
+ *
+ * Algorithm:
+ *   1. Walk un-shipped (status ∈ {planned, deferred}) WOs in rowid order.
+ *   2. Track running consumption against three caps:
+ *        - `dayRem`     — identifiers left in the current day window
+ *        - `monthRem`   — identifiers left in the current month window
+ *        - `dailyFresh` — fresh daily cap once we advance to next day
+ *        - `monthlyFresh` — fresh monthly cap once we advance to next month
+ *      The current day/month start with `quota.daily.remaining` and
+ *      `quota.monthly.remaining` (the live Adobe values, which already
+ *      exclude whatever we shipped before this run).
+ *   3. For each WO:
+ *        a. If it doesn't fit in `dayRem`, advance to the next day
+ *           (`day++`, `dayRem = dailyFresh`).
+ *        b. If it doesn't fit in `monthRem`, advance to the next month
+ *           (`month++`, `day = 1`, `dayRem = dailyFresh`,
+ *           `monthRem = monthlyFresh`). The check happens AFTER the day-fit
+ *           check because a single WO is always ≤ daily cap (100k ≤ 1M).
+ *        c. Assign the WO `(day, month)` and decrement the running caps.
+ *   4. Persist all updates inside a single SQLite transaction so a crash
+ *      mid-redistribute leaves the previous labels intact.
+ *
+ * Returns `{ months, days, shifted, perMonthCounts }` so callers can render
+ * a "projected timeline" or a toast/modal when month_index extends beyond
+ * the previously-projected value.
+ */
+
+const SAFE_MIN_DAILY_CAP   = 100_000;   // 1 work order's worth — never produce a smaller bucket
+const SAFE_MIN_MONTHLY_CAP = 100_000;
+
+function safeInt(v, fallback) {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+/**
+ * @param {string} jobId
+ * @param {{ daily?: {remaining?:number, quota?:number}, monthly?: {remaining?:number, quota?:number}|null }} quota
+ *   The shape returned by `services/quotaApi.js::getOrgQuota`. Either field
+ *   may be null/missing; in that case we fall back to the job's stored
+ *   `daily_limit` / `monthly_limit` configured on the row.
+ * @returns {{ months: number, days: number, totalUnshipped: number,
+ *             totalIdentifiers: number, perMonthCounts: number[] }}
+ */
+export function redistributeUnshippedOrders(jobId, quota) {
+  const job = q().getJob.get(jobId);
+  if (!job) throw new Error(`redistribute: job not found: ${jobId}`);
+
+  // Effective caps. Adobe's /quota is the truth when present; the job-row
+  // values are only used when Adobe data is missing (e.g. first-run before
+  // a successful /quota call). Both checks tolerate `0`-as-disabled per
+  // the existing convention.
+  const dailyFresh = safeInt(
+    quota?.daily?.quota,
+    safeInt(job.daily_limit, config.dailyIdentifierLimit)
+  );
+  const monthlyFresh = job.monthly_limit === null || job.monthly_limit === 0
+    ? safeInt(quota?.monthly?.quota, null)
+    : safeInt(quota?.monthly?.quota, safeInt(job.monthly_limit, null));
+
+  // First-period remainders — live values from Adobe if we have them,
+  // otherwise full fresh caps.
+  let dayRem   = Number.isFinite(quota?.daily?.remaining)   ? Number(quota.daily.remaining)   : dailyFresh;
+  let monthRem = monthlyFresh == null
+    ? null
+    : (Number.isFinite(quota?.monthly?.remaining) ? Number(quota.monthly.remaining) : monthlyFresh);
+
+  // Defensive floors. If Adobe ever reports remaining < a single WO's max
+  // size, our loop would never make progress within that period. Treat it as
+  // "this period is exhausted, advance immediately."
+  if (dayRem   < SAFE_MIN_DAILY_CAP)   dayRem   = 0;
+  if (monthRem != null && monthRem < SAFE_MIN_MONTHLY_CAP) monthRem = 0;
+
+  const orders = q().getUnshippedOrdersForJob.all(jobId);
+  if (orders.length === 0) {
+    q().setProjectedMonths.run(0, jobId);
+    return { months: 0, days: 0, totalUnshipped: 0, totalIdentifiers: 0, perMonthCounts: [] };
+  }
+
+  let month = 1;
+  let day   = 1;
+  const perMonthCounts = [0];   // index 0 = month 1
+  let totalIdentifiers = 0;
+
+  const tx = db.transaction(() => {
+    for (const wo of orders) {
+      const count = wo.identifier_count;
+      totalIdentifiers += count;
+
+      // (a) Daily fit. A WO that doesn't fit pushes us to the next day,
+      //     which starts with a fresh daily cap.
+      if (count > dayRem) {
+        day++;
+        dayRem = dailyFresh;
+      }
+      // (b) Monthly fit. If the WO still doesn't fit even in the next day's
+      //     fresh daily capacity because the month is exhausted, advance
+      //     month (which resets day to 1 and refreshes both caps).
+      if (monthRem != null && count > monthRem) {
+        month++;
+        day = 1;
+        dayRem = dailyFresh;
+        monthRem = monthlyFresh;
+        perMonthCounts[month - 1] = 0;
+      }
+      // (c) Place the WO.
+      q().setOrderMonthDay.run(month, day, wo.id);
+      dayRem -= count;
+      if (monthRem != null) monthRem -= count;
+      perMonthCounts[month - 1] = (perMonthCounts[month - 1] || 0) + count;
+    }
+  });
+  tx();
+
+  // The maximum day_index assigned in the LAST month — useful for the UI
+  // header. (`day` at end-of-loop is exactly that.)
+  const maxDayInFinalMonth = day;
+
+  q().setProjectedMonths.run(month, jobId);
+
+  logger.info({
+    jobId, months: month, daysInLastMonth: maxDayInFinalMonth,
+    totalUnshipped: orders.length, totalIdentifiers,
+  }, 'redistributor: completed');
+
+  return {
+    months: month,
+    days: maxDayInFinalMonth,
+    totalUnshipped: orders.length,
+    totalIdentifiers,
+    perMonthCounts,
+  };
+}

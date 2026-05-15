@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { q } from '../db.js';
 import { planWorkOrders, runSubmission } from '../runner/submission.js';
 import { peek as peekQuota } from '../services/quotaManager.js';
+import { getOrgQuota } from '../services/quotaApi.js';
 import { decryptCreds } from '../utils/crypto.js';
 import { liveProgress } from '../runner/expansion.js';
 import { writeCsv } from '../utils/csv.js';
@@ -87,19 +88,44 @@ router.get('/:id/progress', (req, res) => {
 });
 
 /** Build (or rebuild) the work-order plan. Refuses if any work order has
- *  already been submitted to Adobe — prevents duplicate irreversible deletes. */
+ *  already been submitted to Adobe — prevents duplicate irreversible deletes.
+ *
+ *  Phase 2: fetches Adobe /quota first so the planner can bucket work into
+ *  months that match the org's current entitlement. If /quota fails AND we
+ *  have no cache (24h hard floor), this returns 503 — the operator can't
+ *  plan against unknown quota for a destructive workflow. */
 router.post('/:id/plan', async (req, res, next) => {
   try {
     const job = q().getJob.get(req.params.id);
-    if (!job) return res.status(404).json({ error: 'job not found' });
+    if (!job) {
+      const err = new Error('job not found');
+      err.status = 404; err.code = 'not_found'; err.publicMessage = 'job not found';
+      return next(err);
+    }
+
+    // Fetch live quota. If the credential is gone, fall back to job-row caps.
+    let quota = null;
+    try {
+      const creds = await decryptCreds(job.creds_id);
+      quota = await getOrgQuota(creds, { refresh: false });
+    } catch (err) {
+      if (err.code === 'quota_unavailable') {
+        const e = new Error('Cannot plan: Adobe /quota is unreachable and no recent cache exists. Resolve connectivity, then retry.');
+        e.status = 503; e.code = 'quota_unavailable'; e.publicMessage = e.message;
+        return next(e);
+      }
+      // Credential decrypt failure or other — log and proceed with static caps.
+      logger.warn({ jobId: job.id, err: err.message }, 'plan: /quota fetch failed, falling back to static caps');
+    }
 
     const result = planWorkOrders({
       jobId: job.id,
       datasetIds: job.dataset_ids,
       dailyLimit: job.daily_limit,
       targetServices: job.target_services_json ? JSON.parse(job.target_services_json) : null,
+      quota,
     });
-    res.json(result);
+    res.json({ ...result, quota });
   } catch (err) {
     if (err.name === 'ReplanForbiddenError') {
       return res.status(409).json({ error: 'replan_forbidden', message: err.message });
@@ -108,15 +134,26 @@ router.post('/:id/plan', async (req, res, next) => {
   }
 });
 
-/** Kick off submission (fire-and-forget). Poll /work-orders for status. */
+/** Kick off submission (fire-and-forget). Poll /work-orders for status.
+ *  Body: { dayIndex?: number, monthIndex?: number }. Omit both to ship "the
+ *  next available bucket" (lowest month with un-shipped WOs, Day 1 of that
+ *  month). */
 router.post('/:id/submit', async (req, res, next) => {
   try {
-    const { dayIndex } = req.body;
+    const { dayIndex, monthIndex } = req.body || {};
     const job = q().getJob.get(req.params.id);
-    if (!job) return res.status(404).json({ error: 'job not found' });
+    if (!job) {
+      const err = new Error('job not found');
+      err.status = 404; err.code = 'not_found'; err.publicMessage = 'job not found';
+      return next(err);
+    }
 
-    runSubmission({ jobId: job.id, dayIndex }).catch(err =>
-      logger.error({ jobId: job.id, err: err.message }, 'submission run crashed'));
+    // The actual submission runs async — we kick it off, return 200, and the
+    // UI polls /work-orders for progress. Errors (including quota_unavailable
+    // from runSubmission's pre-flight refresh) are logged; the operator sees
+    // the deferred/failed state on the next /work-orders poll.
+    runSubmission({ jobId: job.id, dayIndex, monthIndex }).catch(err =>
+      logger.error({ jobId: job.id, err: err.message, code: err.code }, 'submission run crashed'));
     res.json({ ok: true });
   } catch (err) { next(err); }
 });

@@ -324,12 +324,16 @@ test('planWorkOrders: empty expanded_identities produces zero orders', () => {
   const jobId = insertJob();
   // no identities seeded
 
-  const { planned, days } = planWorkOrders({
+  const { planned, days, months } = planWorkOrders({
     jobId, datasetIds: 'ALL', dailyLimit: 1_000_000, targetServices: null,
   });
 
   assert.equal(planned, 0);
-  assert.equal(days, 1);
+  // Phase 2: zero unshipped work orders now correctly produces zero days
+  // and zero months. The pre-Phase-2 planner returned `days: 1` even with
+  // no work — a quirk of always starting the day counter at 1.
+  assert.equal(days, 0);
+  assert.equal(months, 0);
   assert.equal(getWorkOrders(jobId).length, 0);
 });
 

@@ -964,6 +964,21 @@ async function buildOrRebuildPlan() {
   try {
     const plan = await http('POST', `/jobs/${state.job.id}/plan`);
     state.plan = plan;
+
+    // Phase 2: pre-plan confirmation modal. Triggered when the plan spans
+    // more than one month, or when re-planning extended the projected
+    // timeline. The operator confirms before we render the new plan and
+    // before any submission can start.
+    const shouldConfirm = (plan.months > 1) || plan.shiftedFromPrevious;
+    if (shouldConfirm) {
+      const ok = await showPlanModal(plan);
+      if (!ok) {
+        // Operator cancelled. Re-render the existing plan (still in DB).
+        const wos = await http('GET', `/jobs/${state.job.id}/work-orders`);
+        await renderPlanResults(wos);
+        return;
+      }
+    }
     const wos = await http('GET', `/jobs/${state.job.id}/work-orders`);
     state.workOrders = wos;
     await renderPlanResults(wos);
@@ -981,6 +996,12 @@ async function buildOrRebuildPlan() {
       }
       return;
     }
+    if (err.status === 503) {
+      $('#plan-body').innerHTML = `<div class="alert error">
+        <div><div class="alert-title">Planning blocked: Adobe quota unreachable</div>
+        ${escape(err.data?.message || err.message)}</div></div>`;
+      return;
+    }
     $('#plan-body').innerHTML = `<div class="alert error">
       <div><div class="alert-title">Planning failed</div>${escape(err.message)}</div></div>`;
   }
@@ -989,17 +1010,40 @@ async function buildOrRebuildPlan() {
 async function renderPlanResults(wos, container) {
   state.workOrders = wos;
   const target = container || $('#plan-body');
-  // If we don't have a totals block yet (e.g. came in via existing-plan path),
-  // synthesize plan summary from the work-order list.
-  const planned = wos.length;
-  const days = wos.reduce((m, w) => Math.max(m, w.day_index), 1);
-  const submittedCount = wos.filter(w =>
-    !['planned', 'deferred'].includes(w.status)
-  ).length;
-  state.plan = state.plan || { planned, days };
 
+  const planned = wos.length;
+  const submittedCount = wos.filter(w => !['planned', 'deferred'].includes(w.status)).length;
   const totalIds = wos.reduce((s, w) => s + w.identifier_count, 0);
   const replanDisabled = submittedCount > 0;
+
+  // Group by Month → Day. month_index is nullable on legacy rows (jobs
+  // planned before Phase 2); we treat NULL as Month 1 for backward compat.
+  const byMonth = new Map();    // monthIndex -> Map<dayIndex, WO[]>
+  for (const w of wos) {
+    const m = w.month_index ?? 1;
+    const d = w.day_index ?? 1;
+    if (!byMonth.has(m)) byMonth.set(m, new Map());
+    const dayMap = byMonth.get(m);
+    if (!dayMap.has(d)) dayMap.set(d, []);
+    dayMap.get(d).push(w);
+  }
+  const monthsSorted = [...byMonth.keys()].sort((a, b) => a - b);
+  const totalMonths = monthsSorted.length || 1;
+  state.plan = state.plan || { planned, months: totalMonths };
+
+  // Per-month identifier totals (Phase 2 — what's going against each month's
+  // entitlement). We also surface the "earliest completion" month relative
+  // to today; the actual calendar date depends on operator cadence so we
+  // phrase it as "spans N months from now."
+  const monthRows = monthsSorted.map(m => {
+    const wosInMonth = [];
+    for (const list of byMonth.get(m).values()) wosInMonth.push(...list);
+    const idsInMonth = wosInMonth.reduce((s, w) => s + w.identifier_count, 0);
+    return { month: m, ids: idsInMonth, wos: wosInMonth };
+  });
+
+  const dailyCap   = state.config.dailyLimit   || 1_000_000;
+  const monthlyCap = state.config.monthlyLimit || 0;
 
   target.innerHTML = `
     <div class="stat-grid">
@@ -1011,39 +1055,60 @@ async function renderPlanResults(wos, container) {
         <div class="stat-label">Work orders</div>
         <div class="stat-value">${planned.toLocaleString()}</div>
       </div>
-      <div class="stat">
-        <div class="stat-label">Submission days</div>
-        <div class="stat-value">${days}</div>
-        <div class="stat-sub">@ ${state.config.dailyLimit.toLocaleString()}/day</div>
+      <div class="stat ${totalMonths > 1 ? 'warn' : ''}">
+        <div class="stat-label">Spans</div>
+        <div class="stat-value">${totalMonths} month${totalMonths === 1 ? '' : 's'}</div>
+        <div class="stat-sub">${monthlyCap > 0 ? `@ ${monthlyCap.toLocaleString()}/mo · ` : ''}${dailyCap.toLocaleString()}/day</div>
       </div>
     </div>
 
+    ${totalMonths > 1 ? `
+    <div class="alert info" style="margin-top: 16px">
+      <div>
+        <div class="alert-title">Multi-month plan</div>
+        This deletion exceeds your monthly quota and will span <b>${totalMonths} months</b>. Each month's batch ships only after the org-wide monthly quota resets at <b>00:00 GMT on the 1st</b>. Phase 3 (auto-resume) is not yet enabled; for now you'll need to come back and click Submit each month.
+      </div>
+    </div>` : ''}
+
     <div class="section" style="margin-top: 24px; padding-top: 24px">
-      <div class="section-head">Planned work orders</div>
+      <div class="section-head">Planned work orders, grouped by month</div>
+      <div class="section-sub">Day numbers are within each month and re-bucket dynamically when Adobe quota changes.</div>
     </div>
-    <div class="table-wrap">
-      <table>
-        <thead><tr><th>Local ID</th><th>Day</th><th>Namespaces</th><th>Identities</th><th>Status</th></tr></thead>
-        <tbody>${wos.map(w => `
-          <tr>
-            <td class="mono">${w.id.slice(0, 8)}…</td>
-            <td><span class="day-chip">Day ${w.day_index}</span></td>
-            <td>${w.namespaces.map(n => {
-                const label = n.code || `nsid:${n.id}`;
-                return `<span class="ns-badge ${nsClass(n.code)}">${escape(label)}</span>`;
-              }).join(' ')}</td>
-            <td class="num">${w.identifier_count.toLocaleString()}</td>
-            <td><span class="pill ${w.status}">${w.status}</span></td>
-          </tr>`).join('')}
-        </tbody>
-      </table>
-    </div>
+
+    ${monthRows.map(m => `
+      <details class="plan-month" ${m.month === monthsSorted[0] ? 'open' : ''}>
+        <summary>
+          <span class="plan-month-label">Month ${m.month}</span>
+          <span class="plan-month-stats">
+            ${m.wos.length} work order${m.wos.length === 1 ? '' : 's'} · ${m.ids.toLocaleString()} identifiers
+            ${monthlyCap > 0 ? `· ${((m.ids / monthlyCap) * 100).toFixed(0)}% of monthly cap` : ''}
+          </span>
+        </summary>
+        <div class="table-wrap" style="margin-top: 8px">
+          <table>
+            <thead><tr><th>Local ID</th><th>Day</th><th>Namespaces</th><th>Identities</th><th>Status</th></tr></thead>
+            <tbody>${m.wos.map(w => `
+              <tr>
+                <td class="mono">${escape(w.id.slice(0, 8))}…</td>
+                <td><span class="day-chip">Day ${w.day_index ?? 1}</span></td>
+                <td>${w.namespaces.map(n => {
+                    const label = n.code || `nsid:${n.id}`;
+                    return `<span class="ns-badge ${nsClass(n.code)}">${escape(label)}</span>`;
+                  }).join(' ')}</td>
+                <td class="num">${w.identifier_count.toLocaleString()}</td>
+                <td><span class="pill ${escape(w.status)}">${escape(w.status)}</span></td>
+              </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>
+      </details>`).join('')}
+
     <div style="margin-top:16px; display:flex; gap:8px; align-items:center">
       <button class="btn btn-secondary" id="btn-replan" ${replanDisabled ? 'disabled title="Re-planning is blocked once any work order has been submitted to Adobe."' : ''}>
-        ${replanDisabled ? 'Re-plan blocked (already submitted)' : '↻ Re-plan'}
+        ${replanDisabled ? 'Re-plan blocked (already submitted)' : '↻ Re-plan against live quota'}
       </button>
       <span style="font-size:11.5px; color:var(--g600)">
-        ${replanDisabled ? 'A new plan would risk duplicate deletions.' : 'Rebuild the plan from current expanded identities.'}
+        ${replanDisabled ? 'Identity content of shipped work orders is immutable. Un-shipped buckets still re-distribute against live quota on every Submit.' : 'Rebuilds the plan using the current Adobe org quota.'}
       </span>
     </div>`;
 
@@ -1128,6 +1193,30 @@ async function renderSubmit() {
       http('GET', `/jobs/${state.job.id}/work-orders`),
       http('GET', `/jobs/${state.job.id}`),
     ]);
+
+    // Phase 2: detect month_index drift across the poll. If the redistributor
+    // (run on the server before each submit) extended the projected timeline,
+    // surface a toast (≤1mo) or modal (≥2mo). We compare to state.lastKnownMonths
+    // — first poll just records the value without notifying.
+    const currentMaxMonth = Math.max(1, ...wos.map(w => w.month_index ?? 1));
+    if (state.lastKnownMonths != null && currentMaxMonth > state.lastKnownMonths) {
+      const delta = currentMaxMonth - state.lastKnownMonths;
+      if (delta === 1) {
+        showToast(
+          `Quota refreshed: plan extended by 1 month (now ${currentMaxMonth}). Adobe's org-wide quota changed since last submit.`,
+          { kind: 'warn', durationMs: 9000 }
+        );
+      } else {
+        await showModal({
+          title: `Plan extended by ${delta} months`,
+          bodyHtml: `<p>Live Adobe quota refresh shifted the timeline from <b>${state.lastKnownMonths}</b> to <b>${currentMaxMonth}</b> months.</p>
+                     <p class="modal-warn">This usually happens when another deletion against the same org-wide pool has consumed significant monthly quota since you last planned. Already-shipped work orders are unaffected.</p>`,
+          actions: [{ label: 'Acknowledge', kind: 'primary', value: true }],
+        });
+      }
+    }
+    state.lastKnownMonths = currentMaxMonth;
+
     render(wos);
     if (detail.quota) {
       const q = detail.quota;
@@ -1163,14 +1252,35 @@ async function renderSubmit() {
 
   $('#btn-submit-day').addEventListener('click', async () => {
     const today = state.workOrders.filter(w => w.day_index === state.currentDay);
-    if (today.every(w => w.status !== 'planned')) {
+    if (today.every(w => !['planned', 'deferred'].includes(w.status))) {
       if (state.currentDay < totalDays) state.currentDay++;
       await refresh();
       return;
     }
-    logActivity('info', `Starting submission for Day ${state.currentDay}…`);
+
+    // Phase 2: pre-submit confirmation modal with current org quota.
+    // The submit endpoint will also re-fetch quota on the server before
+    // shipping, so the modal numbers + the server's decision use the same
+    // source of truth.
+    const wosToSubmit = today.filter(w => ['planned', 'deferred'].includes(w.status));
+    const monthLabel = `Month ${wosToSubmit[0]?.month_index ?? 1}`;
+    const dayLabel   = `Day ${state.currentDay}`;
+    const ok = await showSubmitModal({
+      wosToSubmit,
+      monthLabel, dayLabel,
+      quota: state.orgQuota,   // last known; server will refresh independently
+    });
+    if (!ok) {
+      logActivity('info', `Submission for ${dayLabel} cancelled`);
+      return;
+    }
+
+    logActivity('info', `Starting submission for ${dayLabel} of ${monthLabel}…`);
     try {
-      await http('POST', `/jobs/${state.job.id}/submit`, { dayIndex: state.currentDay });
+      await http('POST', `/jobs/${state.job.id}/submit`, {
+        dayIndex:   state.currentDay,
+        monthIndex: wosToSubmit[0]?.month_index ?? null,
+      });
       logActivity('info', 'Submission started server-side');
     } catch (err) {
       logActivity('error', 'Submission request failed: ' + err.message);
@@ -1813,6 +1923,173 @@ async function bootstrap() {
   if (savedCred) {
     try { await testConnection(); } catch { /* silent; user can retry manually */ }
   }
+}
+
+// ─── Modal + toast (Phase 2) ───────────────────────────────────────────
+// Single shared modal: showModal({title, body, actions}) → Promise<value>
+// where `value` is the `value` field of the action button the user clicked
+// (or null if dismissed via close-X / Escape / backdrop). Modals never
+// interrupt the underlying state — only one modal can be open at a time.
+let modalResolver = null;
+function showModal({ title, bodyHtml, actions }) {
+  return new Promise(resolve => {
+    if (modalResolver) {
+      // Resolve the previous modal with null before opening a new one.
+      modalResolver(null);
+    }
+    modalResolver = (v) => { closeModal(); resolve(v); };
+
+    $('#modal-title').textContent = title;
+    $('#modal-body').innerHTML = bodyHtml;
+    const actionsRoot = $('#modal-actions');
+    actionsRoot.innerHTML = '';
+    actions.forEach(a => {
+      const b = document.createElement('button');
+      b.className = `btn ${a.kind === 'primary' ? 'btn-primary' : a.kind === 'danger' ? 'btn-danger' : 'btn-secondary'}`;
+      b.textContent = a.label;
+      b.type = 'button';
+      b.addEventListener('click', () => modalResolver?.(a.value ?? a.label));
+      actionsRoot.appendChild(b);
+    });
+    const root = $('#modal-root');
+    root.hidden = false;
+    // Focus the primary action so Enter confirms by default.
+    setTimeout(() => {
+      const primary = actionsRoot.querySelector('.btn-primary, .btn-danger') || actionsRoot.querySelector('button');
+      if (primary) primary.focus();
+    }, 50);
+  });
+}
+
+function closeModal() {
+  const root = $('#modal-root');
+  root.hidden = true;
+  modalResolver = null;
+}
+
+// Wire close button + backdrop click + Escape key once (modal is single-instance).
+$('#modal-close').addEventListener('click', () => modalResolver?.(null));
+$('#modal-root .modal-backdrop').addEventListener('click', () => modalResolver?.(null));
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && !$('#modal-root').hidden) modalResolver?.(null);
+});
+
+// Lightweight toast. Stacks in #toast-container, auto-dismisses after ms.
+// Kinds: info | warn | error | success. For Phase 2 we use 'warn' for
+// the "plan extended by 1 month" notification.
+function showToast(message, { kind = 'info', durationMs = 6000 } = {}) {
+  const root = $('#toast-container');
+  if (!root) return;
+  const el = document.createElement('div');
+  el.className = `toast toast-${kind}`;
+  el.innerHTML = `<span>${escape(message)}</span>
+                  <button class="toast-close" aria-label="Dismiss">×</button>`;
+  root.appendChild(el);
+  // Animate in
+  requestAnimationFrame(() => el.classList.add('toast-in'));
+  const close = () => {
+    el.classList.remove('toast-in');
+    setTimeout(() => el.remove(), 200);
+  };
+  el.querySelector('.toast-close').addEventListener('click', close);
+  if (durationMs > 0) setTimeout(close, durationMs);
+}
+
+// Pre-plan confirmation modal. Surfaces the multi-month projection and the
+// fact that monthly quota only resets at UTC midnight on the 1st. Returns
+// true if the operator clicked Continue, false otherwise. Per the
+// 2026-05-15 design (RQ-5): shown when months > 1 OR when re-planning
+// extended the timeline. RQ-2 — toast for ≤1mo shift, modal for ≥2mo
+// shift — applies on the re-plan path here.
+async function showPlanModal(plan) {
+  const isShift = !!plan.shiftedFromPrevious;
+  const prev = plan.previousMonths ?? 1;
+  const delta = plan.months - prev;
+  const totalIds = (plan.totalIdentifiers || 0).toLocaleString();
+  const perMonth = plan.perMonthCounts || [];
+
+  // RQ-2 routing: small shift (1mo extension) → toast, not modal.
+  if (isShift && delta === 1) {
+    showToast(`Plan extended by 1 month (now ${plan.months}). Adobe quota changed since the previous plan.`, { kind: 'warn', durationMs: 8000 });
+    return true;
+  }
+
+  const title = isShift && delta >= 2
+    ? `Plan extended by ${delta} months — confirm`
+    : 'Multi-month plan — confirm';
+
+  const bodyHtml = `
+    <p>This deletion will span <b>${plan.months} month${plan.months === 1 ? '' : 's'}</b>
+       because the total identifier count (<b>${totalIds}</b>) exceeds your monthly Adobe entitlement.</p>
+    ${isShift ? `<p class="modal-warn">
+        Re-planning against fresh Adobe quota shifted the timeline from
+        <b>${prev}</b> to <b>${plan.months}</b> months. The most likely cause is another
+        deletion against the same org-wide pool.</p>` : ''}
+    <p><b>Per-month breakdown:</b></p>
+    <ul class="modal-list">
+      ${perMonth.map((c, i) => `<li>Month ${i + 1}: ${c.toLocaleString()} identifiers</li>`).join('')}
+    </ul>
+    <p class="modal-note">
+      Each month's batch can only ship after the org-wide monthly quota resets
+      at <b>00:00 GMT on the 1st</b>. Phase 3 (auto-resume) is not yet
+      available — for now you'll click Submit at the start of each month.
+    </p>`;
+
+  const choice = await showModal({
+    title,
+    bodyHtml,
+    actions: [
+      { label: 'Cancel',             kind: 'secondary', value: false },
+      { label: 'Confirm plan',       kind: 'primary',   value: true  },
+    ],
+  });
+  return !!choice;
+}
+
+// Pre-submit consumption check. Always shown — the operator confirms each
+// destructive submission with the current quota numbers + planned count.
+// Returns true if the operator clicks "Submit", false otherwise.
+async function showSubmitModal({ wosToSubmit, monthLabel, dayLabel, quota }) {
+  const ids = wosToSubmit.reduce((s, w) => s + w.identifier_count, 0);
+  const dRem = quota?.daily?.remaining;
+  const mRem = quota?.monthly?.remaining;
+  const dCap = quota?.daily?.quota;
+  const mCap = quota?.monthly?.quota;
+
+  const overDaily   = dRem != null && ids > dRem;
+  const overMonthly = mRem != null && ids > mRem;
+  const willPartial = overDaily || overMonthly;
+
+  const fmt = (n) => n == null ? '—' : Number(n).toLocaleString();
+
+  const bodyHtml = `
+    <p>About to submit <b>${wosToSubmit.length} work order${wosToSubmit.length === 1 ? '' : 's'}</b>
+       (<b>${ids.toLocaleString()} identifiers</b>) for <b>${escape(monthLabel)}</b> · <b>${escape(dayLabel)}</b>.</p>
+
+    <div class="modal-quota">
+      <div>
+        <div class="modal-quota-label">Daily</div>
+        <div class="modal-quota-value"><b>${fmt(dRem)}</b> / ${fmt(dCap)} remaining</div>
+        ${overDaily ? '<div class="modal-warn-inline">⚠ Submission exceeds today\'s daily remaining — excess will be deferred.</div>' : ''}
+      </div>
+      <div>
+        <div class="modal-quota-label">Monthly</div>
+        <div class="modal-quota-value"><b>${fmt(mRem)}</b> / ${fmt(mCap)} remaining</div>
+        ${overMonthly ? '<div class="modal-warn-inline">⚠ Submission exceeds this month\'s monthly remaining — excess will be deferred until next month.</div>' : ''}
+      </div>
+    </div>
+    ${quota?.stale ? `<p class="modal-warn">⚠ Quota numbers are <b>stale</b> (live Adobe fetch failed). Last refreshed at ${escape(quota.fetchedAt || '—')}.</p>` : ''}
+    <p class="modal-note">Adobe Data Hygiene work orders are <b>irreversible</b>. Once Adobe accepts a work order, the identities listed are queued for deletion across Data Management, Identity, Profile, and Journey services.</p>`;
+
+  const choice = await showModal({
+    title: willPartial ? 'Submit (some work will defer) — confirm' : 'Submit — confirm',
+    bodyHtml,
+    actions: [
+      { label: 'Cancel', kind: 'secondary', value: false },
+      { label: 'Submit', kind: 'danger',    value: true  },
+    ],
+  });
+  return !!choice;
 }
 
 bootstrap();

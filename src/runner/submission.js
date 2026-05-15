@@ -2,6 +2,8 @@ import pLimit from 'p-limit';
 import { v4 as uuid } from 'uuid';
 import { submitWorkOrder } from '../services/hygiene.js';
 import { reserve, release } from '../services/quotaManager.js';
+import { getOrgQuota } from '../services/quotaApi.js';
+import { redistributeUnshippedOrders } from './redistributor.js';
 import { q } from '../db.js';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
@@ -48,7 +50,7 @@ export class ReplanForbiddenError extends Error {
   constructor(message) { super(message); this.name = 'ReplanForbiddenError'; this.status = 409; }
 }
 
-export function planWorkOrders({ jobId, datasetIds, dailyLimit, targetServices }) {
+export function planWorkOrders({ jobId, datasetIds, dailyLimit, targetServices, quota = null }) {
   // SAFETY: refuse to re-plan if any non-planned/non-deferred work orders exist
   // for this job. Otherwise re-running planning would re-emit work orders for
   // identities that were ALREADY submitted to Adobe, causing duplicate
@@ -158,8 +160,31 @@ export function planWorkOrders({ jobId, datasetIds, dailyLimit, targetServices }
   q().setPlannedOrders.run(planned, jobId);
   q().updateJobStatus.run('ready', null, jobId);
 
-  logger.info({ jobId, planned, days: dayIndex }, 'planning complete');
-  return { planned, days: dayIndex };
+  // Phase 2: assign month_index + correct day_index using LIVE Adobe quota
+  // (or the job's static caps if no quota was passed in / Adobe was
+  // unreachable when the route handler called us). The bucket-based
+  // dailyIndex computed above is a rough sketch — redistribute is the
+  // authoritative numbering and the one the Plan UI reads.
+  const previousMonths = q().getJob.get(jobId)?.projected_months ?? null;
+  const distribution = redistributeUnshippedOrders(jobId, quota);
+  const shifted = previousMonths != null && distribution.months > previousMonths;
+
+  logger.info({
+    jobId, planned,
+    initialDays: dayIndex,
+    finalMonths: distribution.months,
+    finalDaysInLastMonth: distribution.days,
+  }, 'planning complete');
+
+  return {
+    planned,
+    days: distribution.days,                          // days within the last month
+    months: distribution.months,                      // total months
+    perMonthCounts: distribution.perMonthCounts,      // identifiers per month
+    totalIdentifiers: distribution.totalIdentifiers,
+    shiftedFromPrevious: shifted,
+    previousMonths,
+  };
 }
 
 function makeEmptyOrder() { return { byNs: new Map(), total: 0 }; }
@@ -184,8 +209,20 @@ function addToOrder(order, row) {
  *
  * Quota is reserved atomically per-order in SQLite. If quota is exhausted,
  * the order is marked 'deferred' and left untouched - rerun after UTC midnight.
+ *
+ * Phase 2 changes:
+ *   - Re-fetch Adobe /quota before picking work, and re-bucket un-shipped
+ *     WOs against the live numbers. This is the "if someone else's app
+ *     consumed quota since we planned, push our work to a later window"
+ *     behavior the client asked for.
+ *   - Accept `monthIndex` alongside `dayIndex`. When both are passed, only
+ *     WOs in that exact bucket are submitted. The default (neither) means
+ *     "ship the next-available bucket" — Day 1 of the lowest month with
+ *     un-shipped WOs.
+ *   - Returns extra metadata about the redistribution so callers can
+ *     surface "your plan shifted from N to M months" notifications.
  */
-export async function runSubmission({ jobId, dayIndex }) {
+export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
   if (inFlight.has(jobId)) {
     logger.warn({ jobId }, 'submission already in progress, skipping duplicate call');
     return { submitted: 0, deferred: 0, failed: 0 };
@@ -198,14 +235,44 @@ export async function runSubmission({ jobId, dayIndex }) {
     const creds = await decryptCreds(job.creds_id);
     const limit = pLimit(config.workOrderConcurrency);
 
+    // ─── Live quota refresh + re-bucket ───────────────────────────────
+    // Always pull fresh /quota before submitting. If the live call fails
+    // and we have no cache, getOrgQuota throws `quota_unavailable` — we
+    // bubble that up so the caller can block the submission. If a recent
+    // cache exists (<24h) we proceed with `stale: true` data; the operator
+    // saw the stale warning in the UI.
+    const previousMonths = job.projected_months ?? null;
+    let quotaSnapshot = null;
+    try {
+      quotaSnapshot = await getOrgQuota(creds, { refresh: true });
+    } catch (err) {
+      if (err.code === 'quota_unavailable') {
+        const e = new Error('Cannot submit: Adobe /quota is unreachable and no recent cache exists.');
+        e.code = 'quota_unavailable';
+        throw e;
+      }
+      throw err;
+    }
+    const distribution = redistributeUnshippedOrders(jobId, quotaSnapshot);
+    const shifted = previousMonths != null && distribution.months > previousMonths;
+
     q().updateJobStatus.run('submitting', null, jobId);
 
     // Include 'deferred' rows alongside 'planned' — deferred orders were
     // denied quota on a previous run and never went to Adobe. After UTC
     // rollover (daily) or month rollover (monthly), they're safe to retry.
-    const orders = dayIndex
-      ? q().getOrdersByDay.all(jobId, dayIndex).filter(o => ['planned', 'deferred'].includes(o.status))
-      : q().getPlannedOrders.all(jobId);
+    //
+    // Bucket selection: a (month, day) pair, or just day for backward
+    // compat with callers that don't know about monthIndex yet (legacy
+    // jobs default to month_index 1).
+    const useMonth = Number(monthIndex) || null;
+    const useDay   = Number(dayIndex)   || null;
+    const orders = (useMonth && useDay)
+      ? q().getOrdersByMonthAndDay.all(jobId, useMonth, useDay)
+          .filter(o => ['planned', 'deferred'].includes(o.status))
+      : useDay
+        ? q().getOrdersByDay.all(jobId, useDay).filter(o => ['planned', 'deferred'].includes(o.status))
+        : q().getPlannedOrders.all(jobId);
 
     let submitted = 0, deferred = 0, failed = 0;
 
@@ -259,7 +326,21 @@ export async function runSubmission({ jobId, dayIndex }) {
 
     const status = failed > 0 ? 'partial' : (deferred > 0 ? 'submitting' : 'submitted');
     q().updateJobStatus.run(status, null, jobId);
-    return { submitted, deferred, failed };
+    return {
+      submitted, deferred, failed,
+      // Phase 2 metadata: the UI surfaces a toast when months shifted from
+      // the previously-projected value, and renders the live quota that
+      // gated this submission.
+      months: distribution.months,
+      previousMonths,
+      shiftedFromPrevious: shifted,
+      quotaSnapshot: quotaSnapshot ? {
+        daily:   quotaSnapshot.daily,
+        monthly: quotaSnapshot.monthly,
+        stale:   quotaSnapshot.stale,
+        fetchedAt: quotaSnapshot.fetchedAt,
+      } : null,
+    };
   } finally {
     inFlight.delete(jobId);
   }

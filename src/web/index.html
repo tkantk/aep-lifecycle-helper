@@ -410,6 +410,24 @@
     </div>
   </template>
 
+  <!-- ─── Modal + toast infrastructure (Phase 2) ───────────────────────
+       A single reusable modal element used for the pre-plan timeline
+       confirmation and the pre-submit consumption check. The body is
+       populated via app.js's showModal() helper; only one modal is open
+       at a time. Toasts stack in #toast-container at the top right. -->
+  <div id="modal-root" class="modal-root" hidden>
+    <div class="modal-backdrop"></div>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <div class="modal-head">
+        <div class="modal-title" id="modal-title"></div>
+        <button class="modal-close" type="button" id="modal-close" aria-label="Close">×</button>
+      </div>
+      <div class="modal-body" id="modal-body"></div>
+      <div class="modal-actions" id="modal-actions"></div>
+    </div>
+  </div>
+  <div id="toast-container" class="toast-container"></div>
+
   <script src="/app.js"></script>
 </body>
 </html>

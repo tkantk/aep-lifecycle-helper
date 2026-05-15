@@ -285,7 +285,7 @@ from `creds.region` — not `config.aep.identityRegion`. The global config
 is only the fallback when a credential row was inserted before the
 region column existed. Tests in `test/region.test.js` lock this in.
 
-### I10. Re-planning is forbidden once any work order has shipped
+### I10. Identity content of a shipped work order is immutable; day/month labels are not
 
 `runner/submission.js::planWorkOrders` reads from `expanded_identities`
 and emits work orders for every identity in the table — it has no notion
@@ -294,16 +294,26 @@ call after submission would re-emit work orders for identities Adobe
 already received, and the next Submit would create **duplicate
 irreversible deletes**.
 
-The planner now refuses by throwing `ReplanForbiddenError` (HTTP 409)
+The planner refuses by throwing `ReplanForbiddenError` (HTTP 409)
 when any work order on the job is in a state other than `planned` or
 `deferred`. Deferred is fine — those rows never went to Adobe. The UI
 in `web/app.js` mirrors the guard: the Plan tab no longer auto-POSTs
 `/plan` on tab entry, and the "↻ Re-plan" button auto-disables once any
 order has shipped, with a tooltip explaining why.
 
+**Phase 2 refinement (2026-05-15):** `runner/redistributor.js::redistributeUnshippedOrders`
+is allowed to update `(day_index, month_index)` on un-shipped (planned /
+deferred) work orders to match the live Adobe `/quota`. This is *not*
+re-planning — the `namespaces_identities` JSON (the actual identity
+content) of any existing WO never changes. Only the bucket labels do.
+Shipped WOs are read-only. The redistributor runs:
+- at the end of `planWorkOrders` (so plan time uses live quota),
+- at the top of every `runSubmission` call (so each submit uses fresh quota),
+- and, in Phase 3, on the configurable auto-resume scheduler tick.
+
 If you add new flow that mutates work-order state, ensure the planner's
 guard sees it. If you add new statuses, decide whether they should be
-on the "safe to re-plan" list (currently only `planned`/`deferred`).
+on the "safe to re-plan / re-bucket" list (currently `planned` and `deferred`).
 
 ### I11. Adobe POST retries are gated by a per-request idempotency flag
 

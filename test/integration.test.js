@@ -33,7 +33,7 @@ const REGION  = 'https://platform-va7.adobe.io';
 
 before(() => { initDb(); });
 
-afterEach(() => { nock.cleanAll(); });
+afterEach(() => { nock.cleanAll(); clearQuotaCache(); });
 
 after(() => {
   for (const ext of ['', '-wal', '-shm']) {
@@ -80,6 +80,22 @@ function mockNamespacesEndpoint() {
     { id: 11124296, code: 'hashedKocid', name: 'Hashed KOCID', custom: true, status: 'ACTIVE' },
   ]);
 }
+
+// Phase 2: runSubmission now refreshes Adobe /quota before each run. Mock
+// it with a generous default so submission flows that don't care about
+// quota specifics aren't blocked by the live-fetch requirement.
+function mockOrgQuota({ dailyRemaining = 1_000_000, monthlyRemaining = 3_000_000 } = {}) {
+  nock(GATEWAY).persist().get('/data/core/hygiene/quota').reply(200, {
+    quotas: [
+      { name: 'dailyConsumerDeleteIdentitiesQuota',   consumed: 1_000_000 - dailyRemaining,   quota: 1_000_000 },
+      { name: 'monthlyConsumerDeleteIdentitiesQuota', consumed: 3_000_000 - monthlyRemaining, quota: 3_000_000 },
+    ],
+  });
+}
+
+// quotaApi caches results in-memory per imsOrgId. After each test we
+// clear the cache so the next test's mock is consulted fresh.
+const { _clearCache: clearQuotaCache } = await import('../src/services/quotaApi.js');
 
 function mockClustersResponse() {
   // Observed AEP v1.1.0 shape: {version, clusters:[{compositeXid, members:[]}]}
@@ -161,6 +177,7 @@ test('integration: plan → submit wires correct payload to Adobe', async () => 
   mockIms();
   mockNamespacesEndpoint();
   mockClustersResponse();
+  mockOrgQuota();
 
   await runExpansion({
     jobId,

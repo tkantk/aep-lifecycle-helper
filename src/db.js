@@ -163,6 +163,16 @@ export function initDb() {
     { table: 'jobs', column: 'monthly_limit', type: 'INTEGER' },
     { table: 'jobs', column: 'last_checkpoint_at', type: 'TEXT' },
     { table: 'credentials', column: 'client_name', type: 'TEXT' },
+    // Phase 2 (2026-05-15) — month-aware planner / re-bucketer.
+    // work_orders.month_index: which 1-indexed quota month a planned/deferred
+    //   WO falls into. Shipped WOs keep their historical value. Computed by
+    //   `redistributeUnshippedOrders` against live Adobe /quota numbers and
+    //   updated on every plan + submit run.
+    // jobs.projected_months: last redistribute's max month_index for this job —
+    //   used to detect "plan extended" shifts so the UI can show a toast
+    //   (≤1mo) or a modal (≥2mo). Nullable until the first redistribute runs.
+    { table: 'work_orders', column: 'month_index', type: 'INTEGER' },
+    { table: 'jobs',        column: 'projected_months', type: 'INTEGER' },
   ];
   for (const { table, column, type } of additiveColumns) {
     try {
@@ -370,14 +380,35 @@ function prepared() {
     // actually picks up quota-deferred work — without this, deferred rows
     // were stranded and the job appeared "complete".
     getPlannedOrders: db.prepare(`
-      SELECT * FROM work_orders WHERE job_id = ? AND status IN ('planned','deferred') ORDER BY day_index, rowid
+      SELECT * FROM work_orders WHERE job_id = ? AND status IN ('planned','deferred') ORDER BY month_index NULLS FIRST, day_index, rowid
     `),
     getOrdersByDay: db.prepare(`
       SELECT * FROM work_orders WHERE job_id = ? AND day_index = ? ORDER BY rowid
     `),
-    getAllOrdersForJob: db.prepare(`
-      SELECT * FROM work_orders WHERE job_id = ? ORDER BY day_index, rowid
+    // Phase 2: same as getOrdersByDay but month-scoped. Both month_index and
+    // day_index can be NULL on legacy rows; treat NULL as Month 1 / Day 1.
+    getOrdersByMonthAndDay: db.prepare(`
+      SELECT * FROM work_orders
+       WHERE job_id = ?
+         AND COALESCE(month_index, 1) = ?
+         AND COALESCE(day_index, 1)   = ?
+       ORDER BY rowid
     `),
+    getAllOrdersForJob: db.prepare(`
+      SELECT * FROM work_orders WHERE job_id = ? ORDER BY COALESCE(month_index, 1), day_index, rowid
+    `),
+    // Unshipped (planned + deferred) WOs in deterministic creation order.
+    // The redistributor consumes this and updates each row's month/day index.
+    getUnshippedOrdersForJob: db.prepare(`
+      SELECT id, identifier_count, day_index, month_index, status
+        FROM work_orders
+       WHERE job_id = ? AND status IN ('planned','deferred')
+       ORDER BY rowid
+    `),
+    setOrderMonthDay: db.prepare(`
+      UPDATE work_orders SET month_index = ?, day_index = ?, updated_at = datetime('now') WHERE id = ?
+    `),
+    setProjectedMonths: db.prepare(`UPDATE jobs SET projected_months = ?, updated_at = datetime('now') WHERE id = ?`),
     updateWorkOrderStatus: db.prepare(`
       UPDATE work_orders SET status = ?, last_error = ?, updated_at = datetime('now') WHERE id = ?
     `),
