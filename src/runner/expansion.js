@@ -86,8 +86,12 @@ export async function runExpansion({
   const limit = pLimit(config.identityConcurrency);
   let buffer = [];
   const tasks = [];
+  // Abort flag: once any batch throws, in-queue batches skip their DB writes
+  // so the progress counters don't keep incrementing after the job is failed.
+  let aborted = false;
 
   const submitBatch = (batch) => limit(async () => {
+    if (aborted) return;
     try {
       const results = await expandBatch({
         creds, sandboxName,
@@ -126,6 +130,7 @@ export async function runExpansion({
       progress.processed += batch.length;
       progress.found += inserted;
     } catch (err) {
+      aborted = true;
       logger.error({ jobId, batchSize: batch.length, err: err.message }, 'expansion batch failed');
       throw err;
     }
