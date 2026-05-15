@@ -38,22 +38,39 @@ wrong data. A correctness bug costs the client real customer records.
 
 **Runtime**: one Node.js process on the operator's laptop, port 3000.
 **Binds to `127.0.0.1` (loopback) by default** — set `HOST=0.0.0.0`
-explicitly to expose it. No auth on the local UI (trusted single-user).
-Earlier versions of this doc claimed localhost binding without actually
-enforcing it; `app.listen(port, host, cb)` now passes the host explicitly.
+explicitly to expose it. No human auth on the local UI; security
+relies on three middleware guards (`hostHeaderGuard`,
+`originRefererGuard`, helmet/CSP) in `src/middleware/security.js`
+plus UUID validation on every `:id` / `:credsId` path param.
+`app.listen(port, host, cb)` passes the host explicitly.
 
 **Persistence**: one SQLite file (`data/state.db`) in WAL mode.
-`better-sqlite3` synchronous driver.
+`better-sqlite3` synchronous driver. Eight tables: `credentials`,
+`sandbox_configs`, `jobs`, `expanded_identities`, `work_orders`,
+`quota_usage`, `quota_usage_monthly`, `app_settings`.
 
 **Concurrency**: all work happens in the event loop. Identity-graph
 expansion uses `p-limit(10)` for 10 parallel Adobe calls; work-order
-submission uses `p-limit(2)`. No worker threads, no child processes.
+submission uses `p-limit(2)`. Two `setInterval(60s)` background tickers
+— the monitor (status polling) and the scheduler (auto-resume,
+Phase 3). No worker threads, no child processes.
 
-**Dependencies**: `express`, `better-sqlite3`, `axios`, `axios-retry`,
-`multer`, `fast-csv`, `p-limit`, `uuid`, `dotenv`, `open`. Dev: `nock`.
+**Quota model**: Adobe `GET /data/core/hygiene/quota` is the source of
+truth at runtime. Cached 1h in-memory per `imsOrgId`; refreshed before
+every plan + submit + scheduler tick. 24h hard floor — if Adobe is
+unreachable AND no cache exists, the tool refuses to plan/submit
+(`quota_unavailable` 503) rather than ship blind. The local SQLite
+ledger (`quota_usage` + `quota_usage_monthly`) is a per-WO atomicity
+safety net inside `reserve()` / `release()` only.
+
+**Dependencies**: `express`, `helmet`, `better-sqlite3`, `axios`,
+`axios-retry`, `multer` (v2), `fast-csv`, `p-limit`, `uuid`, `dotenv`,
+`open`. Dev: `nock`.
 
 **Frontend**: zero-build vanilla HTML/CSS/JS served from `src/web/` by
-Express. Adobe Spectrum-styled. Talks to the backend via `fetch('/api/…')`.
+Express. Adobe Spectrum-styled. Modal + toast scaffolding for pre-plan
+and pre-submit confirmations. Talks to the backend via `fetch('/api/…')`
+with auto-populated forms and live quota banners.
 
 ---
 
@@ -61,45 +78,83 @@ Express. Adobe Spectrum-styled. Talks to the backend via `fetch('/api/…')`.
 
 ```
 ┌──────────────┐
-│ 1. Config    │  User picks stored creds or enters fresh.
-│              │  Test Connection → IMS token obtained, sandboxes loaded
-│              │  from Adobe. User picks sandbox → datasets loaded,
-│              │  filtered to Identity-enabled. User picks deletion mode:
-│              │     datasets | all | profile-only
+│ 0. Middleware│  Every request first passes through:
+│              │   • hostHeaderGuard — only localhost/127.0.0.1/[::1] accepted
+│              │   • originRefererGuard — POST/PUT/PATCH/DELETE Origin must
+│              │     match Host (defeats simple-form CSRF)
+│              │   • helmet (CSP: script-src 'self'; frame-ancestors 'none')
+│              │   • registerUuidParamGuards on :id / :credsId
+│              │   • centralised error handler (no raw err.message on 5xx)
 └──────┬───────┘
        ▼
 ┌──────────────┐
-│ 2. Upload    │  CSV streamed to disk (never loaded in memory).
-│              │  Row-count pass (streaming) populates progress denominator.
-│              │  Job row inserted into jobs table, status='expanding'.
-│              │  runExpansion() fired and forgotten (in-process async).
+│ 1. Config    │  User picks stored creds or enters fresh. Region +
+│              │  environment validated server-side against allowlists.
+│              │  Test Connection → IMS token obtained, sandboxes loaded,
+│              │  /data/core/hygiene/quota fetched (org-wide, no x-sandbox).
+│              │  Quota banner: Daily X/Y · Monthly A/B · auto-populated
+│              │  cap inputs. User picks sandbox → datasets loaded
+│              │  filtered to Identity-enabled + namespaces loaded.
+│              │  User picks deletion mode: datasets | all | profile-only.
+└──────┬───────┘
+       ▼
+┌──────────────┐
+│ 2. Upload    │  multer 2.x with bounded limits (fileSize 4 GiB; files: 1;
+│              │  fields: 20; parts: 25; headerPairs: 100). CSV streamed
+│              │  to disk (never loaded in memory). Random filename with
+│              │  sanity-checked extension. Row-count pass (streaming)
+│              │  populates progress denominator. Job row inserted, status
+│              │  ='expanding'. runExpansion() fired and forgotten.
 └──────┬───────┘
        ▼
 ┌──────────────┐  Load namespace registry once → build byCode/byId index.
 │ 3. Expansion │  For each 1000-ID buffer:
 │ (p-limit 10) │    POST /data/core/identity/clusters/members
+│              │    (region from creds, NOT process default; allowlist
+│              │     defence-in-depth in services/namespaces.js +
+│              │     services/identityGraph.js).
 │              │    Canonicalize every returned identity to {code, id}
 │              │    INSERT OR IGNORE into expanded_identities
-│              │    (dedup key: job_id, ns_code||'', ns_id||0, identity_id)
+│              │    (dedup key: job_id, ns_code||'', ns_id||0, identity_id).
 │              │  Progress updated in memory + DB.
 └──────┬───────┘
        ▼
-┌──────────────┐  Iterate expanded_identities ORDER BY source_id, ns_code.
-│ 4. Plan      │  Build cluster bundles (all rows with same source_id).
-│              │  Pack bundles into ≤100k-ID work orders.
-│              │  Assign day_index respecting dailyLimit.
-│              │  Insert one row per work order (status='planned').
+┌──────────────┐  POST /api/jobs/:id/plan refreshes /quota first.
+│ 4. Plan      │  Iterate expanded_identities ORDER BY source_id, ns_code.
+│              │  Build cluster bundles, pack into ≤100k-ID work orders,
+│              │  assign initial day_index. Then redistributor walks
+│              │  un-shipped WOs in rowid order and assigns authoritative
+│              │  (month_index, day_index) from live daily.remaining +
+│              │  monthly.remaining + future-period fresh caps.
+│              │  Returns { planned, months, days, perMonthCounts,
+│              │  shiftedFromPrevious, previousMonths }.
+│              │  UI: Plan tab groups by Month → Day with per-month
+│              │  totals. Pre-plan modal confirms before locking in
+│              │  if months > 1 OR timeline shifted. (RQ-2 routing:
+│              │  1-mo shift = toast; ≥2-mo shift = modal.)
 └──────┬───────┘
        ▼
-┌──────────────┐  For each planned OR deferred order on the selected day:
-│ 5. Submit    │    Reserve quota (daily + monthly) in SQLite (atomic UPSERT).
-│ (p-limit 2)  │    If not granted → mark 'deferred', skip. The next submit
-│              │    after UTC daily/monthly rollover picks these up again
-│              │    (selector matches both 'planned' and 'deferred').
-│              │    If granted → POST /data/core/hygiene/workorder.
-│              │    POST is non-idempotent: NO retry on 5xx/network.
-│              │    On success: persist adobe_workorder_id.
-│              │    On failure: release(count, monthlyLimit), mark 'failed'.
+┌──────────────┐  Pre-submit modal (always shown — destructive) with live
+│ 5. Submit    │  remaining + planned consumption. Operator confirms.
+│              │  Then backend (POST /api/jobs/:id/submit):
+│              │   a. runSubmission refreshes /quota with refresh: true.
+│              │      Hard failure (no recent cache) → quota_unavailable
+│              │      error; UI surfaces it on next poll.
+│              │   b. Redistributor re-buckets un-shipped WOs against the
+│              │      fresh numbers (work may shift to a later month).
+│              │   c. For each planned OR deferred order in target
+│              │      (month, day) bucket (p-limit 2):
+│              │       - reserve(imsOrgId, count, dailyLimit, monthlyLimit)
+│              │         — atomic SQLite UPSERT, both dimensions.
+│              │       - If not granted → mark 'deferred', skip.
+│              │       - If granted → POST /data/core/hygiene/workorder.
+│              │         POST is non-idempotent: NO retry on 5xx/network.
+│              │         Log if Adobe operationCount diverges from total.
+│              │       - On success: persist adobe_workorder_id.
+│              │       - On failure: release(count, monthlyLimit), mark
+│              │         'failed'.
+│              │  CSP guard against re-emitting identity content:
+│              │  ReplanForbiddenError (409) if any WO has shipped.
 └──────┬───────┘
        ▼
 ┌──────────────┐  setInterval(60s). Finds work orders where
@@ -108,11 +163,31 @@ Express. Adobe Spectrum-styled. Talks to the backend via `fetch('/api/…')`.
 │              │  GET /data/core/hygiene/workorder/{id}
 │              │  Update adobe_status, product_status_details.
 │              │  Up to 30 polls per tick (rate limiting).
+│              │  UI: per-work-order rich cards (Adobe ID, dates,
+│              │  identifier count, status pill, "Status by service"
+│              │  breakdown matching AEP's own detail screen).
+└──────┬───────┘
+       ▼
+┌──────────────┐  Phase 3 auto-resume (OPT-IN, default disabled).
+│ 7. Scheduler │  setInterval(60s). On each tick, shouldFireNow() checks:
+│              │    enabled === true
+│              │    + today passes days filter (every/weekdays/1st)
+│              │    + now >= today's HH:MM local
+│              │    + lastRunAt < today's HH:MM
+│              │  If all pass: walks every job with un-shipped WOs and
+│              │  calls runSubmission(jobId). Each runSubmission internally
+│              │  re-fetches /quota and re-buckets, so a quota change
+│              │  between ticks (e.g. month rollover) is picked up.
+│              │  Catch-up tick at startup handles "laptop was off at
+│              │  scheduled time."
 └──────────────┘
 ```
 
 Each step's state persists to SQLite, so the process can be killed and
-restarted without losing progress.
+restarted without losing progress. Startup recovery handles two cases:
+`expanding` jobs (resume via skip-set) and `submitting` WOs without an
+Adobe ID (reconcile via Adobe's list endpoint, never roll back on
+indeterminate response).
 
 ---
 
@@ -407,28 +482,50 @@ Terminal states: `completed`, `failed`. Monitor stops polling those.
 
 ## 4. Our API endpoints
 
-All under `/api/` on `http://127.0.0.1:3000`. No auth — security model
-relies on the loopback-only socket (CLAUDE.md I12).
+All under `/api/` on `http://127.0.0.1:3000`. Three guards run on every
+request (CLAUDE.md I13): hostHeaderGuard (only localhost/127.0.0.1/[::1]
+accepted), originRefererGuard (state-changing methods require matching
+Origin or Referer), and registerUuidParamGuards on `:id` / `:credsId`.
+
+### Config
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| POST | `/api/config/credentials` | Store or upsert creds (encrypts secret at rest, keyed on (env, ims_org, client_id)) |
+| POST | `/api/config/credentials` | Store or upsert creds. Validates region (allowlist), environment (allowlist), length limits per field, CRLF rejection. Encrypts secret at rest. Keyed on (env, ims_org, client_id) |
 | GET  | `/api/config/credentials` | List stored creds (no secrets in response) |
-| PATCH | `/api/config/credentials/:id` | Update label / client_name / region only — never touches the encrypted secret or identity fields. Returns 404 if id not found, 400 if label missing |
-| POST | `/api/config/credentials/test` | IMS auth check via stored id or inline creds |
+| PATCH | `/api/config/credentials/:id` | Update label / client_name / region only — never touches the encrypted secret or identity fields. Returns 404 if id not found, 400 if label missing or region invalid |
+| POST | `/api/config/credentials/test` | IMS auth check via stored id or inline creds (inline goes through the same length/CRLF validators) |
 | DELETE | `/api/config/credentials/:id` | Remove creds. Returns **409** with `{error: 'credential_in_use', jobCount}` when any row in `jobs` references this credential — protects status polling and recovery from being orphaned |
+
+### Adobe discovery + live quota
+
+| Method | Path | Purpose |
+|--------|------|---------|
 | GET  | `/api/adobe/:credsId/sandboxes` | Live list of sandboxes |
 | GET  | `/api/adobe/:credsId/sandboxes/:sandbox/datasets?refresh=1&identityOnly=1` | Datasets filtered to Identity-enabled |
 | GET  | `/api/adobe/:credsId/sandboxes/:sandbox/namespaces?refresh=1` | Namespace registry |
-| POST | `/api/upload` (multipart) | Create job + start expansion |
+| GET  | `/api/adobe/:credsId/quota?refresh=1` | Live `/data/core/hygiene/quota` snapshot. Returns `{ daily, monthly, datasetExpiration, fetchedAt, stale, error }`. 503 with code `quota_unavailable` only when no cache AND live call failed |
+
+### Jobs
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/api/upload` (multipart) | Create job + start expansion (multer 2.x with bounded limits) |
 | GET  | `/api/jobs` | List jobs by `created_at DESC` (every status, every sandbox) |
-| GET  | `/api/jobs/monitor?limit&search&sandbox` | Active-submissions feed: jobs with ≥1 Adobe-acked work order. **In-flight-first sort** (recently-completed jobs never push pending work off-screen) then by latest WO activity. Returns `{ rows, totals, sandboxes }` — rows are limit-capped; totals (`in_flight` / `has_failed` / `all_completed` / `total`) span ALL matching jobs; sandboxes is the distinct sandbox list with counts for the filter chip row. Optional `?search` (case-insensitive name LIKE) and `?sandbox` (exact match). |
-| GET  | `/api/jobs/:id` | Job detail + namespace breakdown + quota |
+| GET  | `/api/jobs/monitor?limit&search&sandbox` | Active-submissions feed: jobs with ≥1 Adobe-acked work order. In-flight-first sort, then by latest WO activity. Returns `{ rows, totals, sandboxes }` |
+| GET  | `/api/jobs/:id` | Job detail + namespace breakdown + local-ledger quota peek |
 | GET  | `/api/jobs/:id/progress` | Live expansion progress (fast path) |
-| POST | `/api/jobs/:id/plan` | Build work-order plan |
-| POST | `/api/jobs/:id/submit` | Kick off submission (optional `{dayIndex}`) |
-| GET  | `/api/jobs/:id/work-orders` | All work orders for job |
-| GET  | `/api/jobs/:id/export` | Download expanded identities CSV |
+| POST | `/api/jobs/:id/plan` | Build work-order plan. Server-side fetches `/quota` first; planner emits initial day-bucketed WOs then redistributor re-buckets into month×day. Returns `{ planned, days, months, perMonthCounts, totalIdentifiers, shiftedFromPrevious, previousMonths, quota }`. 503 with `quota_unavailable` if Adobe is unreachable + no recent cache |
+| POST | `/api/jobs/:id/submit` | Kick off submission. Body: `{ dayIndex?, monthIndex? }`. Server runs redistributor against fresh `/quota` before picking work |
+| GET  | `/api/jobs/:id/work-orders` | All work orders (month_index + day_index + per-service status from product_status_details) |
+| GET  | `/api/jobs/:id/export` | Download expanded identities CSV (formula-injection sanitised) |
+
+### Settings (Phase 3)
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/api/settings/auto-resume` | Returns `{ enabled, localTime, days, lastRunAt, lastRunSummary, nextFireAt }` |
+| PUT | `/api/settings/auto-resume` | Body: `{ enabled?, localTime?, days? }`. Validates HH:MM regex, days enum (`every-day` / `weekdays` / `first-of-month`), boolean type. `lastRunAt` and `lastRunSummary` are not writable here |
 
 ---
 
@@ -563,15 +660,26 @@ Full DDL in `src/db.js::initDb()`. Summary:
 - **jobs** — one per CSV upload. `dataset_ids` is the normalized string
   stored as-provided (`"ALL"` or comma list). `target_services_json` is
   nullable JSON. `source_namespace_id` stores the numeric nsid when
-  known.
+  known. `projected_months` (Phase 2) tracks the redistributor's max
+  month_index for shift detection — used by the UI to render the
+  per-poll "plan extended" toast/modal.
 - **expanded_identities** — per-cluster-member rows. Both `ns_code` and
   `ns_id` stored. Unique index on `(job_id, COALESCE(ns_code,''),
   COALESCE(ns_id,0), identity_id)` so dedup works regardless of whether
   Adobe returned us the code, the nsid, or both.
 - **work_orders** — one per Adobe work order. `namespaces_identities` is
   the full JSON payload (we store it so we can retry or audit later).
+  `month_index` (Phase 2) + `day_index` form the bucket label assigned
+  by the redistributor on un-shipped WOs only; shipped WOs preserve
+  their historical labels.
 - **quota_usage** — `(ims_org_id, utc_date) → used`. Rolls over at UTC
-  midnight by virtue of the date being part of the key.
+  midnight by virtue of the date being part of the key. Local atomicity
+  ledger only — Adobe `/quota` is the displayed truth.
+- **quota_usage_monthly** — `(ims_org_id, utc_year_month) → used`. Same
+  pattern at month granularity.
+- **app_settings** — generic key/value bag (Phase 3). First users:
+  `auto_resume_enabled`, `auto_resume_local_time`, `auto_resume_days`,
+  `auto_resume_last_run_at`, `auto_resume_last_run_summary`.
 
 ---
 
@@ -605,6 +713,25 @@ Full DDL in `src/db.js::initDb()`. Summary:
   Adobe's rate limits on GETs during long runs).
 - Polls each serially within the tick.
 
+### Auto-resume scheduler (Phase 3)
+- `setInterval(60_000, tick)` (separate from the monitor's interval).
+- Each tick reads `app_settings.auto_resume_*`. If `shouldFireNow(settings)`
+  agrees (enabled + day filter + HH:MM passed + not-yet-fired-today),
+  iterates every job with un-shipped WOs and calls
+  `runSubmission(jobId)` serially per job.
+- Per-tick `running` flag prevents reentrancy when a paused machine
+  wakes up and stacks multiple ticks.
+- Per-job concurrency is the existing `inFlight` Set in `runSubmission`.
+- Routes EVERY action through `runSubmission`, inheriting the live-quota
+  refresh + redistribute + non-idempotent retry guard + orphan recovery.
+
+### Live `/quota` refresh
+- `services/quotaApi.js` caches per `imsOrgId` for 1 hour.
+- Refreshed force-fresh at the top of every `planWorkOrders` and every
+  `runSubmission` call.
+- Hard floor: 24 h. Past that without a fresh fetch, the function
+  throws `quota_unavailable` so Plan + Submit refuse to ship blind.
+
 ### Race conditions we explicitly considered
 - **Two expansion batches inserting the same identity**: handled by
   `INSERT OR IGNORE` on the unique index. Both may succeed; only one row
@@ -636,29 +763,72 @@ Full DDL in `src/db.js::initDb()`. Summary:
 ### Threat model
 - **In scope**: protecting client secrets at rest from anyone reading
   `data/state.db` without the encryption key.
+- **In scope** (added 2026-05-12): protecting destructive API endpoints
+  from a malicious web page the operator visits (DNS rebinding and
+  simple-form CSRF).
 - **Out of scope**: protecting against a compromised host (if an
   attacker can read `data/.key` AND `data/state.db`, all secrets are
   exposed — but so is everything else on the machine).
-- **Out of scope**: network-level protection. HTTP binds to `127.0.0.1`
-  by default — this is now enforced at `app.listen(port, host)` rather
-  than relied on as a Node default. Operators who set `HOST=0.0.0.0`
-  to expose the API are explicitly opting out of the security model.
+- **Out of scope**: protecting against an operator who explicitly sets
+  `HOST=0.0.0.0` to expose the API for a tunnelled demo.
+
+### HTTP-layer guards (2026-05-12 security review)
+`src/middleware/security.js` runs three middleware on every request:
+- `hostHeaderGuard` — rejects with 421 when Host header is not
+  localhost/127.0.0.1/[::1]. **The only defence against DNS rebinding**:
+  a browser that's been tricked into talking to 127.0.0.1 still sends
+  `Host: attacker.com` (the URL bar), which we detect.
+- `originRefererGuard` — POST/PUT/PATCH/DELETE require Origin (or
+  Referer fallback) to match the request's own Host. Closes the
+  simple-form CSRF where a cross-origin `<form>` could POST to
+  `/api/jobs/:id/submit` without preflight.
+- `registerUuidParamGuards` — `app.param('id')` / `app.param('credsId')`
+  reject malformed IDs with 400 before the route runs. Closes path-
+  traversal in `/api/jobs/:id/export`.
+- `helmet` with a tight CSP: `script-src 'self'`; `style-src 'self'
+  'unsafe-inline'` (existing inline `style=` attributes);
+  `frame-ancestors 'none'`; `object-src 'none'`;
+  `cross-origin-resource-policy: same-origin`.
+- Centralised `makeErrorHandler`: 5xx returns generic
+  `"An internal error occurred"`; only 4xx surface caller-vetted
+  `code` + `publicMessage`. No raw filesystem paths from
+  better-sqlite3 / fs errors leak to clients.
 
 ### Encryption
 - AES-256-GCM, per-row random 12-byte IV, 16-byte auth tag.
 - Key derivation: none — the `ENCRYPTION_KEY` (or `data/.key`) is the
   raw 32-byte key material. 64-hex-char length enforced on load.
+- First-run key creation uses `O_EXCL` (`flag: 'wx'`) so two parallel
+  boots can't race two different keys onto disk.
+- POSIX: explicit `chmod 0600` after `existsSync` check; Windows: the
+  mode is informational only (filesystem doesn't honour it), so the
+  startup banner warns when `data/` resolves under any cloud-sync path
+  (OneDrive / Dropbox / Google Drive / iCloud / Box).
 - `utils/crypto.js` exports `storeCreds()` and `decryptCreds()`.
 
-### Tokens
-- Never persisted. Kept in `services/imsAuth.js` Map with expiry.
-- Never logged in full. Debug logs slice to 12 chars + ellipsis.
+### Tokens + credential metadata
+- IMS tokens never persisted. Kept in `services/imsAuth.js` Map with
+  expiry. Never logged in full (debug logs slice to 12 chars +
+  ellipsis).
+- `region` and `environment` on `POST /api/config/credentials` are
+  validated against server-side allowlists (CLAUDE.md I14) — a stale
+  or attacker-set region would otherwise template into the Identity
+  API host and exfiltrate the bearer token. Defence-in-depth allowlist
+  in `services/namespaces.js` and `services/identityGraph.js` URL
+  builders refuses to compose the URL for an unknown region.
+- All credential-route string fields have length caps + CR/LF/control-
+  char rejection so CRLF can't smuggle headers through to IMS.
 
 ### Input sanitization
 - Dataset IDs: regex `^[a-zA-Z0-9_-]+$` per segment.
 - Display name: trimmed, truncated to 255 chars.
 - Description: truncated to 1000 chars.
 - CSV column values: trimmed, empty/null rows skipped.
+- CSV export: `sanitiseCsvValue()` prefixes any value starting with
+  `=`, `+`, `-`, `@`, tab, or CR with a leading apostrophe so
+  Excel/Sheets can't execute it as a formula on open.
+- multer 2.x with `files: 1, fields: 20, parts: 25, headerPairs: 100,
+  fieldNameSize: 100, fieldSize: 64 KiB, fileSize: 4 GiB`.
 
 ### Things we do NOT sanitize but probably should
 - The CSV *column selector* is passed directly into `streamIds`. If
@@ -679,43 +849,119 @@ Documented in `CLAUDE.md` but critical for review:
 1. **Single source namespace per job** — all CSV rows are treated as
    one namespace. Mixed-namespace input requires separate jobs.
 2. **Single-file upload per job** — one CSV at a time.
-3. **Expansion doesn't resume across restarts** — if the process
-   crashes mid-expansion, the job stays `expanding` and must be
-   manually retried. Source IDs already processed won't be
-   re-expanded (they're in `expanded_identities`) but the streamer
-   starts from the beginning of the CSV, which is wasteful.
-4. **Submission race on crash** — see Concurrency section above.
+3. **Expansion resumes across restarts** — handled by
+   `resumeExpandingJobs()`: builds a set of already-processed source
+   IDs from `expanded_identities` and skips them when re-reading the
+   CSV. Memory cost: ~50 MB per 1M processed sources during resume.
+4. **Submission race on crash** — see Concurrency section above. The
+   orphan-recovery path reconciles via Adobe's list endpoint; on a 400
+   from the list endpoint we LEAVE the orphan alone (never roll back)
+   so a duplicate work order can't be created if the original POST
+   was actually processed.
 5. **Poll frequency is fixed at 60s** — for very long jobs (weeks)
    this hammers Adobe. A geometric backoff (60s → 5min → 1h) would
    be better but isn't implemented.
 6. **No UI for deleting / aborting a job** — cleanup requires
    `rm -rf data/` or manual SQL.
+7. **Auto-resume scheduler defaults disabled** — opt-in. Operator
+   enables it on the Submit tab. When disabled, deferred work orders
+   stay deferred until the operator manually clicks Submit on the
+   next month. When enabled, the 60s tick + startup catch-up handles
+   it automatically.
+8. **Quota numbers diverge between Adobe `/quota` and our local
+   ledger** in two cases: (a) another tool consumed quota for the
+   same org between our reserve() and Adobe's accounting; (b) Adobe
+   itself is intermittently unreachable. Mitigation: Adobe `/quota`
+   is the displayed truth; the redistributor re-buckets against fresh
+   numbers before every submission run; the local ledger is purely a
+   per-WO atomicity safety net.
 
 ---
 
 ## 10. Test coverage and gaps
 
+**169 tests** as of the current codebase (`npm test`).
+
 ### What IS covered (`test/*.test.js`)
+
+**Core pipeline (pre-Phase 1)**
 - IMS token caching, thundering-herd coalescing, 401 invalidation.
 - Identity Graph batch expansion, dedup across overlapping clusters,
   chunking beyond 1000 IDs.
-- Quota reservation atomicity under concurrency.
+- Quota reservation atomicity under concurrency (`quotaManager.test.js`).
 - Hygiene payload validation — 100k cap, empty list, missing display
   name, invalid dataset id, profile-only rule, duplicate namespaces.
 - `submitWorkOrder` end-to-end with `Retry-After` + 429 simulation.
+- Region routing (`region.test.js`) — correct vs. incorrect region sends
+  to the right `platform-{region}.adobe.io` host; wrong-region fallback.
+- Credentials CRUD + PATCH invariant — PATCH only updates label /
+  client_name / region, never touches the encrypted secret or the
+  identity-key fields (`credentialsRoutes.test.js`).
+- Recovery reconciliation — orphan work orders without an Adobe ID are
+  matched, rolled back, or left alone depending on the Adobe response
+  (`recovery.test.js`).
 
-### What is NOT covered (gaps the reviewer should flag)
-- **Canonicalization corner cases**: what happens when the Identity
-  Graph returns a namespace not in our index (e.g. a namespace added
-  between our cache fetch and the expansion call)?
-- **Plan builder**: no tests for the cluster-bundling logic or the
-  day-index assignment. A bug here could mis-pack work orders.
+**Phase 1 — live quota (`quotaApi.test.js`, 8 tests)**
+- Cache miss → fresh Adobe fetch, result returned.
+- Cache hit within 1h → cached value returned without re-fetching.
+- Stale fallback when Adobe is unreachable but cache < 24h.
+- 24h hard floor: stale cache older than 24h throws `quota_unavailable`.
+- `refresh: true` forces a fresh fetch even within the 1h window.
+- Populated `{ daily, monthly }` structure validation.
+
+**Phase 2 — redistributor (`redistributor.test.js`, 8 tests)**
+- Identity batches below daily cap → all land in month 0 / day 0.
+- 4M identity job with 2M monthly cap → months 0 + 1 split correctly.
+- 10M job with 2M monthly cap + 1M daily cap → month × day grid correct.
+- Partial `daily.remaining` (cap partially consumed) → first chunk
+  honours the partial remaining, rest flows to next day.
+- Shipped work orders are immutable — redistributor never touches them.
+- Empty job → no-op.
+- `shiftedFromPrevious` flag set correctly when quota forces a shift.
+
+**Phase 3 — scheduler (`scheduler.test.js`, 20 tests)**
+- Pure-function `shouldFireNow` covers: disabled; before fire time;
+  after fire time never run; already run today; last run was yesterday;
+  weekdays-only skips Saturday + Sunday; first-of-month fires only on 1st;
+  malformed `localTime` fails closed.
+- Pure-function `nextFireTime` covers: disabled → null; every-day before
+  fire time → today; every-day after fire time → tomorrow; weekdays after
+  Friday → Monday; first-of-month from mid-month → 1st of next month.
+- Route round-trip: GET returns defaults; PUT accepts full payload + partial
+  payload (just `enabled`); PUT rejects invalid `localTime`; rejects
+  invalid `days` enum; rejects non-boolean `enabled`; confirms `lastRunAt`
+  / `lastRunSummary` are not writable via the route.
+
+**Security (`security.test.js`)**
+- `hostHeaderGuard` blocks requests with non-localhost Host headers (DNS
+  rebinding protection).
+- `originRefererGuard` blocks state-changing requests from a mismatched
+  Origin (CSRF protection).
+- UUID param guard rejects malformed IDs before routes run.
+- CSP header present on all responses.
+
+### What is NOT covered (remaining gaps the reviewer should flag)
+
+- **Canonicalization corner cases**: what happens when the Identity Graph
+  returns a namespace not in our index (e.g. a namespace added between our
+  cache fetch and the expansion call)? The code stores just `nsid` but no
+  test proves that path through to the hygiene payload.
+- **Plan builder cluster-bundling logic**: no tests for the packing or
+  flush-at-100k boundary inside `planWorkOrders`. A bug here could
+  mis-pack work orders and silently over-pack a single order.
 - **Dataset filter**: no test that confirms we actually skip datasets
-  without `unifiedIdentity: enabled:true`.
-- **Monitor tick**: no test for the polling logic or the
+  without `unifiedIdentity: enabled:true`. The production codepath reads
+  the tag; we trust it without a test.
+- **Monitor tick**: no test for the polling loop or the
   `listOpenWorkOrders` predicate.
 - **End-to-end flow**: no test drives `runExpansion → planWorkOrders →
-  runSubmission` in sequence with a mocked Adobe.
+  runSubmission` in sequence with a mocked Adobe. Coverage is per-module
+  only.
+- **Scheduler `runSubmission` integration**: the scheduler tests cover the
+  time-gate logic but don't actually call `runSubmission`; the integration
+  between `startScheduler` and the jobs table is untested end-to-end.
+- **`quotaApi` + route integration**: the `GET /api/adobe/:credsId/quota`
+  route has no dedicated test; the Phase 1 tests cover the service directly.
 
 ---
 
@@ -738,69 +984,120 @@ Please consider these explicitly in your audit:
    `ORDER BY` places NULL first by default. Does that affect cluster
    bundling for custom namespaces that only have nsid?
 
-### Concurrency
-4. `bulkInsertIdentities` is wrapped in `db.transaction(...)`.
-   better-sqlite3 transactions are synchronous but our caller is async.
-   Is there any code path where two async tasks could call
-   `bulkInsertIdentities` simultaneously and confuse better-sqlite3?
+### Quota model (Phase 1 / Phase 2)
+4. `services/quotaApi.js` caches per `imsOrgId`. Multi-credential orgs
+   (two credentials pointing at the same IMS org but different sandboxes)
+   share one cache entry. Is it possible for credential A's recently-
+   refreshed entry to mask a stale reading for credential B calling the
+   same org?
 
-5. The quota `reserve()` function does:
-   ```js
-   const current = getQuota.get(...)?.used || 0;
-   if (current + count > dailyLimit) return {granted: false, ...};
-   upsertQuota.run(...);
-   return {granted: true, ...};
-   ```
-   Between the `get` and the `run`, could another async task sneak
-   in and over-reserve? (Consider better-sqlite3's synchronous
-   semantics vs. the event loop.)
+5. `redistributor.js::redistributeUnshippedOrders` assigns
+   `month_index=0` work from `daily.remaining`, then fills subsequent
+   days up to `daily.quota`, and opens `month_index=1` using the stored
+   `monthly.quota` rather than `monthly.remaining`. Is that correct? If
+   another process consumed quota in month 1 already, we'd over-allocate
+   to that month and potentially hit Adobe's cap mid-submission.
+
+6. The redistributor calculates `Math.ceil(count / dailyCap)` days per
+   month. When a cluster bundle is exactly `dailyCap` identities, does
+   `ceil` assign it to one day correctly? Verify the off-by-one for
+   boundaries.
+
+### Scheduler (Phase 3)
+7. `shouldFireNow` compares `lastRunAt` to today's fire time using
+   `new Date(settings.lastRunAt) >= todayFireTime`. On a system where the
+   operator manually sets the clock forward (or DST moves the clock),
+   could `lastRunAt` in a past ISO string compare incorrectly against a
+   locally-constructed `todayFireTime`? Are all Date comparisons timezone-
+   consistent (all local vs. all UTC)?
+
+8. The scheduler iterates jobs with un-shipped WOs and calls
+   `runSubmission(jobId)` serially. A job with `status='expanding'` could
+   theoretically be in this list if expansion just started. Does
+   `runSubmission` handle a job mid-expansion safely (e.g. by checking job
+   status before attempting to submit)?
+
+9. `startScheduler()` fires a catch-up tick at boot. What if the catch-up
+   tick runs WHILE the `setInterval` first tick also fires (boot happens
+   at 09:00 exactly)? The `running` flag is checked at the top of the tick
+   function — is the catch-up tick and the interval tick both using the
+   same `running` flag?
+
+### Concurrency
+10. `bulkInsertIdentities` is wrapped in `db.transaction(...)`.
+    better-sqlite3 transactions are synchronous but our caller is async.
+    Is there any code path where two async tasks could call
+    `bulkInsertIdentities` simultaneously and confuse better-sqlite3?
+
+11. The quota `reserve()` function does:
+    ```js
+    const current = getQuota.get(...)?.used || 0;
+    if (current + count > dailyLimit) return {granted: false, ...};
+    upsertQuota.run(...);
+    return {granted: true, ...};
+    ```
+    Between the `get` and the `run`, could another async task sneak
+    in and over-reserve? (Consider better-sqlite3's synchronous
+    semantics vs. the event loop.)
 
 ### Error handling
-6. When `submitWorkOrder` throws, we call `release(count, monthlyLimit)`.
-   What if Adobe accepted the POST but we timed out waiting for the
-   response? The work order is created on their side but we "released"
-   the quota. Mitigation: the hygiene POST is non-idempotent (CLAUDE.md
-   I11) so we never silently double-fire on a retry; the orphan-recovery
-   routine on next startup attempts to reconcile via `GET /hygiene/
-   workorder?displayName=…`. On match it records the Adobe ID without
-   re-submitting. On 400 from the listing endpoint it leaves the row in
-   `submitting` rather than rolling back, so we don't create a duplicate
-   work order on the next submit.
+12. When `submitWorkOrder` throws, we call `release(count, monthlyLimit)`.
+    What if Adobe accepted the POST but we timed out waiting for the
+    response? The work order is created on their side but we "released"
+    the quota. Mitigation: the hygiene POST is non-idempotent (CLAUDE.md
+    I11) so we never silently double-fire on a retry; the orphan-recovery
+    routine on next startup attempts to reconcile via `GET /hygiene/
+    workorder?displayName=…`. On match it records the Adobe ID without
+    re-submitting. On 400 from the listing endpoint it leaves the row in
+    `submitting` rather than rolling back, so we don't create a duplicate
+    work order on the next submit.
 
-7. The retry logic retries on 401 (token refresh) and 429 (rate-limit;
-   Adobe didn't process the request). 5xx and network errors retry only
-   for **idempotent** requests — GETs always; POSTs only when the call
-   site explicitly tags `{idempotent: true}` (the Identity Graph cluster
-   query opts in; the hygiene work-order POST does not). If the creds
-   are genuinely wrong, we'd hit a 401, refresh once via IMS, then 401
-   again on the retry — exits after one round-trip rather than five.
+13. The retry logic retries on 401 (token refresh) and 429 (rate-limit;
+    Adobe didn't process the request). 5xx and network errors retry only
+    for **idempotent** requests — GETs always; POSTs only when the call
+    site explicitly tags `{idempotent: true}` (the Identity Graph cluster
+    query opts in; the hygiene work-order POST does not). If the creds
+    are genuinely wrong, we'd hit a 401, refresh once via IMS, then 401
+    again on the retry — exits after one round-trip rather than five.
 
 ### Security
-8. `services/config.js` route `POST /credentials/test` accepts inline
-   creds OR a `credsId`. Could an attacker with local access to the
-   API (which is bound to localhost but still) use this to enumerate
-   stored credsIds?
+14. `services/config.js` route `POST /credentials/test` accepts inline
+    creds OR a `credsId`. Could an attacker with local access to the
+    API (which is bound to localhost but still) use this to enumerate
+    stored credsIds?
 
-9. The CSV uploads land in `data/uploads/`. After a job completes,
-   they stay on disk forever. Should they be cleaned up? (The file
-   contains the source identifier list — usually hashedKocids, not
-   PII, but still worth discussing.)
+15. The CSV uploads land in `data/uploads/`. After a job completes,
+    they stay on disk forever. Should they be cleaned up? (The file
+    contains the source identifier list — usually hashedKocids, not
+    PII, but still worth discussing.)
+
+16. The `originRefererGuard` checks Origin before falling back to
+    Referer. Browsers send Origin on cross-origin fetch/XHR but may
+    omit it on same-site navigational POSTs (e.g., `<form method=POST>`
+    with same-origin action). Could a same-site form submission from a
+    malicious page hosted on `127.0.0.1` (but a different port) bypass
+    both guards if Origin is absent AND Referer matches only the host?
 
 ### Correctness of Adobe assumptions
-10. We filter datasets to `tags.unifiedIdentity = "enabled:true"`.
+17. We filter datasets to `tags.unifiedIdentity = "enabled:true"`.
     Is this the only dataset flag that Data Hygiene honors? Could a
     `unifiedProfile: enabled:true` dataset (without Identity) also
     accept deletes?
 
-11. We assume Identity Graph response order matches request order
+18. We assume Identity Graph response order matches request order
     (`data[i]` corresponds to `ids[i]`). Adobe doesn't explicitly
     document this. Are there cases where the response is re-ordered
     or deduplicated?
 
-12. `x-sandbox-name` header: we pass the sandbox `name` (not `title`).
+19. `x-sandbox-name` header: we pass the sandbox `name` (not `title`).
     Adobe's docs say "sandbox name, not title", which is what we do —
     but could the header ever need `title` in some edge case (e.g.
     the `available sandboxes` endpoint)?
+
+20. Adobe's `GET /data/core/hygiene/quota` is documented as org-wide
+    (no `x-sandbox-name` needed). Our code sends it without a sandbox
+    header. If Adobe changes this to be sandbox-scoped, our quota numbers
+    would be wrong. Is there any evidence Adobe has moved this direction?
 
 ---
 
@@ -811,14 +1108,22 @@ If your time is limited, review in this order:
 1. **`src/services/hygiene.js`** — destructive payload construction.
    Every validator here must be correct.
 2. **`src/runner/submission.js::planWorkOrders`** — cluster bundling
-   logic; subtle correctness.
-3. **`src/services/namespaces.js`** — canonicalization is core to
+   logic; subtle correctness. Also `runSubmission` for quota sequencing.
+3. **`src/runner/redistributor.js`** — month × day assignment from live
+   quota. A bug here silently over-allocates a month's cap.
+4. **`src/services/quotaApi.js`** — the 24h hard floor and stale-cache
+   logic. Any bypass here ships blind against a destructive API.
+5. **`src/services/namespaces.js`** — canonicalization is core to
    I2 in CLAUDE.md.
-4. **`src/services/quotaManager.js`** + call sites in submission —
-   quota accounting.
-5. **`src/services/imsAuth.js`** — token cache concurrency.
-6. Everything else is more mechanical (CSV streaming, routes,
-   DB boilerplate).
+6. **`src/services/quotaManager.js`** + call sites in submission —
+   quota accounting atomicity.
+7. **`src/runner/scheduler.js`** — time-gate logic, reentrancy guard,
+   startup catch-up tick safety.
+8. **`src/middleware/security.js`** — host guard, origin guard,
+   UUID param guard. Any gap here exposes the destructive API.
+9. **`src/services/imsAuth.js`** — token cache concurrency.
+10. Everything else is more mechanical (CSV streaming, routes,
+    DB boilerplate).
 
 ## Output expected from reviewer
 

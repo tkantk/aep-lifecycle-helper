@@ -21,21 +21,30 @@ getting it wrong deletes real customer data.
 
 ```
                 ┌─────────────────── 127.0.0.1:3000 ──────────────────────┐
+                │  helmet + hostHeaderGuard + originRefererGuard          │
                 │                                                         │
-  ┌─────────┐   │  ┌──────────────┐      ┌─────────────────────────┐      │
-  │ Browser │◀──┼─▶│  Express API │◀────▶│    In-process runners    │      │
-  │ UI (JS) │   │  │  /api/*      │      │   • expansion (p-limit 10)│      │
-  │         │   │  │              │      │   • submission (p-limit 2)│      │
-  │  HTML/  │   │  │              │      │   • monitor (setInterval │      │
-  │  CSS/JS │   │  │              │      │     every 60s)            │      │
-  └─────────┘   │  └──────┬───────┘      └────────────┬──────────────┘     │
-                │         │                           │                    │
-                │         ▼                           ▼                    │
+  ┌─────────┐   │  ┌──────────────┐      ┌──────────────────────────┐    │
+  │ Browser │◀──┼─▶│  Express API │◀────▶│   In-process runners      │    │
+  │ UI (JS) │   │  │  /api/*      │      │  • expansion (p-limit 10) │    │
+  │         │   │  │              │      │  • submission (p-limit 2) │    │
+  │  HTML/  │   │  │              │      │  • redistributor          │    │
+  │  CSS/JS │   │  │              │      │    (Phase 2; runs inside  │    │
+  │  modal+ │   │  │              │      │     plan + submit)        │    │
+  │  toast  │   │  │              │      │  • monitor  60s tick      │    │
+  │         │   │  │              │      │  • scheduler 60s tick     │    │
+  │         │   │  │              │      │    (Phase 3 auto-resume)  │    │
+  └─────────┘   │  └──────┬───────┘      └───────────┬───────────────┘    │
+                │         │                          │                    │
+                │         ▼                          ▼                    │
                 │  ┌─────────────────────────────────────────────┐        │
                 │  │    SQLite (data/state.db, WAL mode)         │        │
-                │  │  credentials · jobs · expanded_identities   │        │
-                │  │  work_orders · sandbox_configs · quota      │        │
+                │  │  credentials · jobs · expanded_identities · │        │
+                │  │  work_orders · sandbox_configs ·            │        │
+                │  │  quota_usage · quota_usage_monthly ·        │        │
+                │  │  app_settings                                │        │
                 │  └─────────────────────────────────────────────┘        │
+                │                                                         │
+                │  In-memory: IMS token cache · /quota cache (1h)         │
                 │                                                         │
                 └────────────────────┬────────────────────────────────────┘
                                      │
@@ -48,6 +57,7 @@ getting it wrong deletes real customer data.
         │                          │      │   /catalog/dataSets          │
         │                          │      │   /idnamespace/identities    │
         │                          │      │   /identity/clusters/members │
+        │                          │      │   /hygiene/quota             │
         │                          │      │   /hygiene/workorder         │
         └──────────────────────────┘      └──────────────────────────────┘
 ```
@@ -78,6 +88,10 @@ demo — never for production. See CLAUDE.md I12.
      │               Test Connection → IMS token obtained & cached in memory.
      ▼               Sandbox list loaded. Sandbox picked → datasets + namespaces
                      loaded in parallel and cached on sandbox_configs.
+                     GET /data/core/hygiene/quota fetched once (cached 1h);
+                     UI banner shows Daily / Monthly consumed + remaining;
+                     cap inputs auto-populated from Adobe's reported entitlement.
+                     See CLAUDE.md I15.
 
   2. UPLOAD          User picks source namespace from dropdown (populated from
      │               the sandbox's namespace registry). CSV streamed to
@@ -93,33 +107,67 @@ demo — never for production. See CLAUDE.md I12.
 
   4. PLAN            Iterate expanded_identities ORDER BY source_id, ns_code.
      │               Bundle identities by cluster. Pack bundles into work orders
-     ▼               (≤ 100k ids/order). Assign day_index, advancing when the
-                     day's running total would exceed dailyLimit. Previously-
-                     planned rows are deleted first, so re-plan is idempotent.
+     ▼               (≤ 100k ids/order). Initial day_index assigned by the
+                     legacy planner. Then runner/redistributor.js runs against
+                     live /quota and assigns each un-shipped WO an authoritative
+                     (month_index, day_index) — current month uses
+                     monthly.remaining; subsequent months use the full quota.
+                     Plan tab groups by Month → Day; if months > 1 OR the
+                     timeline shifted from a previous plan, a pre-plan modal
+                     confirms before locking in. (RQ-2: 1-month shift = toast,
+                     ≥ 2-month shift = modal.) Previously-planned rows are
+                     deleted first, so re-plan is idempotent.
                      SAFETY GUARD (CLAUDE.md I10): planWorkOrders() refuses
                      with ReplanForbiddenError (HTTP 409) if any work order on
                      the job is in a non-{planned,deferred} state — re-emitting
-                     orders for already-shipped identities would cause duplicate
-                     irreversible deletes.
+                     identity content for already-shipped orders would cause
+                     duplicate irreversible deletes. The redistributor is
+                     explicitly allowed to update (month_index, day_index)
+                     labels on un-shipped WOs only; identity content of any
+                     existing WO never changes.
 
-  5. SUBMIT          For each planned OR deferred order (oldest day first):
-     │                 a. reserve(imsOrgId, count, dailyLimit, monthlyLimit)
-     ▼                    — atomic UPSERT, checks BOTH dimensions
-                       b. if granted: POST /hygiene/workorder (NON-idempotent;
-                          5xx & network errors do NOT retry — see I11). Persist
-                          Adobe ID on success.
-                       c. if not granted: mark 'deferred'. The next submit run
-                          (after UTC daily/monthly rollover) picks up these
-                          rows alongside any new 'planned' ones.
-                       d. on failure: release(count, monthlyLimit), mark 'failed'.
-                          monthlyLimit gating prevents leakage into other jobs.
+  5. SUBMIT          Pre-submit modal: shows live remaining + planned count;
+     │               operator confirms each click (always shown — destructive).
+     ▼               Backend then:
+                       a. Re-fetch /quota with refresh: true. On hard failure
+                          (no recent cache), abort with quota_unavailable 503.
+                       b. Re-run redistributor against the fresh numbers
+                          (un-shipped WOs may shift to a later month).
+                       c. For each planned OR deferred order in the target
+                          (month, day) bucket:
+                            i.   reserve(imsOrgId, count, dailyLimit, monthlyLimit)
+                                 — atomic SQLite UPSERT against both dimensions.
+                            ii.  if granted: POST /hygiene/workorder
+                                 (NON-idempotent; 5xx + network errors do NOT
+                                 retry — see I11). Persist Adobe ID + log if
+                                 operationCount diverges from our pre-submit
+                                 total (drift detector, I15).
+                            iii. if not granted: mark 'deferred'. The next
+                                 submit run (after UTC daily/monthly rollover)
+                                 picks up these rows alongside any new 'planned'
+                                 ones.
+                            iv.  on failure: release(count, monthlyLimit), mark
+                                 'failed'. monthlyLimit gating prevents leakage
+                                 into other jobs.
                      Guarded against concurrent runs via in-process inFlight Set.
 
   6. MONITOR         setInterval(60s). Query up to 30 open work orders where
-                     adobe_workorder_id IS NOT NULL AND status NOT terminal.
-                     GET /hygiene/workorder/{id}. Persist status transitions
+     │               adobe_workorder_id IS NOT NULL AND status NOT terminal.
+     ▼               GET /hygiene/workorder/{id}. Persist status transitions
                      through received → validated → submitted → ingested → completed.
-                     Transient errors (DNS, 5xx) retry on the next tick.
+                     productStatusDetails surfaced per-work-order in the
+                     Monitor tab (Identity Service / Profile Service / Journey
+                     Orchestrator / Data Management rows). Transient errors
+                     retry on the next tick.
+
+  7. AUTO-RESUME     setInterval(60s). Reads operator-configured settings
+     (Phase 3)       (enabled, localTime HH:MM, days). When shouldFireNow()
+                     agrees (today's HH:MM has passed in the operator's
+                     timezone AND we haven't fired since), iterates every
+                     job with un-shipped WOs and calls runSubmission(jobId)
+                     for each. Catch-up tick runs once on app startup so a
+                     laptop that was off at the scheduled time still resumes
+                     when next powered on. See CLAUDE.md I16.
 ```
 
 ---
@@ -265,7 +313,7 @@ src/
     │                       gradient tile shows it in white.
     └── fonts/              Self-hosted Source Sans 3 woff2 (OFL-licensed, 4 weights).
 
-test/                       node --test. 113 tests covering hygiene validators,
+test/                       node --test. 169 tests covering hygiene validators,
                             namespace canonicalization, IMS token cache, quota
                             atomicity (incl. monthly-disabled release gating),
                             planWorkOrders cluster packing + day rollover +
@@ -275,9 +323,15 @@ test/                       node --test. 113 tests covering hygiene validators,
                             recovery on missing/indeterminate Adobe responses,
                             adobeClient error-body enrichment, credentials
                             routes (PATCH non-secret-only safety + DELETE 409),
-                            and the Monitor-tab listMonitorJobs feed (filter,
-                            in-flight-first sort, aggregates, search, sandbox
-                            filter, monitorTotals + monitorSandboxes queries).
+                            Monitor-tab listMonitorJobs feed (in-flight-first
+                            sort, aggregates, sandbox filter), the 2026-05-12
+                            security review fixes (host/origin guards, region
+                            allowlist, CSV formula sanitiser), Phase 1 quotaApi
+                            (cache + stale fallback + 24h hard floor), Phase 2
+                            redistributor (4M/10M scenarios + live-quota shifts
+                            + shipped-WO immutability), Phase 3 scheduler
+                            (shouldFireNow gates + nextFireTime projection +
+                            route validation).
 
 docs/
 ├── ARCHITECTURE.md         This file. Living overview.
@@ -315,6 +369,18 @@ data/                       Runtime state; in .gitignore.
 
 **Work order status** `GET platform.adobe.io/data/core/hygiene/workorder/{id}` — terminal states are `completed` and `failed`.
 
+**Quota** `GET platform.adobe.io/data/core/hygiene/quota`
+- Org-wide (no `x-sandbox-name`); read-only — consumes no quota.
+- Response: `{ quotas: [ { name, consumed, quota, description }, ... ] }`.
+- Names: `dailyConsumerDeleteIdentitiesQuota`,
+  `monthlyConsumerDeleteIdentitiesQuota`, `datasetExpirationQuota`.
+- Adobe documented caps: 100k identifiers/work order; 1M identifiers/day
+  (subject to monthly remaining); monthly varies by entitlement
+  (2M without Shield / 15M with Shield, whichever is less of fixed cap
+  or 5%/10% of addressable audience). Resets at 00:00 GMT (daily) and
+  00:00 GMT on the 1st of each calendar month; unused quota does NOT
+  carry over. See CLAUDE.md I15.
+
 ---
 
 ## 6. SQLite schema — at a glance
@@ -323,15 +389,18 @@ data/                       Runtime state; in .gitignore.
 |---|---|---|
 | `credentials` | AES-GCM encrypted secrets | UNIQUE(environment, ims_org_id, client_id) |
 | `sandbox_configs` | Cached sandbox metadata + datasets + namespaces | PK(creds_id, sandbox_name) |
-| `jobs` | One per upload. Status: created → expanding → expanded → ready → submitting → submitted/partial/failed | FK creds_id |
+| `jobs` | One per upload. Status: created → expanding → expanded → ready → submitting → submitted/partial/failed. `projected_months` (Phase 2) tracks the redistributor's max month_index for shift detection. | FK creds_id |
 | `expanded_identities` | One row per (cluster member, source). Dedup via unique index | UNIQUE(job_id, COALESCE(ns_code,''), COALESCE(ns_id,0), identity_id) |
-| `work_orders` | One per Adobe work order. Statuses: planned → submitting → submitted → completed/failed/deferred | FK job_id, ordered by rowid |
-| `quota_usage` | Daily ledger: (ims_org_id, utc_date) → used | PK |
-| `quota_usage_monthly` | Monthly ledger: (ims_org_id, utc_year_month) → used | PK |
+| `work_orders` | One per Adobe work order. Statuses: planned → submitting → submitted → completed/failed/deferred. `month_index` (Phase 2) + `day_index` form the bucket label assigned by the redistributor on un-shipped WOs only. | FK job_id, ordered by rowid |
+| `quota_usage` | Daily local ledger: (ims_org_id, utc_date) → used | PK |
+| `quota_usage_monthly` | Monthly local ledger: (ims_org_id, utc_year_month) → used | PK |
+| `app_settings` | Generic key/value bag (Phase 3). First users: `auto_resume_*` keys for the scheduler. | PK(key) |
 
 Both ledgers are incremented by `reserve()` atomically and decremented by
 `release()` atomically. The `jobs` table has `daily_limit` and `monthly_limit`
-columns (nullable; null monthly = "don't track monthly for this job").
+columns (nullable; null monthly = "don't track monthly for this job") — but
+since Phase 1 these are FALLBACK ONLY; the live Adobe `/quota` is the
+runtime source of truth (CLAUDE.md I15).
 
 ---
 
@@ -351,15 +420,24 @@ columns (nullable; null monthly = "don't track monthly for this job").
 12. UI loads only local assets — no third-party CDN fonts/scripts/images. Loopback-bound by default.
 13. Local API has Host-header + Origin/Referer + helmet/CSP guards. Defeats DNS rebinding and simple-form CSRF.
 14. Region and environment are allowlisted server-side (not just in the UI) — a stale or attacker-set `region` would template into the Identity API host and exfiltrate the bearer token.
+15. Live Adobe `/quota` is the source of truth for daily + monthly caps. Refreshed before every plan + every submit; 1h cache; 24h hard floor falls back to `quota_unavailable` 503 rather than ship blind.
+16. Configurable auto-resume scheduler is opt-in (defaults disabled) and routes every action through `runSubmission`, inheriting the live-quota refresh, the non-idempotent retry guard, and the orphan-recovery path.
 
 ---
 
 ## 8. Known operational boundaries (what the tool does NOT do today)
 
-- **Monthly quota default** — configurable at 3M/month by default. This is a
-  conservative value for typical base Data Hygiene contracts; your specific
-  contract might be different. Override on the Config tab or via
-  `MONTHLY_IDENTIFIER_LIMIT` env var. Set to 0 to disable monthly tracking.
+- **Monthly quota default** — `MONTHLY_IDENTIFIER_LIMIT` env var defaults
+  to 3M/mo, **but is FALLBACK ONLY since Phase 1 (2026-05-15)**. The live
+  `GET /data/core/hygiene/quota` value is the runtime source of truth and
+  drives both the Config UI banner and the redistributor's bucket math.
+  The env var is consulted only when Adobe is unreachable AND no recent
+  `/quota` cache exists.
+- **Auto-resume on quota rollover** — IMPLEMENTED in Phase 3 (2026-05-15)
+  via `runner/scheduler.js`, but defaults to OFF. Operator enables it on
+  the Submit tab. Daily 60s tick fires at the configured HH:MM local time
+  on the configured days (every-day / weekdays / first-of-month). Startup
+  catch-up tick handles the "laptop was off at the scheduled time" case.
 - **Crashed expansion auto-resumes** on next boot — `resumeExpandingJobs()`
   builds a Set of already-processed source IDs from `expanded_identities` and
   skips them when re-reading the CSV. Cost: holds ~50 MB per 1M processed

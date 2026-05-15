@@ -77,23 +77,50 @@ src/
 │   ├── namespaces.js           GET /data/core/idnamespace/identities + index
 │   ├── identityGraph.js        POST /data/core/identity/clusters/members
 │   ├── hygiene.js              POST /data/core/hygiene/workorder + validation
-│   └── quotaManager.js         SQLite-backed daily quota ledger
+│   ├── quotaApi.js             GET /data/core/hygiene/quota (live Adobe-side
+│   │                           daily + monthly counters; 1h cache; 24h hard
+│   │                           floor on stale fallback)
+│   └── quotaManager.js         SQLite-backed daily + monthly quota ledger
+│                               (atomic reserve/release used by submission)
+│
+├── middleware/                 Security middleware (CLAUDE.md I13/I14):
+│   └── security.js             hostHeaderGuard (DNS rebinding), origin
+│                               /referer guard (CSRF), UUID param guards,
+│                               centralised error handler
 │
 ├── runner/                     In-process background work
 │   ├── expansion.js            CSV stream → batched Identity Graph calls
-│   ├── submission.js           Planner (with replan guard) + quota-gated submission
+│   ├── submission.js           Planner (with replan guard) + quota-gated
+│   │                           submission. runSubmission re-fetches /quota
+│   │                           and calls the redistributor before picking
+│   │                           work — see I3 + I10.
+│   ├── redistributor.js        Month-aware re-bucketer (Phase 2). Walks
+│   │                           un-shipped WOs in rowid order and assigns
+│   │                           (month_index, day_index) from live Adobe
+│   │                           quota remaining + future-period fresh caps.
+│   │                           Shipped WOs are immutable — see I10.
+│   ├── scheduler.js            Auto-resume scheduler (Phase 3). Reads
+│   │                           operator-configurable settings from
+│   │                           app_settings; setInterval(60s) tick that
+│   │                           fires when shouldFireNow() agrees with the
+│   │                           HH:MM-local-time + days policy + not-yet-
+│   │                           fired-today guard. Iterates jobs with
+│   │                           un-shipped WOs via runSubmission.
 │   ├── monitor.js              setInterval(60s) status poll
 │   └── recovery.js             One-shot startup reconciliation of orphan work orders
 │
 ├── routes/                     Express route modules
 │   ├── config.js               Credential CRUD + test
-│   ├── adobe.js                Sandbox/dataset/namespace discovery
+│   ├── adobe.js                Sandbox/dataset/namespace discovery + /quota
 │   ├── upload.js               CSV upload → job creation
-│   └── jobs.js                 Job detail, plan, submit, progress, export
+│   ├── jobs.js                 Job detail, plan, submit, progress, export
+│   └── settings.js             GET/PUT /api/settings/auto-resume
 │
 ├── utils/
-│   ├── csv.js                  Streaming CSV in/out
-│   ├── crypto.js               AES-256-GCM envelope encryption
+│   ├── csv.js                  Streaming CSV in/out + formula-injection
+│   │                           sanitiser on writeCsv (CLAUDE.md F10)
+│   ├── crypto.js               AES-256-GCM envelope encryption; O_EXCL on
+│   │                           first-run key creation (F12)
 │   └── logger.js               Text or JSON output
 │
 └── web/                        Zero-build static UI
@@ -411,6 +438,62 @@ list and the two services lists together** when Adobe adds a new region.
 Route handlers also validate string lengths and reject control characters
 (CR/LF/null) in `imsOrgId`, `clientId`, `clientSecret`, etc. — those flow
 into HTTP headers downstream.
+
+### I15. Live Adobe `/quota` is the source of truth for daily + monthly caps
+
+`services/quotaApi.js::getOrgQuota(creds)` calls
+`GET /data/core/hygiene/quota` and returns
+`{ daily: {consumed, quota, remaining}, monthly: {consumed, quota, remaining},
+  fetchedAt, stale, error }`. This endpoint is per-organization (Adobe doc
+doesn't require `x-sandbox-name`) and **read-only — it consumes no quota
+to call it**, so we refresh aggressively:
+
+- After Test Connection succeeds (UI banner).
+- Before every plan (`POST /api/jobs/:id/plan`).
+- Before every submit run (`runSubmission` fetches with `refresh: true`).
+- On every scheduler tick (I16).
+- Hourly background — the 1-hour in-memory cache is keyed by `imsOrgId`.
+
+Stale-cache fallback: a failed live fetch keeps the last cached value with
+`stale: true` and the error message. **24-hour hard floor**: if the cache
+is older than that (or doesn't exist), `getOrgQuota` re-raises with
+`err.code = 'quota_unavailable'`. Plan and Submit routes block at 503 in
+that case rather than ship blind.
+
+The job-row `daily_limit` / `monthly_limit` columns are now FALLBACK only —
+used when Adobe `/quota` isn't reachable AND no cache exists. Live values
+always supersede them at runtime. The `config.dailyIdentifierLimit` and
+`config.monthlyIdentifierLimit` env vars are second-tier fallbacks.
+
+Adobe's `operationCount` in the POST work-order response is logged when it
+diverges from our pre-submit `total` — drift detector for identifier-
+counting discrepancies without needing a live delete to verify.
+
+### I16. Configurable auto-resume scheduler is opt-in and routes through `runSubmission`
+
+`runner/scheduler.js` provides a setInterval(60s) tick that resubmits
+deferred work when the operator-configured local HH:MM passes on an
+allowed day (every-day / weekdays / first-of-month). Settings live in the
+`app_settings` table (keys prefixed `auto_resume_*`):
+
+- `auto_resume_enabled`        — `'true'` / `'false'`, default disabled
+- `auto_resume_local_time`     — HH:MM, default `'09:00'`
+- `auto_resume_days`           — `'every-day' | 'weekdays' | 'first-of-month'`
+- `auto_resume_last_run_at`    — ISO timestamp; written by the scheduler only
+- `auto_resume_last_run_summary` — JSON written by the scheduler only
+
+`startScheduler()` runs a catch-up tick at boot so a laptop that was off
+at the scheduled time still resumes within seconds of starting the app.
+Per-tick reentrancy is blocked by a `running` flag; per-job reentrancy
+is the existing `inFlight` Set in `runSubmission`. The scheduler routes
+EVERY action through `runSubmission`, which means it inherits:
+- The live `/quota` refresh + redistribute (I15 + I10).
+- The non-idempotent retry guard (I11).
+- The orphan-recovery path (`reconcileOrphanWorkOrders`).
+
+`PUT /api/settings/auto-resume` validates `enabled` (boolean), `localTime`
+(HH:MM regex), `days` (enum membership). `lastRunAt` / `lastRunSummary`
+are NOT writable via the route — only the scheduler updates them.
 
 ---
 
