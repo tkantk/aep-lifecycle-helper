@@ -105,7 +105,8 @@ test('reconcile: Adobe finds matching work order → record Adobe ID', async () 
   const localId = `wo-hit-${seq}`;
   seedOrphanWorkOrder(jobId, localId);
 
-  const prefix = `Delete match-hit - WO ${localId.slice(0, 8)}`;
+  // Display name now uses the full local UUID (F-009 fix).
+  const displayName = `Delete match-hit - WO ${localId}`;
 
   mockIms();
   nock(GATEWAY)
@@ -114,7 +115,7 @@ test('reconcile: Adobe finds matching work order → record Adobe ID', async () 
     .reply(200, {
       workorders: [{
         workorderId: 'DI-recovered-abc-123',
-        displayName: prefix + ' — something',
+        displayName,
         status: 'received',
         bundleId: 'BN-xyz',
         createdAt: '2026-04-23T10:00:00Z',

@@ -315,7 +315,7 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
           creds,
           sandboxName: job.sandbox_name,
           datasetId: wo.dataset_ids || job.dataset_ids,
-          displayName: `Delete ${job.name} - WO ${wo.id.slice(0, 8)}`,
+          displayName: `Delete ${job.name} - WO ${wo.id}`,
           description: `Bulk delete (Job ${jobId.slice(0, 8)}, Day ${wo.day_index})`,
           targetServices,
           namespacesIdentities,

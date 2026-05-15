@@ -81,13 +81,14 @@ export async function reconcileOrphanWorkOrders() {
   for (const wo of orphans) {
     try {
       const creds = await decryptCreds(wo.j_creds_id);
+      // Display name assigned in submission.js: `Delete ${job.name} - WO ${wo.id}`
+      // Use the full UUID so the match is unambiguous even if the job name
+      // contains the substring " - WO " (F-009).
+      const displayName = `Delete ${wo.j_name} - WO ${wo.id}`;
       const found = await findAdobeWorkOrderByDisplayNamePrefix({
         creds,
         sandboxName: wo.j_sandbox_name,
-        // Display name prefix we assign in submission.js is:
-        //   `Delete ${job.name} - WO ${wo.id.slice(0, 8)}`
-        // The 8-char prefix of the local UUID is the unique part.
-        prefix: `Delete ${wo.j_name} - WO ${wo.id.slice(0, 8)}`,
+        prefix: displayName,
       });
 
       if (found === __testInternal__.LOOKUP_INDETERMINATE) {
@@ -132,7 +133,7 @@ export async function reconcileOrphanWorkOrders() {
 const LOOKUP_INDETERMINATE = Symbol('lookup-indeterminate');
 
 /**
- * Best-effort lookup of an existing Adobe work order by displayName prefix.
+ * Best-effort lookup of an existing Adobe work order by exact displayName.
  * Uses the list endpoint (GET /data/core/hygiene/workorder).
  *
  * Returns:
@@ -155,7 +156,9 @@ async function findAdobeWorkOrderByDisplayNamePrefix({ creds, sandboxName, prefi
   try {
     const { data } = await client.get(url);
     const list = Array.isArray(data) ? data : (data?.workorders || data?.items || []);
-    const match = list.find(w => (w.displayName || '').startsWith(prefix));
+    // Use exact match now that the full UUID is embedded in the displayName
+    // (F-009). The API filter may return approximate results; we re-check here.
+    const match = list.find(w => (w.displayName || '') === prefix);
     if (!match) return null;
     return {
       workorderId: match.workorderId || match.id,
