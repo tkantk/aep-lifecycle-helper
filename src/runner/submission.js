@@ -232,6 +232,16 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
   try {
     const job = q().getJob.get(jobId);
     if (!job) throw new Error(`Job not found: ${jobId}`);
+
+    // Skip jobs that are still expanding — they may have stale planned/deferred
+    // WOs from a previous run, but the identity content is not yet complete.
+    // The scheduler could otherwise submit those WOs while expansion is still
+    // adding identities in the same process (crash + restart edge case).
+    if (job.status === 'expanding') {
+      logger.info({ jobId }, 'runSubmission: job is still expanding — skipping');
+      return { submitted: 0, deferred: 0, failed: 0 };
+    }
+
     const creds = await decryptCreds(job.creds_id);
     const limit = pLimit(config.workOrderConcurrency);
 
@@ -256,8 +266,6 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
     const distribution = redistributeUnshippedOrders(jobId, quotaSnapshot);
     const shifted = previousMonths != null && distribution.months > previousMonths;
 
-    q().updateJobStatus.run('submitting', null, jobId);
-
     // Include 'deferred' rows alongside 'planned' — deferred orders were
     // denied quota on a previous run and never went to Adobe. After UTC
     // rollover (daily) or month rollover (monthly), they're safe to retry.
@@ -274,10 +282,20 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
         ? q().getOrdersByDay.all(jobId, useDay).filter(o => ['planned', 'deferred'].includes(o.status))
         : q().getPlannedOrders.all(jobId);
 
+    // Use live quota cap values for the local reserve() ledger so the safety
+    // net is consistent with what Adobe will actually enforce (F-003). Fall
+    // back to job-row values only when the live snapshot is unavailable.
+    const liveDailyLimit   = quotaSnapshot?.daily?.quota   || job.daily_limit;
+    const liveMonthlyLimit = job.monthly_limit === null || job.monthly_limit === 0
+      ? (quotaSnapshot?.monthly?.quota ? quotaSnapshot.monthly.quota : null)
+      : (quotaSnapshot?.monthly?.quota || job.monthly_limit);
+
+    q().updateJobStatus.run('submitting', null, jobId);
+
     let submitted = 0, deferred = 0, failed = 0;
 
     const tasks = orders.map(wo => limit(async () => {
-      const res = reserve(creds.imsOrgId, wo.identifier_count, job.daily_limit, job.monthly_limit);
+      const res = reserve(creds.imsOrgId, wo.identifier_count, liveDailyLimit, liveMonthlyLimit);
       if (!res.granted) {
         const reason = res.reason === 'monthly'
           ? `monthly quota: ${res.monthlyUsed}/${res.monthlyLimit} used`
@@ -315,7 +333,7 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
           localId: wo.id, adobeId: result.workorderId, count: result.operationCount,
         }, 'work order submitted');
       } catch (err) {
-        release(creds.imsOrgId, wo.identifier_count, job.monthly_limit);
+        release(creds.imsOrgId, wo.identifier_count, liveMonthlyLimit);
         q().updateWorkOrderStatus.run('failed', err.message, wo.id);
         failed++;
         logger.error({ localId: wo.id, err: err.message }, 'submission failed');
