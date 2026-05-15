@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { storeCreds, decryptCreds } from '../utils/crypto.js';
 import { getAccessToken, invalidateToken } from '../services/imsAuth.js';
 import { q } from '../db.js';
-import { registerUuidParamGuards } from '../middleware/security.js';
+import { registerUuidParamGuards, UUID_RE } from '../middleware/security.js';
 
 const router = Router();
 registerUuidParamGuards(router);   // :id is the credential UUID
@@ -107,6 +107,13 @@ router.post('/credentials/test', async (req, res) => {
   try {
     let creds;
     if (req.body?.credsId) {
+      // Validate UUID format before hitting the DB — prevents timing-based
+      // credential enumeration (non-UUID strings are rejected instantly, so
+      // "not found" vs "found but auth failed" timing difference is eliminated
+      // for syntactically invalid inputs). F-007.
+      if (!UUID_RE.test(req.body.credsId)) {
+        return res.json({ ok: false, error: 'invalid credential id' });
+      }
       creds = await decryptCreds(req.body.credsId);
     } else {
       const body = req.body || {};
