@@ -56,11 +56,11 @@ import { logger } from '../utils/logger.js';
  * the previously-projected value.
  */
 
-const SAFE_MIN_DAILY_CAP   = 100_000;   // 1 work order's worth — never produce a smaller bucket
-const SAFE_MIN_MONTHLY_CAP = 100_000;
-
 function safeInt(v, fallback) {
   const n = Number(v);
+  // Treat 0 as invalid (suspended org / no entitlement) and fall through to
+  // the fallback. If Adobe ever legitimately reports quota=0, we'd use the
+  // env-configured fallback cap rather than silently over-submitting.
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
@@ -96,11 +96,13 @@ export function redistributeUnshippedOrders(jobId, quota) {
     ? null
     : (Number.isFinite(quota?.monthly?.remaining) ? Number(quota.monthly.remaining) : monthlyFresh);
 
-  // Defensive floors. If Adobe ever reports remaining < a single WO's max
-  // size, our loop would never make progress within that period. Treat it as
-  // "this period is exhausted, advance immediately."
-  if (dayRem   < SAFE_MIN_DAILY_CAP)   dayRem   = 0;
-  if (monthRem != null && monthRem < SAFE_MIN_MONTHLY_CAP) monthRem = 0;
+  // Clamp negatives to 0 (can't happen via Adobe's API but guard defensive-
+  // ly). We deliberately do NOT apply a "minimum useful remaining" floor here:
+  // work orders can be much smaller than the daily/monthly cap, so even a
+  // small remaining value can hold real work. Flooring to 0 when remaining is,
+  // say, 80k would skip that 80k unnecessarily (F-001).
+  if (dayRem < 0)                       dayRem   = 0;
+  if (monthRem != null && monthRem < 0) monthRem = 0;
 
   const orders = q().getUnshippedOrdersForJob.all(jobId);
   if (orders.length === 0) {
