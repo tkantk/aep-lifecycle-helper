@@ -1012,7 +1012,7 @@ async function renderPlanResults(wos, container) {
   const target = container || $('#plan-body');
 
   const planned = wos.length;
-  const submittedCount = wos.filter(w => !['planned', 'deferred'].includes(w.status)).length;
+  const submittedCount = wos.filter(w => !['planned', 'deferred', 'awaiting_approval'].includes(w.status)).length;
   const totalIds = wos.reduce((s, w) => s + w.identifier_count, 0);
   const replanDisabled = submittedCount > 0;
 
@@ -1066,7 +1066,7 @@ async function renderPlanResults(wos, container) {
     <div class="alert info" style="margin-top: 16px">
       <div>
         <div class="alert-title">Multi-month plan</div>
-        This deletion exceeds your monthly quota and will span <b>${totalMonths} months</b>. Each month's batch ships only after the org-wide monthly quota resets at <b>00:00 GMT on the 1st</b>. Phase 3 (auto-resume) is not yet enabled; for now you'll need to come back and click Submit each month.
+        This deletion exceeds your monthly quota and will span <b>${totalMonths} months</b>. Each month's batch ships only after the org-wide monthly quota resets at <b>00:00 GMT on the 1st</b>. Months 2 and beyond require explicit approval before they can ship — use the <b>Approve Month</b> button on each future month below.
       </div>
     </div>` : ''}
 
@@ -1075,7 +1075,11 @@ async function renderPlanResults(wos, container) {
       <div class="section-sub">Day numbers are within each month and re-bucket dynamically when Adobe quota changes.</div>
     </div>
 
-    ${monthRows.map(m => `
+    ${monthRows.map(m => {
+      const hasAwaitingApproval = m.wos.some(w => w.status === 'awaiting_approval');
+      const allApproved = !hasAwaitingApproval;
+      const isMonth1 = m.month === 1;
+      return `
       <details class="plan-month" ${m.month === monthsSorted[0] ? 'open' : ''}>
         <summary>
           <span class="plan-month-label">Month ${m.month}</span>
@@ -1083,6 +1087,8 @@ async function renderPlanResults(wos, container) {
             ${m.wos.length} work order${m.wos.length === 1 ? '' : 's'} · ${m.ids.toLocaleString()} identifiers
             ${monthlyCap > 0 ? `· ${((m.ids / monthlyCap) * 100).toFixed(0)}% of monthly cap` : ''}
           </span>
+          ${!isMonth1 && hasAwaitingApproval ? `<span class="approval-badge">Awaiting approval</span>` : ''}
+          ${!isMonth1 && allApproved && m.wos.every(w => ['planned','deferred'].includes(w.status)) ? `<span class="approval-badge approved">Approved</span>` : ''}
         </summary>
         <div class="table-wrap" style="margin-top: 8px">
           <table>
@@ -1101,7 +1107,13 @@ async function renderPlanResults(wos, container) {
             </tbody>
           </table>
         </div>
-      </details>`).join('')}
+        ${!isMonth1 && hasAwaitingApproval ? `
+        <div class="approval-action" style="margin: 0 14px 14px; padding: 12px; background: var(--blue50, #eff6ff); border-radius: 6px; display:flex; align-items:center; gap:12px">
+          <span style="font-size:13px; flex:1">Month ${m.month} contains <b>${m.wos.filter(w => w.status === 'awaiting_approval').length}</b> work order(s) awaiting your approval before they can ship.</span>
+          <button class="btn btn-primary btn-sm" data-approve-month="${m.month}" style="white-space:nowrap">Approve Month ${m.month}</button>
+        </div>` : ''}
+      </details>`;
+    }).join('')}
 
     <div style="margin-top:16px; display:flex; gap:8px; align-items:center">
       <button class="btn btn-secondary" id="btn-replan" ${replanDisabled ? 'disabled title="Re-planning is blocked once any work order has been submitted to Adobe."' : ''}>
@@ -1114,6 +1126,26 @@ async function renderPlanResults(wos, container) {
 
   const btn = target.querySelector('#btn-replan');
   if (btn && !replanDisabled) btn.addEventListener('click', () => buildOrRebuildPlan());
+
+  // Wire up "Approve Month N" buttons. Each button flips that month's
+  // awaiting_approval WOs to planned, then re-renders the plan results.
+  target.querySelectorAll('[data-approve-month]').forEach(approveBtn => {
+    approveBtn.addEventListener('click', async () => {
+      const monthIndex = Number(approveBtn.dataset.approveMonth);
+      approveBtn.disabled = true;
+      approveBtn.textContent = 'Approving…';
+      try {
+        await http('POST', `/jobs/${state.job.id}/approve-month`, { monthIndex });
+        showToast(`Month ${monthIndex} approved — work orders are now eligible for submission.`, { kind: 'success' });
+        const wos = await http('GET', `/jobs/${state.job.id}/work-orders`);
+        await renderPlanResults(wos, container);
+      } catch (err) {
+        showToast(`Failed to approve: ${err.message}`, { kind: 'error' });
+        approveBtn.disabled = false;
+        approveBtn.textContent = `Approve Month ${monthIndex}`;
+      }
+    });
+  });
 
   $('#btn-goto-submit').hidden = false;
 }
@@ -2127,8 +2159,9 @@ async function showPlanModal(plan) {
     </ul>
     <p class="modal-note">
       Each month's batch can only ship after the org-wide monthly quota resets
-      at <b>00:00 GMT on the 1st</b>. Phase 3 (auto-resume) is not yet
-      available — for now you'll click Submit at the start of each month.
+      at <b>00:00 GMT on the 1st</b>. Months 2 and beyond require explicit
+      approval before they can ship — use the <b>Approve Month</b> button on
+      each future month in the Plan tab.
     </p>`;
 
   const choice = await showModal({

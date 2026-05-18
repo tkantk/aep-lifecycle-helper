@@ -177,6 +177,38 @@ router.get('/:id/work-orders', (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+/** Approve a specific month's work orders: flip awaiting_approval → planned.
+ *  Body: { monthIndex: number } (must be ≥ 2; Month 1 is always auto-approved).
+ *  Returns { ok: true, approved: N, monthIndex: N } — count of WOs newly made
+ *  eligible for submission. */
+router.post('/:id/approve-month', (req, res, next) => {
+  try {
+    const job = q().getJob.get(req.params.id);
+    if (!job) {
+      const err = new Error('job not found');
+      err.status = 404; err.code = 'not_found'; err.publicMessage = 'job not found';
+      return next(err);
+    }
+
+    const monthIndex = Number(req.body?.monthIndex);
+    if (!Number.isInteger(monthIndex) || monthIndex < 2) {
+      const err = new Error('monthIndex must be an integer ≥ 2 (Month 1 needs no approval)');
+      err.status = 400; err.code = 'invalid_request'; err.publicMessage = err.message;
+      return next(err);
+    }
+
+    const result = q().approveMonth.run(job.id, monthIndex);
+    if (result.changes === 0) {
+      const err = new Error(`No work orders awaiting approval for Month ${monthIndex}`);
+      err.status = 404; err.code = 'not_found'; err.publicMessage = err.message;
+      return next(err);
+    }
+
+    logger.info({ jobId: job.id, monthIndex, approved: result.changes }, 'month approved for submission');
+    res.json({ ok: true, approved: result.changes, monthIndex });
+  } catch (err) { next(err); }
+});
+
 /** Export all expanded identities as CSV. */
 router.get('/:id/export', async (req, res, next) => {
   try {

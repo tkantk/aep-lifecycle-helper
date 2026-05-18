@@ -60,7 +60,7 @@ export function planWorkOrders({ jobId, datasetIds, dailyLimit, targetServices, 
   // quota rollover and never went to Adobe.
   const existing = q().countWorkOrdersByStatus.all(jobId);
   const blocking = existing.filter(r =>
-    !['planned', 'deferred'].includes(r.status) && r.count > 0
+    !['planned', 'deferred', 'awaiting_approval'].includes(r.status) && r.count > 0
   );
   if (blocking.length > 0) {
     const summary = blocking.map(r => `${r.status}=${r.count}`).join(', ');
@@ -168,6 +168,10 @@ export function planWorkOrders({ jobId, datasetIds, dailyLimit, targetServices, 
   const previousMonths = q().getJob.get(jobId)?.projected_months ?? null;
   const distribution = redistributeUnshippedOrders(jobId, quota);
   const shifted = previousMonths != null && distribution.months > previousMonths;
+
+  // Mark WOs in Month 2+ as awaiting_approval — they require explicit operator
+  // sign-off before shipping. Month 1 stays 'planned' and is immediately eligible.
+  q().markFutureMonthsAwaitingApproval.run(jobId);
 
   logger.info({
     jobId, planned,

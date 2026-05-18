@@ -119,12 +119,24 @@ demo — never for production. See CLAUDE.md I12.
                      deleted first, so re-plan is idempotent.
                      SAFETY GUARD (CLAUDE.md I10): planWorkOrders() refuses
                      with ReplanForbiddenError (HTTP 409) if any work order on
-                     the job is in a non-{planned,deferred} state — re-emitting
-                     identity content for already-shipped orders would cause
-                     duplicate irreversible deletes. The redistributor is
-                     explicitly allowed to update (month_index, day_index)
-                     labels on un-shipped WOs only; identity content of any
-                     existing WO never changes.
+                     the job is in a non-{planned,deferred,awaiting_approval}
+                     state — re-emitting identity content for already-shipped
+                     orders would cause duplicate irreversible deletes. The
+                     redistributor is explicitly allowed to update
+                     (month_index, day_index) labels on un-shipped WOs only;
+                     identity content of any existing WO never changes.
+                     After planning, Month 2+ WOs are immediately flipped to
+                     'awaiting_approval' — they cannot ship until the operator
+                     clicks "Approve Month N" in the Plan tab (see step 5a).
+
+  5a. APPROVE        Operator-driven. For each month > 1 the Plan tab shows an
+      (Month 2+)     "Approve Month N" button next to the grouped WOs.
+                     POST /api/jobs/:id/approve-month { monthIndex } flips
+                     'awaiting_approval' → 'planned' for that month, making
+                     those WOs eligible for the next Submit run or scheduler
+                     tick. Month 1 is never gated — it ships immediately on
+                     the initial Submit. Idempotent: approving an already-
+                     approved month returns 404 (no rows changed).
 
   5. SUBMIT          Pre-submit modal: shows live remaining + planned count;
      │               operator confirms each click (always shown — destructive).
@@ -223,9 +235,12 @@ src/
 │   │                       mid-flow inserts. inFlight Set guards re-entry.
 │   │                       Planner exports ReplanForbiddenError and refuses
 │   │                       to re-emit work orders if any are in a state past
-│   │                       'planned'/'deferred'. runSubmission selects both
-│   │                       'planned' and 'deferred' so quota-deferred orders
-│   │                       actually retry after rollover.
+│   │                       'planned'/'deferred'/'awaiting_approval'. After
+│   │                       planning, markFutureMonthsAwaitingApproval flips
+│   │                       Month 2+ WOs to 'awaiting_approval'. runSubmission
+│   │                       selects both 'planned' and 'deferred'; 'awaiting_
+│   │                       approval' WOs are invisible to the submitter until
+│   │                       explicitly approved via the /approve-month route.
 │   ├── monitor.js          setInterval(60s). Picks up from wo.j_creds_id /
 │   │                       wo.j_sandbox_name (joined alias columns).
 │   ├── scheduler.js        Configurable auto-resume scheduler (Phase 3,
@@ -263,6 +278,11 @@ src/
 │   ├── adobe.js            Sandbox/dataset/namespace discovery endpoints.
 │   ├── upload.js           multipart CSV → job + expansion kickoff.
 │   └── jobs.js             Job detail, plan, submit, progress, export.
+│                           - POST /api/jobs/:id/approve-month — flips
+│                             'awaiting_approval' → 'planned' for a given
+│                             monthIndex (≥ 2). Returns 400 for monthIndex=1
+│                             (auto-submitted, no approval needed) or invalid
+│                             values; 404 when no awaiting WOs exist.
 │                           Two list endpoints:
 │                           - GET /api/jobs           — flat list, every status
 │                           - GET /api/jobs/monitor   — active-submissions feed:

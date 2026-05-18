@@ -9,6 +9,64 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-05-18 — Per-month approval gate for multi-month deletion plans
+
+Context: the client raised a concern that with multi-month plans the tool was
+automatically scheduling Month 2, 3, … for submission via the auto-resume
+scheduler — operators wanted an explicit approval checkpoint before each
+month's quota chunk ships, to allow time for reviewing the plan before
+irreversible deletes go out. This session adds a first-class `awaiting_approval`
+work-order status and a per-month "Approve Month N" action in the UI.
+
+### Backend
+
+- **`src/db.js`** — Three changes to the prepared-statement set:
+  - `deletePlannedOrders` now also deletes `awaiting_approval` rows, so
+    re-planning after an approval clears the stale WOs.
+  - New `markFutureMonthsAwaitingApproval`: flips any `planned` WOs with
+    `COALESCE(month_index, 1) > 1` to `awaiting_approval` immediately after
+    planning. Month 1 stays `planned` and ships on the first Submit click.
+  - New `approveMonth`: flips `awaiting_approval` → `planned` for a given
+    `(job_id, month_index)` pair. Used by the new route below.
+- **`src/runner/submission.js`**:
+  - `planWorkOrders` calls `markFutureMonthsAwaitingApproval` at the end,
+    so every fresh plan immediately protects Month 2+ behind the approval
+    gate.
+  - `ReplanForbiddenError` guard now allows `awaiting_approval` alongside
+    `planned` and `deferred` — these WOs have never shipped to Adobe and
+    it's safe to re-plan over them.
+- **`src/routes/jobs.js`** — New route `POST /api/jobs/:id/approve-month`
+  accepts `{ monthIndex }` (integer ≥ 2), calls `approveMonth`, and returns
+  `{ ok: true, approved: <changes>, monthIndex }`. Returns 400 for invalid
+  monthIndex (1 would approve Month 1 which is auto-submitted, so it's
+  disallowed), 404 when no `awaiting_approval` WOs exist for that month.
+
+### Frontend
+
+- **`src/web/app.js`**:
+  - `renderPlanResults` now renders "Awaiting approval" / "Approved" badges
+    on Month 2+ `<summary>` headers in the grouped work-order table.
+  - Each month with `awaiting_approval` WOs gets an approval action bar
+    with an "Approve Month N" button that POSTs to the new route and
+    re-renders the plan on success.
+  - `submittedCount` excludes `awaiting_approval` (alongside `planned` and
+    `deferred`) so the progress bar stays correct until the operator
+    explicitly approves and the WOs start shipping.
+- **`src/web/styles.css`** — Added `.pill.awaiting_approval` (blue tint) and
+  `.approval-badge` / `.approval-badge.approved` styles for the summary-row
+  indicator.
+
+### Tests
+
+- **`test/approveMonth.test.js`** — New file. 9 tests: happy path (2 WOs
+  approved), idempotency (second call returns 404), invalid monthIndex values
+  (1, 0, non-integer, missing), no awaiting WOs for the month (404), unknown
+  job (404).
+
+**178/178 tests pass.**
+
+---
+
 ## 2026-05-15 — Security & correctness fixes from code review
 
 Context: post-Phase-3 full functionality + security audit surfaced a set of

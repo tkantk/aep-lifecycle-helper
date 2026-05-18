@@ -385,7 +385,22 @@ function prepared() {
       VALUES (@id, @jobId, @dayIndex, @datasetIds, @targetServicesJson,
               @namespacesIdentities, @identifierCount, @status)
     `),
-    deletePlannedOrders: db.prepare(`DELETE FROM work_orders WHERE job_id = ? AND status = 'planned'`),
+    deletePlannedOrders: db.prepare(`DELETE FROM work_orders WHERE job_id = ? AND status IN ('planned', 'awaiting_approval')`),
+    // Mark WOs in Month 2+ as awaiting_approval after planning. These require
+    // explicit operator sign-off before they become eligible for submission.
+    // Month 1 (or NULL legacy rows) stays 'planned' and ships immediately on Submit.
+    markFutureMonthsAwaitingApproval: db.prepare(`
+      UPDATE work_orders
+         SET status = 'awaiting_approval', updated_at = datetime('now')
+       WHERE job_id = ? AND COALESCE(month_index, 1) > 1 AND status = 'planned'
+    `),
+    // Approve a specific month: flip awaiting_approval → planned so the
+    // submission runner can pick them up on the next submit/scheduler run.
+    approveMonth: db.prepare(`
+      UPDATE work_orders
+         SET status = 'planned', last_error = NULL, updated_at = datetime('now')
+       WHERE job_id = ? AND COALESCE(month_index, 1) = ? AND status = 'awaiting_approval'
+    `),
     // Order by SQLite rowid (insertion order) rather than the UUID primary key,
     // so the list reflects creation sequence instead of sorting lexicographically
     // by a random hex string. Includes 'deferred' rows so that re-running
