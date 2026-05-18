@@ -132,6 +132,17 @@ with auto-populated forms and live quota banners.
 │              │  totals. Pre-plan modal confirms before locking in
 │              │  if months > 1 OR timeline shifted. (RQ-2 routing:
 │              │  1-mo shift = toast; ≥2-mo shift = modal.)
+│              │  After planning, Month 2+ WOs are flipped to
+│              │  'awaiting_approval' — invisible to Submit until
+│              │  the operator approves each month (step 4a).
+└──────┬───────┘
+       ▼
+┌──────────────┐  Operator-driven. Plan tab shows "Approve Month N"
+│ 4a. Approve  │  button for each month > 1 that has awaiting_approval
+│ (Month 2+)   │  WOs. POST /api/jobs/:id/approve-month { monthIndex }
+│              │  flips awaiting_approval → planned for that month.
+│              │  Month 1 is never gated — it ships immediately.
+│              │  Idempotent: re-approving returns 404 (no rows changed).
 └──────┬───────┘
        ▼
 ┌──────────────┐  Pre-submit modal (always shown — destructive) with live
@@ -516,6 +527,7 @@ Origin or Referer), and registerUuidParamGuards on `:id` / `:credsId`.
 | GET  | `/api/jobs/:id` | Job detail + namespace breakdown + local-ledger quota peek |
 | GET  | `/api/jobs/:id/progress` | Live expansion progress (fast path) |
 | POST | `/api/jobs/:id/plan` | Build work-order plan. Server-side fetches `/quota` first; planner emits initial day-bucketed WOs then redistributor re-buckets into month×day. Returns `{ planned, days, months, perMonthCounts, totalIdentifiers, shiftedFromPrevious, previousMonths, quota }`. 503 with `quota_unavailable` if Adobe is unreachable + no recent cache |
+| POST | `/api/jobs/:id/approve-month` | Flip `awaiting_approval` → `planned` for `{ monthIndex }` (≥ 2). 400 for monthIndex=1/non-integer; 404 if no awaiting WOs |
 | POST | `/api/jobs/:id/submit` | Kick off submission. Body: `{ dayIndex?, monthIndex? }`. Server runs redistributor against fresh `/quota` before picking work |
 | GET  | `/api/jobs/:id/work-orders` | All work orders (month_index + day_index + per-service status from product_status_details) |
 | GET  | `/api/jobs/:id/export` | Download expanded identities CSV (formula-injection sanitised) |

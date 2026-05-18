@@ -322,16 +322,25 @@ already received, and the next Submit would create **duplicate
 irreversible deletes**.
 
 The planner refuses by throwing `ReplanForbiddenError` (HTTP 409)
-when any work order on the job is in a state other than `planned` or
-`deferred`. Deferred is fine — those rows never went to Adobe. The UI
-in `web/app.js` mirrors the guard: the Plan tab no longer auto-POSTs
-`/plan` on tab entry, and the "↻ Re-plan" button auto-disables once any
-order has shipped, with a tooltip explaining why.
+when any work order on the job is in a state other than `planned`,
+`deferred`, or `awaiting_approval`. The first two never went to Adobe;
+`awaiting_approval` is a pre-ship gate for Month 2+ and also never went
+to Adobe — all three are safe to re-plan over. The UI in `web/app.js`
+mirrors the guard: the Plan tab no longer auto-POSTs `/plan` on tab
+entry, and the "↻ Re-plan" button auto-disables once any order has
+shipped, with a tooltip explaining why.
 
-**Phase 2 refinement (2026-05-15):** `runner/redistributor.js::redistributeUnshippedOrders`
-is allowed to update `(day_index, month_index)` on un-shipped (planned /
-deferred) work orders to match the live Adobe `/quota`. This is *not*
-re-planning — the `namespaces_identities` JSON (the actual identity
+**Phase 2 refinement (2026-05-15):** At the end of `planWorkOrders`,
+`markFutureMonthsAwaitingApproval` flips all Month 2+ WOs from `planned`
+to `awaiting_approval`. These WOs are invisible to `runSubmission` (and
+the scheduler) until the operator explicitly clicks "Approve Month N" in
+the Plan tab (`POST /api/jobs/:id/approve-month`), which flips them back
+to `planned`. Month 1 is never gated and ships on the first Submit click.
+
+`runner/redistributor.js::redistributeUnshippedOrders` is allowed to
+update `(day_index, month_index)` on un-shipped (planned / deferred /
+awaiting_approval) work orders to match the live Adobe `/quota`. This is
+*not* re-planning — the `namespaces_identities` JSON (the actual identity
 content) of any existing WO never changes. Only the bucket labels do.
 Shipped WOs are read-only. The redistributor runs:
 - at the end of `planWorkOrders` (so plan time uses live quota),
@@ -340,7 +349,8 @@ Shipped WOs are read-only. The redistributor runs:
 
 If you add new flow that mutates work-order state, ensure the planner's
 guard sees it. If you add new statuses, decide whether they should be
-on the "safe to re-plan / re-bucket" list (currently `planned` and `deferred`).
+on the "safe to re-plan / re-bucket" list (currently `planned`, `deferred`,
+and `awaiting_approval`).
 
 ### I11. Adobe POST retries are gated by a per-request idempotency flag
 
@@ -656,6 +666,7 @@ Local API surface (under `/api/`, loopback only):
 | POST   | `/api/config/credentials/test`     | IMS auth check via stored id or inline creds                             |
 | GET    | `/api/jobs?limit&offset`           | List jobs by `created_at DESC` (every status, every sandbox)             |
 | GET    | `/api/jobs/monitor?limit&search&sandbox` | **Active-submissions feed** for the Monitor tab. Returns `{ rows, totals, sandboxes }`. Rows are jobs with ≥1 Adobe-acked work order, sorted **in-flight-first** (`(in_flight_count > 0) DESC`) then by `latest_activity_at DESC` so still-pending jobs never get pushed off-screen by recently-completed ones. Optional sandbox filter. `totals` are job-level dashboard counts (`in_flight` / `has_failed` / `all_completed` / `total`) across ALL matching jobs (not capped by limit). `sandboxes` is the distinct sandbox list (with per-sandbox job counts) for the filter chip row. |
+| POST   | `/api/jobs/:id/approve-month`      | Flip `awaiting_approval` → `planned` for `{ monthIndex }` (integer ≥ 2). Returns `{ ok, approved, monthIndex }`. 400 for monthIndex=1 or non-integer; 404 when no awaiting WOs exist for that month. |
 
 Host: `https://platform.adobe.io` for everything **except** Identity APIs,
 which require `https://platform-{region}.adobe.io` (region ∈ `va7`, `nld2`,

@@ -106,6 +106,14 @@ fast bandwidth and aren't getting 429'd.
                    re-bucketed by the LIVE Adobe quota into Month × Day
                    buckets. Multi-month plans surface a confirmation
                    modal with a per-month breakdown.
+                   Month 2+ work orders are immediately placed in
+                   'awaiting approval' — they cannot ship until the
+                   operator clicks "Approve Month N" in the Plan tab.
+      ↓
+4a. Approve        For each month beyond Month 1 an "Approve Month N"
+    Month 2+       button appears in the Plan tab. Clicking it unlocks
+                   that month's work orders for the next Submit run.
+                   Month 1 ships immediately — no extra click needed.
       ↓
 5. Submit          Pre-submit modal shows planned vs Adobe's current
                    remaining. POST each work order to /hygiene/workorder.
@@ -224,6 +232,7 @@ All under `/api/` on `http://127.0.0.1:3000`.
 | GET | `/api/jobs/:id` | Job detail + namespace breakdown + quota peek |
 | GET | `/api/jobs/:id/progress` | Live expansion progress (fast path) |
 | POST | `/api/jobs/:id/plan` | Build work-order plan (auto re-buckets against live quota) |
+| POST | `/api/jobs/:id/approve-month` | Approve Month N for submission. Body: `{monthIndex}` (≥ 2) |
 | POST | `/api/jobs/:id/submit` | Submit work orders. Body: `{dayIndex?, monthIndex?}` |
 | GET | `/api/jobs/:id/work-orders` | All work orders + per-service status |
 | GET | `/api/jobs/:id/export` | Download expanded identities CSV (formula-injection sanitized) |
