@@ -15,6 +15,18 @@ into work orders ≤ 100k each, and submits them to the Data Hygiene record-dele
 API. Destructive. Irreversible. Every invariant in `CLAUDE.md` exists because
 getting it wrong deletes real customer data.
 
+**Runtime requirement: Node.js 20 LTS** (`engines: ">=20.0.0"` in `package.json`).
+The tool uses `node --test` (built-in test runner, Node 18+), `node --watch`
+(Node 18+), and `better-sqlite3` (native addon, must compile during `npm install`).
+Node 20 is the minimum version where all three are stable together.
+
+- **Windows**: install via [nvm-windows](https://github.com/coreybutler/nvm-windows/releases)
+  (`nvm install 20 && nvm use 20`). Move `data/` outside OneDrive — see README §Install.
+- **Linux / macOS**: install via [nvm](https://github.com/nvm-sh/nvm)
+  (`nvm install 20 && nvm alias default 20`).
+
+Verify with `node --version` (must print `v20.x.x` or higher) before `npm install`.
+
 ---
 
 ## 2. Topology

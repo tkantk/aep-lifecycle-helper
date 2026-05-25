@@ -42,13 +42,78 @@ also handles:
 
 ## Install & run
 
-Requires **Node.js 20+**.
+Requires **Node.js 20 LTS** (the tool uses `node --test`, `node --watch`, and
+`better-sqlite3`'s native addon — all stable on Node 20+).
+
+### Step 1 — Install Node.js 20
+
+Use a version manager so you can switch Node versions per-project without
+touching the system install.
+
+<details>
+<summary><strong>Windows</strong></summary>
+
+1. Download and run the **nvm-windows** installer from
+   https://github.com/coreybutler/nvm-windows/releases  
+   (pick `nvm-setup.exe` from the latest release).
+
+2. Open a **new** PowerShell window (the PATH update takes effect in new shells):
+
+   ```powershell
+   nvm install 20
+   nvm use 20
+   node --version   # should print v20.x.x
+   ```
+
+3. If you already have another Node version set as default, `nvm use 20` is
+   per-session. To make it permanent:
+
+   ```powershell
+   nvm alias default 20   # nvm-windows ≥ 1.2 supports aliases
+   ```
+
+> **OneDrive warning** — the default Documents folder is synced by OneDrive on
+> most corporate Windows machines. SQLite's WAL journal files can be locked by
+> the sync client and cause `SQLITE_BUSY` errors under load. Set `DATA_DIR` in
+> `.env` to a path outside OneDrive (e.g. `C:\Users\you\AppData\Local\aep-lh`).
+> The app prints a warning at startup when it detects a cloud-sync path.
+
+</details>
+
+<details>
+<summary><strong>Linux / macOS</strong></summary>
+
+1. Install **nvm**:
+
+   ```bash
+   curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
+   # Then restart your shell, or:
+   source ~/.bashrc   # or ~/.zshrc on macOS
+   ```
+
+2. Install and activate Node 20:
+
+   ```bash
+   nvm install 20
+   nvm use 20
+   node --version   # should print v20.x.x
+   ```
+
+3. To make it the default for all new shells:
+
+   ```bash
+   nvm alias default 20
+   ```
+
+</details>
+
+### Step 2 — Run the tool
 
 ```bash
 unzip aep-lifecycle-helper.zip
 cd aep-lifecycle-helper
-npm install
-npm start
+npm install          # compiles the better-sqlite3 native addon
+npm start            # opens http://localhost:3000
 ```
 
 The tool opens `http://localhost:3000` in your default browser. That's it.
@@ -340,7 +405,7 @@ and stay well under Adobe's rate limits.
 
 ```bash
 npm run dev      # auto-restart on file changes
-npm test         # 169 tests, mocked Adobe via nock
+npm test         # 178 tests, mocked Adobe via nock
 ```
 
 To reset everything (delete all jobs + credentials):
