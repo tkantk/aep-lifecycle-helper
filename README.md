@@ -390,14 +390,56 @@ and stay well under Adobe's rate limits.
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | `401` from Adobe | Bad creds / wrong IMS org | Click **Test Connection** on the Environment tab |
+| `403` on quota or plan — "needs Data Hygiene product profile" | Integration lacks hygiene permissions | See **Permissions** section below |
 | `429` spikes during expansion | Concurrency too high | Lower `IDENTITY_CONCURRENCY` in `.env` |
 | Expansion stuck at 0% | No Identity Graph data for namespace | Verify the source namespace matches what's in AEP |
 | `Work order has N ids, exceeds per-order limit` | Bug in planner | Re-run plan step (orders are re-created) |
-| Plan blocked with "Adobe quota unreachable" | Network or permission issue | Confirm IMS auth still valid; click ↻ Refresh on the quota panel |
+| Plan blocked with "Adobe quota unreachable" | `/quota` returned 403/network error or no recent cache | Check permissions first (see below); then confirm IMS auth is still valid |
 | Submit denied: `quota_unavailable` 503 | Adobe `/quota` outage + no recent cache | Try again once Adobe is reachable; the 24h hard floor protects against blind shipping |
 | `quota: N/M used` on work order | Daily cap hit | Re-run submit after UTC midnight, or enable auto-resume |
 | `Cannot find module 'better-sqlite3'` | Native build step skipped | `npm install` must complete; it compiles the native module |
 | Auto-resume didn't fire on the 1st | Laptop was off at the scheduled time | The startup tick catches up automatically next time the app runs |
+
+### Permissions required in Adobe Admin Console
+
+The quota endpoint (`GET /data/core/hygiene/quota`), the plan step, and all
+work-order submission routes require the same Data Lifecycle product profile.
+**There is no separate read-only quota permission** — read and write are bundled.
+
+**Minimum permissions for the integration's technical account:**
+
+1. Log into [adminconsole.adobe.com](https://adminconsole.adobe.com) as a
+   System Admin.
+2. Go to **Products → Adobe Experience Platform** → open (or create) the
+   product profile the integration is assigned to.
+3. On the **Permissions** tab, enable all of the following:
+
+   | Permission category | Permissions to enable |
+   |---|---|
+   | **Data Lifecycle** | `View Data Lifecycle` + `Manage Data Lifecycle` |
+   | **Sandboxes** | The sandbox(es) being used (e.g. Prod) |
+   | **Identity Management** | `View Identity Namespaces` (required for expansion) |
+
+4. Save. Wait ~5 minutes for token propagation, or click **Test Connection**
+   again to force a fresh IMS token.
+
+> **Service Account (JWT) vs Server-to-Server OAuth**: if the integration was
+> created as a legacy JWT credential, the technical account email
+> (`<uuid>@techacct.adobe.com`) must be explicitly added as a member of the
+> product profile — it is not enough to just add permissions to the profile.
+> OAuth Server-to-Server credentials (the current type) only need the profile
+> permissions set.
+
+**How to read the error the tool surfaces:** when the tool gets a `403` from
+Adobe, it automatically appends a hint to the error message:
+
+- `/hygiene/` path → `needs Data Hygiene product profile + "Delete Record" permission`
+- `/idnamespace/` path → `needs Identity read access`
+- `/identity/clusters/` path → `needs Identity Service access on this region`
+- `/sandbox-management/` path → `needs Sandbox Administration read access`
+- `/catalog/` path → `needs Catalog read access`
+
+The exact message appears in the UI error banner and in `data/app.log`.
 
 ---
 
