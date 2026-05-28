@@ -113,9 +113,16 @@ demo — never for production. See CLAUDE.md I12.
   3. EXPAND          CSV stream → 1000-ID batches → p-limit(10) workers POST
      │               /identity/clusters/members. Response parsed from
      ▼               {clusters:[{compositeXid, members}]}. Each member canonicalized
-                     via namespace registry index → {code, id}. INSERT OR IGNORE
-                     into expanded_identities (unique on job_id, ns_code, ns_id,
-                     identity_id). Live progress map in memory for the UI.
+                     via namespace registry index → {code, id}. Plain INSERT into
+                     expanded_identities (no unique index — dedup is deferred to
+                     planning time via GROUP BY in streamIdentitiesBySource).
+                     Wave-based scheduling: WAVE_SIZE = concurrency × 2 tasks run
+                     in parallel; onRow is async so the CSV stream pauses when the
+                     wave fills, capping peak heap at O(concurrency × batchSize)
+                     regardless of job size. After all waves drain, a single
+                     COUNT DISTINCT query computes the true deduplicated found_count
+                     and writes it via setFoundCount. Live progress map in memory
+                     for the UI poll path.
 
   4. PLAN            Iterate expanded_identities ORDER BY source_id, ns_code.
      │               Bundle identities by cluster. Pack bundles into work orders
@@ -175,14 +182,16 @@ demo — never for production. See CLAUDE.md I12.
                                  into other jobs.
                      Guarded against concurrent runs via in-process inFlight Set.
 
-  6. MONITOR         setInterval(60s). Query up to 30 open work orders where
+  6. MONITOR         setInterval(60s). Query up to 100 open work orders where
      │               adobe_workorder_id IS NOT NULL AND status NOT terminal.
-     ▼               GET /hygiene/workorder/{id}. Persist status transitions
-                     through received → validated → submitted → ingested → completed.
+     ▼               pLimit(5) concurrent GET /hygiene/workorder/{id} calls
+                     (was serial). Persist status transitions through received
+                     → validated → submitted → ingested → completed.
                      productStatusDetails surfaced per-work-order in the
                      Monitor tab (Identity Service / Profile Service / Journey
                      Orchestrator / Data Management rows). Transient errors
-                     retry on the next tick.
+                     retry on the next tick. At 1,500+ open WOs the full poll
+                     cycle completes in ~15 min instead of the old ~52 min.
 
   7. AUTO-RESUME     setInterval(60s). Reads operator-configured settings
      (Phase 3)       (enabled, localTime HH:MM, days). When shouldFireNow()
@@ -203,8 +212,18 @@ src/
 ├── index.js                Express entrypoint. Mounts routes, boots monitor.
 ├── config.js               Env-overridable defaults (port, paths, Adobe hosts,
 │                           concurrency knobs, daily cap, timeouts).
+│                           sqliteCacheMb: SQLITE_CACHE_MB env var (default
+│                           512 MB; use 8192 on a 32 GB laptop, 2048+ on a
+│                           server — see README §Tuning for large jobs).
 ├── db.js                   SQLite open + schema init + prepared statements.
 │                           MUST mkdir data/ before connecting (ESM hoist gotcha).
+│                           Pragmas: WAL, NORMAL sync, cache_size from
+│                           config.sqliteCacheMb (negative = KB), wal_autocheckpoint
+│                           8000 pages (~32 MB — reduces Defender scan frequency
+│                           8× vs the default 1000 page / ~4 MB threshold).
+│                           expanded_identities has NO unique index (dropped at
+│                           boot via migration). Dedup is done at planning time
+│                           by streamIdentitiesBySource's GROUP BY clause.
 │
 ├── middleware/             Security middleware: hostHeaderGuard, origin/
 │   └── security.js         referer guard, UUID param guards, centralised
@@ -238,13 +257,22 @@ src/
 │                           skips the monthly ledger on BOTH operations.
 │
 ├── runner/                 In-process background work.
-│   ├── expansion.js        CSV stream → Identity Graph → SQLite. Resolves
-│   │                       source nsid from the registry when the UI didn't send
-│   │                       one. Logs linkedTotal per batch so ops can tell if
-│   │                       Adobe returned anything.
-│   ├── submission.js       Planner + quota-gated submission. Uses .all() (not
-│   │                       .iterate()) so SQLite connection isn't held during
-│   │                       mid-flow inserts. inFlight Set guards re-entry.
+│   ├── expansion.js        CSV stream → Identity Graph → SQLite. Wave-based
+│   │                       scheduling (WAVE_SIZE = concurrency × 2); onRow is
+│   │                       async so the stream pauses at each wave boundary —
+│   │                       caps peak heap regardless of job size. Plain INSERT
+│   │                       (no OR IGNORE) — O(1) per row; no B-tree lookup.
+│   │                       After all batches finish, COUNT DISTINCT computes
+│   │                       the true deduped found_count and persists it.
+│   │                       Resolves source nsid from the registry when the UI
+│   │                       didn't send one. Logs linkedTotal per batch.
+│   ├── submission.js       Planner + quota-gated submission. All insertWorkOrder
+│   │                       calls are wrapped in a single db.transaction() — one
+│   │                       fsync for 1,500+ work orders instead of one per WO
+│   │                       (cuts planning from minutes to seconds on Windows).
+│   │                       Uses .all() (not .iterate()) so SQLite connection
+│   │                       isn't held during mid-flow inserts. inFlight Set
+│   │                       guards re-entry.
 │   │                       Planner exports ReplanForbiddenError and refuses
 │   │                       to re-emit work orders if any are in a state past
 │   │                       'planned'/'deferred'/'awaiting_approval'. After
@@ -253,8 +281,10 @@ src/
 │   │                       selects both 'planned' and 'deferred'; 'awaiting_
 │   │                       approval' WOs are invisible to the submitter until
 │   │                       explicitly approved via the /approve-month route.
-│   ├── monitor.js          setInterval(60s). Picks up from wo.j_creds_id /
-│   │                       wo.j_sandbox_name (joined alias columns).
+│   ├── monitor.js          setInterval(60s). pLimit(5) concurrent status GETs;
+│   │                       polls up to 100 open WOs per tick (was serial / 30).
+│   │                       Picks up from wo.j_creds_id / wo.j_sandbox_name
+│   │                       (joined alias columns).
 │   ├── scheduler.js        Configurable auto-resume scheduler (Phase 3,
 │   │                       2026-05-15). setInterval(60s) tick that fires
 │   │                       when shouldFireNow() agrees with the operator's
@@ -345,7 +375,7 @@ src/
     │                       gradient tile shows it in white.
     └── fonts/              Self-hosted Source Sans 3 woff2 (OFL-licensed, 4 weights).
 
-test/                       node --test. 169 tests covering hygiene validators,
+test/                       node --test. 178 tests covering hygiene validators,
                             namespace canonicalization, IMS token cache, quota
                             atomicity (incl. monthly-disabled release gating),
                             planWorkOrders cluster packing + day rollover +
@@ -422,7 +452,7 @@ data/                       Runtime state; in .gitignore.
 | `credentials` | AES-GCM encrypted secrets | UNIQUE(environment, ims_org_id, client_id) |
 | `sandbox_configs` | Cached sandbox metadata + datasets + namespaces | PK(creds_id, sandbox_name) |
 | `jobs` | One per upload. Status: created → expanding → expanded → ready → submitting → submitted/partial/failed. `projected_months` (Phase 2) tracks the redistributor's max month_index for shift detection. | FK creds_id |
-| `expanded_identities` | One row per (cluster member, source). Dedup via unique index | UNIQUE(job_id, COALESCE(ns_code,''), COALESCE(ns_id,0), identity_id) |
+| `expanded_identities` | One row per (cluster member, source). No unique index — dedup deferred to planning via `GROUP BY` in `streamIdentitiesBySource`. idx_ei_job_source and idx_ei_job_ns remain for fast WHERE lookups. | FK job_id |
 | `work_orders` | One per Adobe work order. Statuses: planned → submitting → submitted → completed/failed/deferred. `month_index` (Phase 2) + `day_index` form the bucket label assigned by the redistributor on un-shipped WOs only. | FK job_id, ordered by rowid |
 | `quota_usage` | Daily local ledger: (ims_org_id, utc_date) → used | PK |
 | `quota_usage_monthly` | Monthly local ledger: (ims_org_id, utc_year_month) → used | PK |
