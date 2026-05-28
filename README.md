@@ -226,6 +226,16 @@ MAX_IDS_PER_WORK_ORDER=100000
 DAILY_IDENTIFIER_LIMIT=1000000        # FALLBACK ONLY — live /quota wins
 MONTHLY_IDENTIFIER_LIMIT=3000000      # FALLBACK ONLY — live /quota wins
 
+# SQLite page cache (MB). Larger cache = fewer disk reads during expansion
+# and planning. Each MB covers ~256 4 KB B-tree pages.
+# Recommended values:
+#   16 GB laptop  →  SQLITE_CACHE_MB=1024
+#   32 GB laptop  →  SQLITE_CACHE_MB=8192   (entire B-tree fits in RAM)
+#   dedicated server (8–16 GB RAM) →  SQLITE_CACHE_MB=2048
+#   dedicated server (32+ GB RAM) →  SQLITE_CACHE_MB=4096
+# Default is 512 MB (safe for any machine with ≥4 GB RAM).
+SQLITE_CACHE_MB=512
+
 # Run state location. Move out of OneDrive / Dropbox / etc. on Windows.
 DATA_DIR=/custom/path
 DB_PATH=/custom/path/state.db
@@ -361,6 +371,26 @@ All under `/api/` on `http://127.0.0.1:3000`.
 Concurrency knobs (`IDENTITY_CONCURRENCY`, `WORK_ORDER_CONCURRENCY`) tune
 how many Adobe API calls run in parallel. The defaults are conservative
 and stay well under Adobe's rate limits.
+
+### Tuning for large jobs
+
+For jobs with 1M+ source IDs, two settings make the biggest difference:
+
+| Machine | `SQLITE_CACHE_MB` | `IDENTITY_CONCURRENCY` | Notes |
+|---------|------------------|----------------------|-------|
+| 16 GB laptop | `1024` | `10` (default) | B-tree hot path fits in cache |
+| 32 GB laptop | `8192` | `15` | Entire B-tree in RAM, no disk degradation |
+| Dedicated server (8–16 GB RAM) | `2048` | `15–20` | More stable network, higher throughput |
+| Dedicated server (32+ GB RAM) | `4096` | `20` | Well below Adobe 429 threshold |
+
+`SQLITE_CACHE_MB=8192` is the most impactful single change for a 32 GB machine —
+it keeps all B-tree pages in RAM so insert throughput stays constant even at
+8M+ rows in `expanded_identities`.
+
+Raising `IDENTITY_CONCURRENCY` beyond 20 risks `429` responses from Adobe's
+Identity Graph. The tool backs off automatically, but a sustained 429 rate
+slows expansion more than the extra concurrency gains. Start at 15, monitor
+for warn-level `retrying` log lines, and bump by 5 at a time if you see none.
 
 ---
 
