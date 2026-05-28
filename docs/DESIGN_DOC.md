@@ -1,821 +1,1183 @@
-# Design Document — AEP Data Lifecycle Helper
-
-**Status**: implemented, tested, production-ready for single-operator use
-**Last updated**: 2026-04-23
-**Author**: tushark (Adobe) with AI pair-programming assistance
-**Audience**: engineers maintaining or extending the tool, reviewers auditing
-behavior against Adobe Experience Platform's Data Hygiene API contract.
+# AEP Data Lifecycle Helper
+## Design & Architecture Document
 
 ---
 
-## 1. Executive summary
-
-The AEP Data Lifecycle Helper is a local, single-process Node.js application
-that submits bulk record-delete work orders to Adobe Experience Platform via
-the Data Hygiene API. An operator supplies a CSV of source identifiers
-(typically `hashedKocid`, but any namespace is supported), and the tool:
-
-1. Expands each source identifier into its full Identity Graph cluster to find
-   every linked identity (email, phone, ECID, CRMID, etc.),
-2. Packs the resulting identities into ≤ 100,000-identifier work orders,
-3. Respects Adobe's daily and monthly identifier caps,
-4. Submits the work orders to Adobe's Hygiene API,
-5. Polls each work order's status until it reaches a terminal state,
-6. Recovers gracefully from process crashes without data loss or duplicate deletions.
-
-**Why this tool exists.** Adobe provides Data Hygiene as an API-only service.
-Operating it at scale — across tens to hundreds of thousands of identifiers —
-requires careful coordination of identity resolution, rate-limit compliance,
-and idempotent submission. Doing this via ad-hoc scripts risks silent
-misbehavior against an irreversible, destructive API. This tool codifies the
-correct behavior, validates every payload before the wire, tracks state
-durably in SQLite, and exposes a browser UI for the operator.
-
-**Stakes.** Work orders are asynchronous AND irreversible. A malformed payload
-that happens to pass Adobe's validation will quietly delete the wrong data.
-Every design decision in this document is shaped by that constraint.
+| Field        | Value                                           |
+|--------------|-------------------------------------------------|
+| Version      | 2.0.0                                           |
+| Date         | 2026-05-28                                      |
+| Status       | Production-ready                                |
+| Author       | Tushar Kant Kar (Adobe)                         |
+| Audience     | Client teams, platform architects, reviewers    |
 
 ---
 
-## 2. System overview
+## Table of Contents
 
-### 2.1 Topology
-
-Single Node.js process, `http://127.0.0.1:3000` (loopback-only by default;
-override with `HOST` env var for SSH-tunneled demos only). No distributed
-components.
-All state in one SQLite file (`data/state.db`, WAL mode). All secrets
-AES-256-GCM encrypted at rest. IMS tokens cached in memory. UI is vanilla
-HTML/CSS/JS — no build step, no framework. Tests use Node's built-in
-`node --test` runner and `nock` for HTTP mocking.
-
-### 2.2 Component diagram
-
-```
-                127.0.0.1:3000
-   ┌────────────────────────────────────────────────────────┐
-   │  Browser UI (vanilla JS)                               │
-   │   ↕ fetch /api/*                                       │
-   │  Express API                                           │
-   │    ├─ routes/config.js        Credentials CRUD         │
-   │    ├─ routes/adobe.js         Sandbox/dataset/NS disc. │
-   │    ├─ routes/upload.js        CSV → job creation       │
-   │    └─ routes/jobs.js          Plan / submit / progress │
-   │                                                        │
-   │  In-process runners                                    │
-   │    ├─ runner/expansion.js     CSV → Identity Graph     │
-   │    ├─ runner/submission.js    Plan + quota-gated POST  │
-   │    ├─ runner/monitor.js       60s status poll          │
-   │    └─ runner/recovery.js      Boot-time reconciliation │
-   │                                                        │
-   │  Services (Adobe-facing)                               │
-   │    ├─ services/imsAuth.js     Token cache              │
-   │    ├─ services/adobeClient.js axios + retry + auth     │
-   │    ├─ services/sandboxes.js                            │
-   │    ├─ services/datasets.js                             │
-   │    ├─ services/namespaces.js                           │
-   │    ├─ services/identityGraph.js                        │
-   │    ├─ services/hygiene.js     Workorder validation     │
-   │    └─ services/quotaManager.js Daily + monthly ledger  │
-   │                                                        │
-   │  SQLite (WAL, data/state.db)                           │
-   │    ├─ credentials                                      │
-   │    ├─ sandbox_configs                                  │
-   │    ├─ jobs                                             │
-   │    ├─ expanded_identities                              │
-   │    ├─ work_orders                                      │
-   │    ├─ quota_usage                                      │
-   │    └─ quota_usage_monthly                              │
-   └────────────────────────────────────────────────────────┘
-```
-
-### 2.3 Data flow (happy path)
-
-1. **Configure** — operator enters IMS credentials; tool tests via
-   `POST /ims/token/v3`, loads sandboxes via
-   `GET /data/foundation/sandbox-management/`. On sandbox pick, tool loads
-   datasets (filtered to Identity-enabled via the `unifiedIdentity: enabled:true`
-   tag) and the namespace registry in parallel, caching both.
-2. **Upload** — CSV streamed to `data/uploads/`; row count tallied; a `jobs`
-   row is created in status `expanding`.
-3. **Expand** — CSV stream → 1,000-ID batches → `p-limit(10)` parallel
-   `POST /identity/clusters/members` calls. Each response's `clusters[*].members`
-   are canonicalized using the registry and dedup-inserted into
-   `expanded_identities`.
-4. **Plan** — iterate `expanded_identities` sorted by `(source_id, ns_code)`.
-   Bundle identities per cluster; pack bundles into work orders ≤ 100k IDs.
-   Assign `day_index` to each work order, advancing when today's running total
-   would exceed the daily cap. Previously-planned rows are deleted so re-plan
-   is idempotent. **Re-planning is GUARDED**: if any work order on the job is
-   in a state past `planned`/`deferred`, the planner throws
-   `ReplanForbiddenError` (HTTP 409) — re-emitting orders for already-shipped
-   identities would cause duplicate irreversible deletes (CLAUDE.md I10).
-5. **Submit** — per work order in `planned` OR `deferred` state, atomically
-   reserve quota (daily AND monthly). If granted, `POST /data/core/hygiene/
-   workorder` (non-idempotent — never auto-retries on 5xx/network; CLAUDE.md
-   I11). On success, record Adobe's work-order ID. If quota denied, mark
-   `deferred` — the next submit run after UTC rollover picks it up. On
-   failure, `release(count, monthlyLimit)` (skips monthly when null), mark
-   `failed`.
-6. **Monitor** — every 60 seconds, `GET /data/core/hygiene/workorder/{id}` for
-   each non-terminal work order. Persist status transitions.
-
-### 2.4 Recovery flow
-
-On process startup, after schema init and monitor start:
-
-- **Resume expanding jobs.** For each job with `status='expanding'`, build
-  a Set of already-processed `source_id`s from `expanded_identities` and
-  restart expansion with `skipSourceIds` — the CSV is re-read but already-done
-  rows are skipped, so no redundant Adobe calls.
-- **Reconcile orphan work orders.** For each work order with
-  `status='submitting' AND adobe_workorder_id IS NULL` (the crash window
-  between `reserve()` and the POST returning), best-effort look up the work
-  order in Adobe by `displayName` prefix. Three outcomes:
-    - **Match** — record the Adobe ID and let the monitor take over.
-    - **Confirmed no-match** (Adobe responded 200, our row not in the list) —
-      roll back to `planned` and release the quota so the next submit run
-      can retry cleanly.
-    - **Indeterminate** (Adobe returned 400 from the listing endpoint, OR a
-      transient 5xx/network error) — leave the orphan in `submitting`. The
-      next startup retries. Critically, **we never roll back when the answer
-      is indeterminate**, because rolling back would risk a duplicate Adobe
-      work order if the original POST had actually been processed.
+1. [Executive Summary](#1-executive-summary)
+2. [System Architecture](#2-system-architecture)
+3. [End-to-End Data Flow](#3-end-to-end-data-flow)
+4. [Work Order Lifecycle](#4-work-order-lifecycle)
+5. [Multi-Month Quota Planning](#5-multi-month-quota-planning)
+6. [Adobe API Integration](#6-adobe-api-integration)
+7. [Security Architecture](#7-security-architecture)
+8. [Environment Configuration Reference](#8-environment-configuration-reference)
+9. [Operational Procedures](#9-operational-procedures)
+10. [Design Decisions](#10-design-decisions)
+11. [Known Limitations & Extension Points](#11-known-limitations--extension-points)
+12. [Appendix — File Map](#12-appendix--file-map)
 
 ---
 
-## 3. Adobe API contracts
+## 1. Executive Summary
 
-### 3.1 IMS token — `POST /ims/token/v3`
+### What This Tool Does
 
-Grant type: `client_credentials`. Returns a bearer token with
-`expires_in ≈ 86,400` (24 hours). We refresh 120 seconds before expiry.
-Cached in memory keyed by `(clientId, imsOrgId)`; concurrent callers share
-the same in-flight promise (thundering-herd guard). On 401 from any Adobe API,
-the cache is invalidated and the next call re-authenticates.
+The **AEP Data Lifecycle Helper** is a secure, operator-run application that
+executes bulk identity deletion requests against Adobe Experience Platform (AEP)
+via the Data Hygiene API. An operator supplies a CSV of source identifiers
+(typically hashed customer identifiers such as `hashedKocid`), and the tool
+automatically:
 
-### 3.2 Sandbox listing
+1. **Expands** each source identifier through the AEP Identity Graph to discover
+   every linked identity — email addresses, phone numbers, ECIDs, CRMIDs, custom
+   namespace IDs, and more.
+2. **Plans** the resulting identities into work orders of up to 100,000 identifiers
+   each, respecting both Adobe's per-day and per-month deletion quotas.
+3. **Submits** each work order to Adobe's Data Hygiene API in a quota-safe,
+   crash-safe, and duplicate-safe manner.
+4. **Monitors** every submitted work order to completion, surfacing status in
+   a browser dashboard.
 
-`GET platform.adobe.io/data/foundation/sandbox-management/?limit=100&offset=0`
+### Why It Was Built
 
-No `x-sandbox-name` header (the endpoint lists sandboxes, so it operates
-org-wide). Response: `{sandboxes: [{name, title, state, type, region, isDefault}]}`.
-We filter to `state === 'active'` and stop paginating when a page returns
-fewer than `limit` results (safety cap at offset 1000).
+Adobe's Data Hygiene service is an API-only offering. Managing bulk deletions at
+scale — across tens of thousands to millions of identifiers — requires careful
+orchestration of identity resolution, quota compliance, idempotent submission, and
+crash recovery. Ad-hoc scripting against this API risks silent failures against an
+irreversible destructive operation. This tool codifies the correct behavior, validates
+every payload before it touches Adobe's API, and tracks all state durably so
+operators can stop and resume at any time.
 
-### 3.3 Dataset listing
+### Key Capabilities
 
-`GET platform.adobe.io/data/foundation/catalog/dataSets?limit=100&start=0&properties=name,description,tags,schemaRef,state`
+| Capability                     | Detail                                                         |
+|--------------------------------|----------------------------------------------------------------|
+| Identity graph expansion       | Follows all identity links via AEP's Private Graph             |
+| Multi-namespace support        | Email, phone, ECID, CRMID, GAID, IDFA, custom namespaces       |
+| Quota-aware planning           | Respects daily (default 1M/day) and monthly caps               |
+| Multi-month batching           | Spans deletions across calendar months with per-month approval |
+| Crash-safe submission          | Startup recovery reconciles any orphaned work orders           |
+| Encrypted credential storage   | AES-256-GCM for all Adobe client secrets at rest               |
+| Auto-resume scheduler          | Configurable daily schedule for unattended quota rollovers     |
+| Profile-only mode              | Deletes from Identity + Profile + AJO without touching data lake |
 
-Response is a **dict keyed by dataset id**, not an array. We filter to
-datasets with `tags.unifiedIdentity: ["enabled:true"]` — datasets without
-this tag would accept work orders but silently delete nothing, so hiding
-them prevents a footgun.
+### Architecture Principles
 
-### 3.4 Namespace listing
+- **Local-first, single-process.** Runs on the operator's machine. No cloud
+  infrastructure, no Docker, no Kubernetes.
+- **One SQLite file for all state.** Zero administration, point-in-time
+  durability, fast prepared statements.
+- **Validate before the wire.** Every work-order payload is validated locally
+  before any network call. Adobe's irreversible API is never reached with a
+  malformed request.
+- **Non-idempotent hygiene POST.** Adobe's deletion call is never automatically
+  retried on failure — duplicate submissions create duplicate irreversible deletes.
 
-`GET platform-{region}.adobe.io/data/core/idnamespace/identities`
+---
 
-Region-specific host. Returns an array of namespace descriptors with
-`{id (numeric nsid), code (string), name, idType, custom, status}`.
+## 2. System Architecture
 
-### 3.5 Identity Graph expansion — `POST /identity/clusters/members`
+### 2.1 High-Level Architecture
 
-Region-specific host. Request body:
-
-```json
-{
-  "compositeXids": [{ "ns": "hashedKocid", "nsid": 11124296, "id": "abc" }],
-  "graph-type": "Private Graph"
-}
+```
+╔══════════════════════════════════════════════════════════════════════════╗
+║                         OPERATOR'S MACHINE                               ║
+║                                                                          ║
+║  ┌─────────────────────────────────────────────────────────────────┐    ║
+║  │  Web Browser  (http://127.0.0.1:3000)                           │    ║
+║  │                                                                  │    ║
+║  │  ┌──────────────┐  ┌──────────────┐  ┌───────────┐  ┌───────┐  │    ║
+║  │  │  Config tab  │  │  Upload tab  │  │ Jobs tab  │  │Monitor│  │    ║
+║  │  │  Credentials │  │  CSV ingest  │  │ Plan+     │  │  tab  │  │    ║
+║  │  │  Sandbox pick│  │  Expansion   │  │ Submit    │  │ 60s   │  │    ║
+║  │  └──────────────┘  └──────────────┘  └───────────┘  └───────┘  │    ║
+║  └─────────────────────────────┬───────────────────────────────────┘    ║
+║                                 │  HTTP  fetch /api/*                    ║
+║                                 ▼                                        ║
+║  ┌──────────────────────────────────────────────────────────────────┐   ║
+║  │  Node.js Express Server  (src/index.js)                          │   ║
+║  │                                                                  │   ║
+║  │  ┌─────────────────────────┐   ┌──────────────────────────────┐ │   ║
+║  │  │  REST API Routes        │   │  Background Runners          │ │   ║
+║  │  │                         │   │                              │ │   ║
+║  │  │  /api/config/*          │   │  expansion.js                │ │   ║
+║  │  │    Credential CRUD      │   │    CSV → Identity Graph      │ │   ║
+║  │  │  /api/jobs/*            │   │                              │ │   ║
+║  │  │    Plan/Submit/Progress │   │  submission.js               │ │   ║
+║  │  │  /api/adobe/*           │   │    Quota-gated work order    │ │   ║
+║  │  │    Sandbox/Dataset/NS   │   │    creation + Adobe POST     │ │   ║
+║  │  │  /api/settings/*        │   │                              │ │   ║
+║  │  │    Auto-resume config   │   │  monitor.js (every 60s)      │ │   ║
+║  │  │                         │   │    Poll Adobe WO status      │ │   ║
+║  │  │  Security Middleware    │   │                              │ │   ║
+║  │  │    Host-header guard    │   │  recovery.js (boot-time)     │ │   ║
+║  │  │    CSRF guard           │   │    Reconcile orphan orders   │ │   ║
+║  │  │    Helmet / CSP         │   │                              │ │   ║
+║  │  └─────────────────────────┘   │  scheduler.js (opt-in)       │ │   ║
+║  │                                │    Daily auto-resume         │ │   ║
+║  │                                └──────────────────────────────┘ │   ║
+║  │                                                                  │   ║
+║  │  ┌──────────────────────────────────────────────────────────┐   │   ║
+║  │  │  Adobe Service Layer                                      │   │   ║
+║  │  │                                                           │   │   ║
+║  │  │  imsAuth.js      ·  adobeClient.js  ·  sandboxes.js      │   │   ║
+║  │  │  datasets.js     ·  namespaces.js   ·  identityGraph.js  │   │   ║
+║  │  │  hygiene.js      ·  quotaApi.js     ·  quotaManager.js   │   │   ║
+║  │  └──────────────────────────────────────────────────────────┘   │   ║
+║  │                                                                  │   ║
+║  │  ┌──────────────────────────────────────────────────────────┐   │   ║
+║  │  │  SQLite (WAL mode)  data/state.db                        │   │   ║
+║  │  │                                                           │   │   ║
+║  │  │  credentials        ·  sandbox_configs                    │   │   ║
+║  │  │  jobs               ·  expanded_identities                │   │   ║
+║  │  │  work_orders        ·  quota_usage                        │   │   ║
+║  │  │  quota_usage_monthly·  app_settings                       │   │   ║
+║  │  └──────────────────────────────────────────────────────────┘   │   ║
+║  └──────────────────────────────────────────────────────────────────┘   ║
+║                                                                          ║
+║  data/                                                                   ║
+║    state.db       ← all persistent state                                 ║
+║    .key           ← AES-256 encryption key (chmod 600, never synced)     ║
+║    uploads/       ← streamed CSV files                                   ║
+║    output/        ← exported result CSVs                                 ║
+╚═════════════════════════════════╤════════════════════════════════════════╝
+                                   │  HTTPS  (TLS 1.2+, Adobe mTLS)
+                                   ▼
+         ╔═════════════════════════════════════════════════════╗
+         ║           Adobe Experience Platform                  ║
+         ║                                                      ║
+         ║  ┌────────────────────┐  ┌───────────────────────┐  ║
+         ║  │  IMS Auth          │  │  Identity Service     │  ║
+         ║  │  ims-na1.adobe.    │  │  platform-{region}.   │  ║
+         ║  │  login.com         │  │  adobe.io             │  ║
+         ║  │                    │  │  /clusters/members    │  ║
+         ║  │  /ims/token/v3     │  │  /idnamespace/        │  ║
+         ║  │  Bearer token      │  │    identities         │  ║
+         ║  └────────────────────┘  └───────────────────────┘  ║
+         ║                                                      ║
+         ║  ┌────────────────────┐  ┌───────────────────────┐  ║
+         ║  │  Platform Services │  │  Data Hygiene API     │  ║
+         ║  │  platform.adobe.io │  │  platform.adobe.io    │  ║
+         ║  │                    │  │                       │  ║
+         ║  │  /sandbox-mgmt/    │  │  POST /workorder      │  ║
+         ║  │  /catalog/dataSets │  │  GET  /workorder/{id} │  ║
+         ║  └────────────────────┘  │  GET  /quota          │  ║
+         ║                          └───────────────────────┘  ║
+         ╚═════════════════════════════════════════════════════╝
 ```
 
-Max 1,000 `compositeXids` per call (Adobe hard limit). For custom
-namespaces, `nsid` must be provided — matching by `ns` (code) alone is
-unreliable. Our `runner/expansion.js` auto-resolves the nsid from the loaded
-namespace registry when the UI supplies only a code.
+### 2.2 Component Summary
 
-**Response shape (observed, AEP v1.1.0 — current):**
+| Component             | File                          | Responsibility                                              |
+|-----------------------|-------------------------------|-------------------------------------------------------------|
+| Express server        | `src/index.js`                | Boot, route mounting, runner startup, security middleware   |
+| Config                | `src/config.js`               | Env-var defaults; all tunables in one place                 |
+| Database              | `src/db.js`                   | SQLite schema, migrations, all prepared statements          |
+| Expansion runner      | `src/runner/expansion.js`     | CSV stream → batched Identity Graph calls → SQLite          |
+| Submission runner     | `src/runner/submission.js`    | Planner + quota-gated work-order submission                 |
+| Redistributor         | `src/runner/redistributor.js` | Re-buckets unshipped WOs against live Adobe quota           |
+| Monitor runner        | `src/runner/monitor.js`       | 60s polling of Adobe work-order status                      |
+| Recovery runner       | `src/runner/recovery.js`      | Boot-time orphan reconciliation and expansion resume        |
+| Auto-resume scheduler | `src/runner/scheduler.js`     | Configurable daily auto-submit on quota rollover            |
+| IMS auth              | `src/services/imsAuth.js`     | Token cache with thundering-herd guard                      |
+| Adobe HTTP client     | `src/services/adobeClient.js` | axios with retry, backoff, auth injection, error enrichment |
+| Identity Graph        | `src/services/identityGraph.js` | POST /clusters/members, both response shapes              |
+| Hygiene               | `src/services/hygiene.js`     | Work-order payload validation + POST                        |
+| Quota API             | `src/services/quotaApi.js`    | Live Adobe /quota with 1h cache and 24h hard floor          |
+| Quota manager         | `src/services/quotaManager.js`| SQLite-backed daily + monthly ledgers (atomic reserve)      |
+| Security middleware   | `src/middleware/security.js`  | Host guard, CSRF guard, error handler                       |
+| Crypto                | `src/utils/crypto.js`         | AES-256-GCM envelope encryption for client secrets         |
 
-```json
-{
-  "version": "1.1.0",
-  "clusters": [
-    {
-      "compositeXid": { "nsid": 11124296, "id": "abc" },
-      "members": [
-        { "nsid": 11124296, "id": "abc" },
-        { "nsid": 6, "id": "alice@x.com" },
-        { "nsid": 4, "id": "12345..." }
-      ]
-    }
-  ]
-}
+### 2.3 Technology Stack
+
+| Layer          | Choice          | Reason                                                        |
+|----------------|-----------------|---------------------------------------------------------------|
+| Runtime        | Node.js 20 LTS  | Long-term support; `better-sqlite3` has prebuilt binaries     |
+| HTTP server    | Express 4       | Minimal, well-understood, no magic                            |
+| Database       | SQLite (WAL)    | Zero-admin, single-file, crash-safe; sufficient throughput    |
+| SQLite driver  | better-sqlite3  | Synchronous API; ~100k rows/sec bulk insert; no async queuing |
+| HTTP client    | axios           | Interceptors for auth inject, retry, error enrichment         |
+| Concurrency    | p-limit         | Simple, battle-tested async concurrency limiter               |
+| CSV parsing    | fast-csv        | Streaming; never loads entire file into memory                |
+| UI             | Vanilla JS/HTML | No build step; edit and refresh; no bundler dependency        |
+| Testing        | node --test     | Built-in; no Jest/Mocha install; nock for HTTP mocking        |
+
+---
+
+## 3. End-to-End Data Flow
+
+### 3.1 Operator Journey Overview
+
+```
+  CONFIGURE        UPLOAD           EXPAND           PLAN
+  ─────────────────────────────────────────────────────────
+      │                │                │               │
+      ▼                ▼                ▼               ▼
+  Enter IMS        Drop CSV         Fetch all       Pack into
+  credentials   ──► to disk      ──► linked      ──► work orders
+  Pick sandbox     Create job       identities       Assign day
+  Test connect     row (DB)         via Identity     + month index
+  Fetch quota                       Graph (AEP)
+      │                │                │               │
+      └────────────────┴────────────────┴───────────────┘
+                            ▼
+  APPROVE          SUBMIT           MONITOR         EXPORT
+  ─────────────────────────────────────────────────────────
+      │                │                │               │
+      ▼                ▼                ▼               ▼
+  Month 2+        Reserve         Poll Adobe      Download CSV
+  WOs need     ──► quota        ──► every 60s  ──► with status
+  explicit        POST to          Track all        per source
+  operator        Adobe            status           identifier
+  approval        Hygiene          transitions
+                  API
 ```
 
-Members carry only `nsid` — the `code` must be filled in locally via the
-registry index. Array order is not guaranteed to match request order; we
-match by `compositeXid.id`.
+### 3.2 Step-by-Step Detail
 
-We also handle the **legacy bare-array shape**
-`[{xid, identities:[{ns,nsid,id}]}]` for older regions.
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  STEP 1 — CONFIGURE                                                     │
+│                                                                         │
+│  Operator enters in the Config tab:                                     │
+│    • IMS Org ID, Client ID, Client Secret                               │
+│    • Region (va7 / nld2 / aus5 / can2)                                  │
+│    • Environment (Production / Stage / Development)                     │
+│                                                                         │
+│  On "Test Connection":                                                  │
+│    POST /ims/token/v3 ──► bearer token (cached in memory, 24h TTL)      │
+│    GET  /sandbox-management/ ──► sandbox list                           │
+│    GET  /quota ──► live daily + monthly caps displayed in UI banner     │
+│                                                                         │
+│  Client secret stored: AES-256-GCM encrypted in data/state.db          │
+│  IMS token: in-memory only (never written to disk)                      │
+└─────────────────────────────────────────────────────────────────────────┘
+           │
+           ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  STEP 2 — UPLOAD                                                        │
+│                                                                         │
+│  Operator selects:                                                      │
+│    • Target namespace (e.g. hashedKocid)                                │
+│    • Deletion scope (ALL datasets / specific datasets / profile-only)   │
+│    • CSV file of source identifiers                                     │
+│                                                                         │
+│  Server:                                                                │
+│    Streams CSV to data/uploads/  (never fully in memory)                │
+│    Counts rows → sets job.source_count                                  │
+│    Creates jobs row with status = 'ready'                               │
+└─────────────────────────────────────────────────────────────────────────┘
+           │
+           ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  STEP 3 — EXPAND  (runner/expansion.js)                                 │
+│                                                                         │
+│  Operator clicks "Start Identity Expansion" on the Jobs tab.            │
+│                                                                         │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │  CSV stream                                                       │  │
+│  │    │                                                              │  │
+│  │    ▼ read 1,000 IDs per batch (Adobe hard limit)                  │  │
+│  │  ┌────────────┐  ┌────────────┐  ┌────────────┐  ┌────────────┐ │  │
+│  │  │  Batch 1   │  │  Batch 2   │  │  Batch 3   │  │   ...      │ │  │
+│  │  └─────┬──────┘  └─────┬──────┘  └─────┬──────┘  └────┬───────┘ │  │
+│  │        │               │               │               │         │  │
+│  │        └───────────────┴───────────────┴───────────────┘         │  │
+│  │                         │ p-limit(10) concurrent                  │  │
+│  │                         ▼                                         │  │
+│  │              POST /identity/clusters/members                      │  │
+│  │              (region-specific host per credential)                │  │
+│  │                         │                                         │  │
+│  │                         ▼                                         │  │
+│  │              Response: clusters[].members[]                       │  │
+│  │              Each member: { nsid, id }                            │  │
+│  │              Canonicalized to { code, nsid } via namespace index  │  │
+│  │                         │                                         │  │
+│  │                         ▼                                         │  │
+│  │              INSERT into expanded_identities (SQLite)             │  │
+│  │              (plain INSERT, no unique constraint,                 │  │
+│  │               dedup performed at planning time via GROUP BY)      │  │
+│  └──────────────────────────────────────────────────────────────────┘  │
+│                                                                         │
+│  Wave scheduling: batches processed in waves of 20 (concurrency × 2)  │
+│  to keep memory constant regardless of file size.                       │
+│                                                                         │
+│  On completion: COUNT DISTINCT identities → set job.found_count         │
+│  Job status: expanding → expanded                                        │
+└─────────────────────────────────────────────────────────────────────────┘
+           │
+           ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  STEP 4 — PLAN  (runner/submission.js::planWorkOrders)                  │
+│                                                                         │
+│  1. Fetch live quota from Adobe GET /quota (with 1h cache)             │
+│  2. Run redistributor: assign day_index + month_index to any           │
+│     existing unshipped work orders                                      │
+│  3. Stream expanded_identities, deduplicated via GROUP BY               │
+│     (ns_code, ns_id, identity_id), ordered by source_id                │
+│  4. Bundle identities per cluster (keep clusters together)              │
+│  5. Pack bundles into work orders (≤ 100,000 identifiers each)          │
+│  6. Assign day_index (advance day when daily cap would overflow)        │
+│     and month_index (advance month when monthly cap would overflow)     │
+│  7. Month 1 work orders → status = 'planned'                            │
+│     Month 2+ work orders → status = 'awaiting_approval'                 │
+│     (operator must explicitly approve each future month)                │
+│                                                                         │
+│  Guard: throws HTTP 409 (ReplanForbiddenError) if any work order       │
+│  has already shipped to Adobe — prevents duplicate deletions.           │
+└─────────────────────────────────────────────────────────────────────────┘
+           │
+           ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  STEP 5 — APPROVE  (if multi-month job)                                 │
+│                                                                         │
+│  Month 1 ships immediately on Submit.                                   │
+│                                                                         │
+│  Month 2, 3, … are shown in the Plan tab as "Awaiting Approval".        │
+│  Operator reviews the planned quantity and clicks "Approve Month N".    │
+│                                                                         │
+│  POST /api/jobs/:id/approve-month  { monthIndex: 2 }                   │
+│    → flips WOs from awaiting_approval → planned                         │
+│    → Month N becomes eligible for the next Submit run                   │
+│                                                                         │
+│  This gate prevents accidental multi-month submissions and gives        │
+│  operators a review checkpoint before each month's quota is consumed.   │
+└─────────────────────────────────────────────────────────────────────────┘
+           │
+           ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  STEP 6 — SUBMIT  (runner/submission.js::runSubmission)                 │
+│                                                                         │
+│  For each planned (or deferred) work order:                             │
+│                                                                         │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │  Quota check (SQLite atomic transaction)                          │  │
+│  │    daily_used + count ≤ daily_limit?   ──No──► mark DEFERRED     │  │
+│  │    monthly_used + count ≤ monthly_limit?──No──► mark DEFERRED    │  │
+│  │    Both pass ──► reserve quota (increment both ledgers)          │  │
+│  │         │                                                         │  │
+│  │         ▼                                                         │  │
+│  │  POST /data/core/hygiene/workorder                                │  │
+│  │    Payload validated locally before the call:                     │  │
+│  │      • ≤ 100,000 identifiers total                                │  │
+│  │      • datasetId format (ALL / id / comma-list)                   │  │
+│  │      • targetServices ↔ datasetId="ALL" consistency               │  │
+│  │      • each namespace has code and/or numeric id                  │  │
+│  │         │                                                         │  │
+│  │         ├─ Success ──► record Adobe work-order ID, mark SUBMITTED │  │
+│  │         ├─ Quota denied (429) ──► safe to retry; token refresh    │  │
+│  │         ├─ Network error/5xx ──► quota released, mark FAILED      │  │
+│  │         │   (never auto-retried — would create duplicate deletes) │  │
+│  │         └─ Quota denied by our ledger ──► mark DEFERRED           │  │
+│  └──────────────────────────────────────────────────────────────────┘  │
+│                                                                         │
+│  Deferred orders retry automatically after UTC midnight rollover.       │
+│  The auto-resume scheduler can handle this unattended.                  │
+└─────────────────────────────────────────────────────────────────────────┘
+           │
+           ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  STEP 7 — MONITOR  (runner/monitor.js, every 60 seconds)                │
+│                                                                         │
+│  For each submitted work order (up to 100 per tick, p-limit(5)):        │
+│    GET /data/core/hygiene/workorder/{adobe_workorder_id}                │
+│                                                                         │
+│  Status transitions persisted in SQLite:                                │
+│    received → validated → submitted → ingested → completed              │
+│                                              └─────────────► failed     │
+│                                                                         │
+│  Monitor tab in the UI refreshes every 15 seconds showing:              │
+│    • Per-job cards with completion progress bars                         │
+│    • In-flight jobs always ranked first (never pushed off-screen)        │
+│    • Per-work-order pipeline table in the detail panel                   │
+│    • Sandbox filter chips for multi-sandbox operators                    │
+└─────────────────────────────────────────────────────────────────────────┘
+```
 
-### 3.6 Work-order creation — `POST /data/core/hygiene/workorder`
+---
+
+## 4. Work Order Lifecycle
+
+### 4.1 State Machine
+
+```
+                         ┌──────────────────────┐
+                         │  Job in status:       │
+                         │  expanded / ready     │
+                         └──────────┬───────────┘
+                                    │  POST /api/jobs/:id/plan
+                                    ▼
+                         ┌──────────────────────┐
+                   ┌────►│      PLANNED          │
+                   │     │  Ready to submit      │◄──────────────────────┐
+                   │     └──────────┬───────────┘                        │
+                   │                │  runSubmission picks up             │
+                   │                ▼                                     │
+                   │     ┌──────────────────────┐                        │
+                   │     │  Quota available?     │                        │
+                   │     └──┬─────────────────┬─┘                        │
+                   │        │ No              │ Yes                       │
+                   │        ▼                 ▼                           │
+                   │  ┌──────────┐   ┌───────────────────┐               │
+                   │  │ DEFERRED │   │    SUBMITTING      │               │
+                   │  │          │   │  POST in-flight    │               │
+                   │  │  Daily   │   │  (crash window)    │               │
+                   │  │  cap hit │   └──────┬──────┬──────┘               │
+                   │  └─────┬────┘          │      │                      │
+                   │        │ UTC midnight  │      │                      │
+                   │        └──────────────►│  Failure                   │
+                   │                        │  (quota released)           │
+                   │                   Success                            │
+                   │                        │                             │
+                   │                        ▼                             │
+                   │             ┌──────────────────────┐                 │
+                   │             │     SUBMITTED         │                 │
+                   │             │  Adobe has ACKed      │                 │
+                   │             └──────────┬───────────┘                 │
+                   │                        │  monitor polls              │
+                   │                        ▼                             │
+                   │             ┌──────────────────────┐                 │
+                   │             │  Adobe status         │                 │
+                   │             │  received             │                 │
+                   │             │  validated            │                 │
+                   │             │  submitted            │                 │
+                   │             │  ingested             │                 │
+                   │             └──────┬──────┬─────────┘                │
+                   │                    │      │                           │
+                   │               failed  completed  (startup recovery   │
+                   │                    │      │       matches orphan) ───►┘
+                   │                    ▼      ▼
+                   │             ┌────────┐  ┌────────────────┐
+                   │             │ FAILED │  │   COMPLETED    │
+                   │             │        │  │  (terminal)    │
+                   │             └────────┘  └────────────────┘
+                   │
+  ┌────────────────┴──────────────────────┐
+  │        AWAITING_APPROVAL              │
+  │  Month 2+ WOs — held until operator   │
+  │  clicks "Approve Month N"             │──── operator approves ─────────►
+  │  POST /api/jobs/:id/approve-month     │
+  └───────────────────────────────────────┘
+```
+
+### 4.2 Status Reference
+
+| Status                | Description                                                    | Next action           |
+|-----------------------|----------------------------------------------------------------|-----------------------|
+| `planned`             | Work order created locally; ready to submit to Adobe           | runSubmission picks up |
+| `awaiting_approval`   | Month 2+ gate; operator must approve before submission         | Click "Approve Month N" |
+| `deferred`            | Quota exhausted for today; will retry after UTC midnight       | Auto-resumes next day  |
+| `submitting`          | POST to Adobe in-flight (crash window)                         | Recovery reconciles    |
+| `submitted`           | Adobe has acknowledged; monitoring in progress                 | Monitor polls 60s      |
+| `completed`           | Adobe confirms deletion complete (terminal)                    | Export results         |
+| `failed`              | Adobe returned error or POST failed (terminal)                 | Review error message   |
+
+---
+
+## 5. Multi-Month Quota Planning
+
+### 5.1 Why Multi-Month Planning Exists
+
+Adobe's Data Hygiene API enforces two quota dimensions:
+
+- **Daily cap**: typically 1,000,000 identifiers per day (varies by contract)
+- **Monthly cap**: typically 3,000,000 identifiers per month (varies by contract)
+
+A large deletion batch (e.g. 4 million identifiers from a 1.5M-row CSV after
+graph expansion) will span multiple calendar months. The planner assigns each
+work order to a `(month_index, day_index)` bucket upfront, so the operator can
+see the full timeline before any work is submitted.
+
+### 5.2 Planning Diagram
+
+```
+  INPUT:  2,500,000 expanded identifiers
+  QUOTA:  Daily cap = 1,000,000  ·  Monthly cap = 3,000,000
+
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  MONTH 1  (ships immediately on first Submit click)                 │
+  │                                                                     │
+  │  Running              Identifiers          Work Orders              │
+  │  daily total          in bucket            created                  │
+  │  ──────────           ──────────           ──────────               │
+  │  Day 1   1,000,000   ████████████████████  10 × 100k WOs           │
+  │  Day 2   1,000,000   ████████████████████  10 × 100k WOs           │
+  │  Day 3     500,000   ██████████             5 × 100k WOs           │
+  │            ───────                                                  │
+  │  Month 1 total: 2,500,000  ✓ Within monthly cap (3,000,000)        │
+  │  Remaining: 500,000 carry to Month 2                                │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  ─── Operator reviews Month 2 plan ─── Clicks "Approve Month 2" ─────►
+
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  MONTH 2  (status: awaiting_approval → planned after approval)      │
+  │                                                                     │
+  │  Day 1     500,000   ██████████             5 × 100k WOs           │
+  │            ───────                                                  │
+  │  Month 2 total: 500,000  ✓ Within monthly cap                       │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  TOTAL JOB: 2,500,000 identifiers across 2 months, 4 days, 25 WOs
+```
+
+### 5.3 Live Quota Redistribution
+
+Before **every** plan and every submit run, the tool fetches live quota
+from Adobe's `GET /quota` endpoint. The **redistributor** then re-assigns
+`(day_index, month_index)` to all unshipped work orders to reflect the
+current quota remaining.
+
+```
+  EXAMPLE: 300,000 identifiers consumed from today's quota by another source
+
+  Before redistribution:                 After redistribution:
+  ──────────────────────                 ─────────────────────
+  Day 1: 1,000,000 capacity              Day 1: 700,000 remaining
+    WO-001: 100,000 ─ planned              WO-001: 100,000 ─ planned
+    WO-002: 100,000 ─ planned              WO-002: 100,000 ─ planned
+    WO-003: 100,000 ─ planned              WO-003: 100,000 ─ planned
+    ...                                    WO-004 → Day 2 (overflow)
+    WO-010: 100,000 ─ planned
+
+  The redistributor moves work orders across day/month buckets as needed.
+  Only unshipped WOs are ever re-bucketed. Already-shipped WOs are immutable.
+  The identity content (namespacesIdentities) never changes.
+```
+
+---
+
+## 6. Adobe API Integration
+
+### 6.1 API Summary
+
+| Method | Endpoint                                                    | Purpose                        | Host                          |
+|--------|-------------------------------------------------------------|--------------------------------|-------------------------------|
+| POST   | `/ims/token/v3`                                             | IMS bearer token               | ims-na1.adobelogin.com        |
+| GET    | `/data/foundation/sandbox-management/`                      | List active sandboxes          | platform.adobe.io             |
+| GET    | `/data/foundation/catalog/dataSets`                         | List Identity-enabled datasets | platform.adobe.io             |
+| GET    | `/data/core/idnamespace/identities`                         | List identity namespaces       | platform-{region}.adobe.io    |
+| POST   | `/data/core/identity/clusters/members`                      | Expand identity cluster        | platform-{region}.adobe.io    |
+| POST   | `/data/core/hygiene/workorder`                              | Create record-delete WO        | platform.adobe.io             |
+| GET    | `/data/core/hygiene/workorder/{id}`                         | Poll work-order status         | platform.adobe.io             |
+| GET    | `/data/core/hygiene/quota`                                  | Live daily + monthly quota     | platform.adobe.io             |
+
+### 6.2 Region Architecture
+
+Identity Service APIs are regionally sharded. Using the wrong region returns
+HTTP 200 with empty cluster data — a silent partial delete.
+
+```
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  Identity Service regions                                           │
+  │                                                                     │
+  │  Credential row → region field                                      │
+  │                          │                                          │
+  │                          ▼                                          │
+  │  ┌────────┐  ┌────────┐  ┌────────┐  ┌────────┐                    │
+  │  │  va7   │  │  nld2  │  │  aus5  │  │  can2  │                    │
+  │  │ VA     │  │ NL     │  │ AU     │  │ CA     │                    │
+  │  │ (US)   │  │(Europe)│  │(APAC)  │  │(Canada)│                    │
+  │  └────────┘  └────────┘  └────────┘  └────────┘                    │
+  │                                                                     │
+  │  URL pattern: https://platform-{region}.adobe.io                   │
+  │                                                                     │
+  │  Server-side allowlist prevents SSRF: only the four known regions   │
+  │  can be stored on a credential row.                                  │
+  └─────────────────────────────────────────────────────────────────────┘
+```
+
+### 6.3 Work-Order Payload
 
 ```json
 {
   "action": "delete_identity",
   "datasetId": "ALL",
-  "displayName": "Delete job-abc - WO 12345678",
-  "description": "...",
-  "targetServices": ["identity","profile","ajo"],
+  "displayName": "Delete job-abc123 - WO 1 - Day 1",
+  "description": "Bulk identity deletion - 95,000 identifiers",
+  "targetServices": ["identity", "profile", "ajo"],
   "namespacesIdentities": [
-    { "namespace": { "code": "email", "id": 6 }, "ids": ["a@x.com"] },
-    { "namespace": { "code": "hashedKocid", "id": 11124296 }, "ids": ["abc"] }
+    {
+      "namespace": { "code": "email", "id": 6 },
+      "ids": ["user@example.com", "user2@example.com"]
+    },
+    {
+      "namespace": { "code": "hashedKocid", "id": 11124296 },
+      "ids": ["abc123hash", "def456hash"]
+    }
   ]
 }
 ```
 
-Enforced constraints (all validated pre-network in `services/hygiene.js`):
-- Total `ids` across all groups ∈ [1, 100,000]
-- `datasetId` ∈ `"ALL"` | single id | comma-joined list; `"ALL"` cannot be
-  combined with specific ids
-- `targetServices`, if present, must be exactly `{identity, profile, ajo}`
-  (order-independent) AND `datasetId` must be `"ALL"` ("profile-only mode")
-- Each namespace group must have a `code` OR an `id` (or both)
+**Payload constraints (all validated locally before the network call):**
 
-Adobe returns `{workorderId, status, orgId, bundleId, operationCount,
-createdAt, targetServices, datasetId, displayName}`.
+| Field                  | Constraint                                                                  |
+|------------------------|-----------------------------------------------------------------------------|
+| `ids` total count      | 1 – 100,000 (Adobe hard limit)                                              |
+| `datasetId`            | `"ALL"` \| single dataset ID \| comma-joined list (no mixing `"ALL"` with specific IDs) |
+| `targetServices`       | When present: must be `["identity","profile","ajo"]` AND `datasetId` must be `"ALL"` |
+| Namespace entry        | Each entry must have `code` (string) and/or `id` (numeric nsid)             |
 
-### 3.7 Work-order status — `GET /data/core/hygiene/workorder/{id}`
+### 6.4 Identity Quota
 
-Status progression: `received → validated → submitted → ingested → completed`
-(or `failed`). Terminal states are `completed` and `failed`. Response includes
-`productStatusDetails[]` showing per-service completion (Data Management,
-Identity Service, Profile Service, Journey Orchestrator).
+| Dimension | Default | Configurable via |
+|-----------|---------|-----------------|
+| Daily cap | 1,000,000 identifiers | Adobe contract; read from live `/quota` |
+| Monthly cap | 3,000,000 identifiers | Adobe contract; read from live `/quota` |
 
----
-
-## 4. Non-obvious design decisions
-
-### 4.1 Why SQLite and not Postgres / Redis
-
-This tool runs on an operator's laptop. It's a local helper, not a
-distributed service. SQLite's WAL mode gives us:
-- Zero-administration durability (one file, point-in-time consistent)
-- Fast concurrent reads during long writes
-- ~100 k rows/sec bulk insert with prepared statements
-- No deployment complexity — `data/state.db` is the entire state
-
-Postgres / Redis would be appropriate only if multiple operators shared the
-state. That's explicitly out of scope (see Known Limitations §6).
-
-### 4.2 Why vanilla JS, no framework
-
-- No build step — edit HTML/CSS/JS, refresh, done.
-- Zero dependency on Node version / bundler / transpiler versions for the UI.
-- The UI's state machine is small (5 steps, ~900 lines of `app.js`). A
-  framework would add complexity without value.
-
-### 4.3 Why validate before the network (not rely on Adobe's 400s)
-
-Adobe's Data Hygiene API returns HTTP 400 on malformed payloads, but once the
-request goes through it's irreversible. Pre-validating also avoids:
-- Wasted IMS token exchanges for doomed requests.
-- Cryptic Adobe error messages leaking to the UI.
-- Round-trip latency for mistakes that can be caught in microseconds.
-
-Every validator throws `WorkOrderValidationError` with a human-readable
-message. See `src/services/hygiene.js` for the full set.
-
-### 4.4 Why in-memory IMS tokens (not persisted)
-
-Tokens are bearer secrets. Persisting them means a ~24h window where anyone
-who reads `data/state.db` can impersonate the operator. In-memory caching
-with thundering-herd coalescing is free after the first exchange and
-regenerates in ~300 ms on restart. Not worth persisting.
-
-### 4.5 Why auto-resolve the nsid from the registry
-
-Custom namespaces (like `hashedKocid`) often fail to resolve clusters when
-the request has only `ns` (code) without `nsid` (numeric). The tool used to
-send only the code, which caused zero-cluster responses on every call for
-custom-namespace sources. Now `runner/expansion.js` loads the namespace
-registry once per job and fills in the nsid when the UI didn't supply one.
-
-### 4.6 Why use `.all()` not `.iterate()` in the planner
-
-`better-sqlite3` locks the connection while an iterator is active. The
-planner must insert new `work_orders` rows whenever a cluster boundary
-would push the current order past 100k — which requires a free connection.
-Using `.iterate()` worked for small test cases (single cluster, no mid-flow
-flush) but deadlocked with `"This database connection is busy"` on the
-first multi-cluster scenario with a real flush. `.all()` materializes the
-rows up front and releases the connection before any writes. Memory cost
-is the same — we were going to consume the whole iterator anyway.
-
-### 4.7 Why the crashed-submission reconciliation is best-effort
-
-The window between "reserve quota in SQLite" and "Adobe returns 200 from
-the POST" is where a process crash leaves ambiguity: did Adobe receive
-the request or not? The reconciliation strategy:
-
-1. **Look up by displayName prefix** — our displayName includes an 8-char
-   prefix of the local work-order UUID, which is unique enough to identify
-   the work order in Adobe's list. If Adobe has it, we know it was received,
-   and we record the Adobe ID.
-2. **Confirmed no match → roll back** — if Adobe responded successfully and
-   the prefix isn't in the list, the POST did not land. Safe to release
-   quota and put the work order back to `planned` for the next submit run.
-3. **Transient OR indeterminate → leave alone** — if the lookup itself fails
-   with 5xx, network, 401, **or 400** (filter rejected by Adobe — we can't
-   tell whether the original POST was processed), leave the orphan in
-   `submitting`. The next startup retries. Earlier code rolled back on 400,
-   which would create a duplicate Adobe work order on the next submit when
-   the original POST had actually been processed; the fix is to treat 400
-   as "indeterminate" and refuse to roll back.
-
-The only remaining unsafe outcome is: Adobe received the POST, listing
-returns 200 with the order *missing* for some unrelated reason (replication
-lag, a region-specific quirk), and we roll back. To minimize this risk:
-
-- The hygiene POST is **deliberately non-idempotent** in `services/
-  adobeClient.js`'s retry guard — `axios-retry` blocks 5xx and network
-  retries on requests that don't tag `{idempotent: true}`. 401 (token
-  refresh) and 429 (rate-limit) retries are still safe and on. (CLAUDE.md
-  I11.)
-- The recovery call uses `GET` + client-side `displayName.startsWith()`
-  match, which is resilient to Adobe's filter syntax variations.
-- Any reconciliation error path logs at warn level so the operator can
-  investigate.
-
-### 4.8 Why the Monitor tab uses an "active-submissions" feed, not /jobs
-
-The Monitor tab is fundamentally about tracking deletions Adobe is processing
-— a marketer's question on this tab is *"where is my deletion request and did
-Adobe finish it?"*. Initial implementations of the picker pulled from
-`/api/jobs?limit=20`, which returned every job in `created_at DESC` order
-regardless of status. Two real problems followed:
-
-1. **Submitted jobs disappeared from the picker** as soon as enough new
-   uploads/expansions accumulated. A submitter who had run a 1M-row
-   deletion last week and wanted to check progress would scroll past 20
-   newer "expanding" or "ready" jobs that were irrelevant to monitoring.
-2. **Sort by `created_at`** surfaced the most-recently-uploaded job, not
-   the most-recently-active deletion. An ongoing in-flight submission from
-   3 days ago could be ranked below a brand-new job whose work orders
-   hadn't even shipped to Adobe yet.
-
-The fix: a dedicated `GET /api/jobs/monitor` endpoint backed by
-`db.listMonitorJobs`. The SQL:
-
-- INNER JOINs `work_orders` and filters to rows where
-  `adobe_workorder_id IS NOT NULL` — i.e., Adobe has acknowledged at least
-  one work order for this job. Jobs that never made it past expansion
-  are excluded entirely (they have nothing to monitor).
-- GROUP BY `j.id` with `FILTER (WHERE …)` aggregates so each row carries
-  `submitted_count`, `in_flight_count`, `completed_count`,
-  `adobe_failed_count`, `submitted_ids`, and `latest_activity_at` —
-  everything the dashboard cards need, in a single query.
-- ORDER BY `(in_flight_count > 0) DESC, latest_activity_at DESC`. This
-  two-level sort is the **in-flight-first priority**: jobs that still
-  have work orders Adobe is processing always rank above terminal
-  (fully-completed or fully-failed) jobs, regardless of how recently the
-  terminal jobs were touched. Without this, a freshly-completed job
-  could push a quietly-in-flight one off the visible window. Within each
-  bucket, the secondary sort by latest WO activity surfaces the most
-  recently-touched job first.
-- Optional `search` parameter does case-insensitive substring match on
-  job name; `''` (empty) means no filter.
-- Optional `sandbox` parameter scopes results to a single AEP sandbox.
-  Operators who manage multiple sandboxes per client typically want to
-  filter Monitor to whichever they're working in; the chip row above
-  the dashboard cards drives this filter.
-
-The route returns three things in one payload to keep the Monitor tab
-to a single round-trip per refresh:
-
-- **`rows`** — the limit-capped, in-flight-first-sorted list rendered as
-  cards.
-- **`totals`** — job-level dashboard counts (`in_flight`, `has_failed`,
-  `all_completed`, `total`) across **all** matching jobs (NOT capped
-  by limit). Drives the colored chips in the dashboard header so the
-  operator sees the true picture even when the visible list is paginated.
-  Each job sits in exactly one bucket — a job with both completed and
-  in-flight work orders is `in_flight`; only fully-terminal jobs are
-  `has_failed` (any failed WO + no in-flight) or `all_completed` (no
-  in-flight, no failed).
-- **`sandboxes`** — distinct sandbox names with per-sandbox job counts.
-  Honors the search filter (so the chip count for "americas-uat (3)"
-  reflects what would be shown if that chip were clicked while the
-  current search is active) but NOT the sandbox filter — the chips ARE
-  the sandbox filter, so they're computed across all sandboxes.
-
-The Monitor tab UI:
-
-- **Top card** — list of up to 10 cards, one per job, showing name,
-  sandbox, day range, work-order counts, completion progress bar, and a
-  relative-time "Updated N min ago." Clicking a card selects the job.
-- **Search input** in the same card — debounced, hits the same endpoint
-  with the search param; the limit applies to the search results too,
-  so an operator can find a specific older job by typing its name.
-- **Detail panel below** — the selected job's full per-work-order
-  pipeline table and 5-stage stat grid (`received → validated →
-  submitted → ingested → completed`), refreshed every 15s alongside the
-  list.
-- **Empty state** — when no submitted jobs exist at all, shows a clear
-  "Upload a CSV and run Submit to start tracking deletions here"
-  message.
-
-This separation matches Adobe Experience Platform's own Data Lifecycle
-Monitor view, which also key-orders its work order list by Adobe activity
-rather than upload time.
-
-### 4.9 Why the credentials picker has its own dedicated UX
-
-The Configuration tab manages **one** credential at a time, but most operators
-work across multiple Adobe orgs (or multiple environments per org). Without a
-dedicated picker the form silently encoded "I'm editing whichever credential
-was loaded last," and three problems followed:
-
-1. Edits to non-secret fields like Client Name were lost on refresh because
-   the save path was gated on "did the secret change."
-2. There was no obvious way to switch between saved credentials (the right-
-   rail "Saved Credentials" panel was visible only with ≥1 cred, easy to
-   miss, and didn't indicate which one was loaded).
-3. Adding a new credential required the operator to manually clear every
-   field — not discoverable.
-
-The picker bar at the top of the Configuration card solves all three:
-- Dropdown listing all saved creds, last-used-first, formatted as
-  `Client name · Label · Environment · Region`.
-- Explicit **+ Add new** button (and the same option at the bottom of the
-  dropdown) that resets the form to a blank state and unlocks identity
-  fields.
-- Explicit **⊗ Remove** button (with native `confirm()` dialog) that calls
-  `DELETE /api/config/credentials/:id`. The server returns 409 if any job
-  references the credential, and the UI surfaces a clear "Cannot remove:
-  N job(s) reference this credential" alert.
-- Identity fields (Environment, IMS Org ID, Client ID) are **readonly when
-  a saved cred is loaded**. They form the unique key on the credentials
-  row, so editing them silently routes the next save to a different row
-  via the upsert. Locking by default makes the "I'm creating a new
-  credential" intent explicit; an "✏ Edit identity fields" link unlocks
-  with an info alert that explains the consequence.
-- "Save & Continue" now actually saves: PATCHes the editable fields when
-  the active cred is loaded, POSTs a new row when in Add-new mode.
-
-This separation matches Adobe Experience Cloud's own org-switcher pattern
-(top-right org picker + per-org settings inside the app) without the
-complexity of a separate credentials management page.
-
-### 4.10 Why monthly quota is a separate table (not a column on daily)
-
-- Daily rows churn once per UTC date; monthly rows churn once per UTC month.
-  Mixing them in one table complicates rollover queries.
-- Adding a "period type" column would allow generic code but require
-  migration for existing users. A separate table with additive schema is
-  simpler and more explicit.
-- Tests can seed each ledger independently.
+Adobe's `/quota` endpoint is the **source of truth**. The tool's stored
+`daily_limit`/`monthly_limit` values are fallbacks used only when the live
+endpoint is unreachable and no cache exists.
 
 ---
 
-## 5. Review findings and resolutions
+## 7. Security Architecture
 
-From the initial code review (see `docs/REVIEW.md` for the full
-questionnaire), 1 blocker + 3 major + 4 minor issues were identified.
-All were fixed before production use.
+### 7.1 Defense-in-Depth Model
 
-### 5.1 Blocker
+```
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  LAYER 1 — Network Isolation                                        │
+  │                                                                     │
+  │  Server binds to 127.0.0.1 (loopback) by default.                  │
+  │  The unauthenticated API is not reachable from the LAN.             │
+  │  Setting HOST=0.0.0.0 opts out of this protection entirely —        │
+  │  only do so for SSH-tunneled demos, never for production.           │
+  └─────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  LAYER 2 — HTTP Request Guards  (src/middleware/security.js)        │
+  │                                                                     │
+  │  ① Host-Header Guard                                                │
+  │     Rejects requests where Host ≠ localhost / 127.0.0.1 / [::1]   │
+  │     Purpose: blocks DNS rebinding attacks                           │
+  │     (attacker resolves attacker.com → 127.0.0.1, serves malicious  │
+  │      JS; guard rejects because Host header is still attacker.com)  │
+  │                                                                     │
+  │  ② Origin / Referer Guard                                           │
+  │     POST / PUT / PATCH / DELETE must carry matching Origin header   │
+  │     Purpose: blocks cross-site request forgery (CSRF)               │
+  │     (a malicious page posting to localhost would have the wrong     │
+  │      Origin and be rejected before any state changes)               │
+  │                                                                     │
+  │  ③ Helmet Middleware (CSP + security headers)                       │
+  │     Content-Security-Policy: script-src 'self'  (no CDN scripts)   │
+  │     Content-Security-Policy: frame-ancestors 'none'  (no iframes)  │
+  │     Content-Security-Policy: object-src 'none'                     │
+  │     Cross-Origin-Opener-Policy: same-origin                        │
+  │     Cross-Origin-Resource-Policy: same-origin                      │
+  └─────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  LAYER 3 — Server-Side Allowlists                                   │
+  │                                                                     │
+  │  region       ∈ { va7, nld2, aus5, can2 }                           │
+  │  environment  ∈ { Production, Stage, Development }                  │
+  │                                                                     │
+  │  Purpose: prevents SSRF via region injection.                       │
+  │  Without this, a tampered credential row could cause the server     │
+  │  to inject bearer tokens into a host controlled by an attacker.     │
+  │                                                                     │
+  │  All credential fields validated for length + control characters    │
+  │  (CR/LF/null) — these flow into outbound HTTP headers.              │
+  └─────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  LAYER 4 — Credential Encryption                                    │
+  │                                                                     │
+  │  Raw client secret                                                  │
+  │       │                                                             │
+  │       ▼                                                             │
+  │  AES-256-GCM encryption                                             │
+  │    Key: data/.key (auto-generated, chmod 600) or ENCRYPTION_KEY env │
+  │    IV:  12 random bytes per row                                      │
+  │    Tag: 16-byte authentication tag (detects tampering)              │
+  │       │                                                             │
+  │       ▼                                                             │
+  │  Ciphertext stored in data/state.db                                 │
+  │                                                                     │
+  │  IMS bearer tokens:                                                 │
+  │    Cached in-memory only — never written to disk                    │
+  │    Auto-refreshed 120 seconds before expiry                         │
+  │    Thundering-herd guard: concurrent callers share one in-flight    │
+  │    promise (no duplicate refresh races)                             │
+  └─────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  LAYER 5 — Static Asset Isolation                                   │
+  │                                                                     │
+  │  All UI assets (fonts, icons, scripts, styles) are self-hosted.     │
+  │  Zero CDN loads from the browser — no google-fonts.com, no          │
+  │  cloudflare, no analytics pixels.                                   │
+  │                                                                     │
+  │  Rationale: this is an admin tool for destructive operations. Any   │
+  │  third-party origin receives the operator's IP, user-agent, and     │
+  │  timing data — unacceptable for an offline-capable security tool.   │
+  └─────────────────────────────────────────────────────────────────────┘
+```
 
-**B1: `monitor.js` used wrong column names.** `wo.creds_id` / `wo.sandbox_name`
-were `undefined` because the SQL aliased them as `j_creds_id` / `j_sandbox_name`.
-Every 60-second poll was silently failing with "Unknown credential id: undefined".
-**Fix**: corrected the property names. Monitor now runs correctly.
+### 7.2 Submission Safety
 
-### 5.2 Major
+```
+  CRITICAL: Adobe work orders are IRREVERSIBLE. The following safeguards
+  prevent duplicate or erroneous submissions:
 
-**M1: Non-idempotent POST retried on network errors.** `axios-retry` was set
-to retry every request on every network error, which could have created
-duplicate irreversible work orders if the hygiene POST timed out.
-**Fix (initial)**: retry condition skipped non-GET methods on network errors.
-**Fix (extended in 2026-04-26 review remediation)**: retry condition is now
-fully idempotency-aware — non-idempotent requests (default for non-GETs)
-also skip 5xx retries, not just network errors. The Identity Graph cluster
-query opts back in via `{idempotent: true}` because POST-as-query is
-side-effect-free. The hygiene POST stays non-idempotent. 401/429 retries
-are unconditional on all paths.
+  1. Payload validation before every POST — 5 checks in hygiene.js
+     (identifier count, datasetId format, targetServices consistency,
+      namespace shape, no duplicate namespace groups)
 
-**M2: Re-plan duplicated work orders.** `planWorkOrders` inserted new rows
-without clearing previous `planned` rows. Calling `/plan` twice doubled
-the work orders.
-**Fix (initial)**: added `deletePlannedOrders` prepared statement;
-`planWorkOrders` clears existing planned rows for the job first. Now
-idempotent within a pre-submission window.
-**Fix (extended in 2026-04-26 review remediation)**: re-planning AFTER any
-order shipped to Adobe was still possible — the planner only deleted
-`planned` rows, leaving submitted rows alone but happily re-emitting work
-orders for identities Adobe already received. Now `planWorkOrders` throws
-`ReplanForbiddenError` (HTTP 409) if any work order is in a state past
-`planned`/`deferred`. The UI Plan tab no longer auto-POSTs `/plan` on tab
-entry; the Re-plan button auto-disables once any order has shipped.
+  2. Non-idempotent retry policy — network errors and 5xx responses
+     are NOT retried for the hygiene POST. Only 401 (token refresh)
+     and 429 (rate limit) are retried, because those unambiguously
+     mean Adobe did NOT process the request.
 
-**M3: Concurrent submission race.** Two rapid `/submit` calls could both
-read the same `planned` rows and POST the same work orders.
-**Fix**: module-level `inFlight` Set in `submission.js`; the second caller
-gets an immediate return.
+  3. ReplanForbiddenError — attempting to re-plan after any work order
+     has shipped returns HTTP 409. The UI disables the Re-plan button
+     automatically. Prevents re-emitting identities already deleted.
 
-### 5.3 Minor
-
-**m1: CSV header auto-detection could silently drop a real value.** The old
-regex treated any first-row value matching `[a-zA-Z_][a-zA-Z0-9_\s]{2,}`
-as a header. A real hashedKocid matching that pattern would be dropped.
-**Fix**: header detection only activates when the caller passes a string
-`column` name (named-column mode). Numeric column index never skips row 1.
-
-**m2: `id=0` bypass in `canonicalizeNamespace`.** `if (id && !code)` evaluates
-false for `id === 0` (falsy), so a namespace with nsid 0 wouldn't have its
-code looked up.
-**Fix**: condition changed to `id != null && !code`.
-
-**m3: Unused `zod` dependency.** CLAUDE.md declared "no zod" but package.json
-had `zod@3.23.8`. Dead weight.
-**Fix**: removed from `dependencies`.
-
-**m6: `listOpenWorkOrders` loaded everything before slicing.** Monitor did
-`.all().slice(0, 30)` — loaded every open order before trimming.
-**Fix**: `LIMIT 30` moved into the SQL.
-
-### 5.4 Discovered during live run
-
-- **Identity Graph response shape.** `docs/REVIEW.md` documented a bare-array
-  response; Adobe actually returns `{version, clusters:[{compositeXid, members}]}`.
-  Our parser dropped every cluster. **Fix**: rewrite of `identityGraph.js` to
-  handle both shapes; added a WARN log when a batch returns zero linked
-  identities so future contract drift surfaces immediately.
-- **Bootstrap crash on first install.** `db.js` opened the SQLite connection
-  at module load, before `index.js` had a chance to `mkdirSync('data/')`.
-  **Fix**: `mkdirSync` moved into `db.js` itself so the module is
-  self-bootstrapping.
-- **"Authenticated" chip always visible.** CSS `display: flex` on `.auth-chip`
-  overrode the HTML `hidden` attribute.
-  **Fix**: added global `[hidden] { display: none !important }` rule.
-
-### 5.5 Observed via testing during integration work
-
-- **Planner's `.iterate()` deadlock.** Mid-flow writes during iterator
-  iteration raised `"This database connection is busy"` on scenarios with
-  multi-cluster day rollover.
-  **Fix**: switched to `.all()`.
-
-- **Work orders ordered by UUID in UI.** `getAllOrdersForJob ORDER BY id` used
-  the primary-key UUID, producing random-looking order in the UI.
-  **Fix**: `ORDER BY day_index, rowid` — insertion order is now shown.
-
-### 5.6 External review remediation (2026-04-26 session)
-
-A second external code review surfaced 7 additional findings (4 P1, 2 P2,
-1 P3). All accepted and fixed.
-
-- **R1 (P1): HTTP server not bound to localhost.** `app.listen(port, cb)`
-  defaulted Node's host to `0.0.0.0`, exposing the unauthenticated
-  destructive API to the LAN despite docs claiming localhost-only.
-  **Fix**: `app.listen(port, host, cb)` with `host = process.env.HOST || '127.0.0.1'`.
-- **R2 (P1): Re-plan after submission could duplicate deletes.** See M2
-  extension above.
-- **R3 (P1): Deferred orders never retried.** `runSubmission` only selected
-  `status='planned'`, so quota-deferred orders were stranded. The UI also
-  treated a day with no `planned` rows as complete.
-  **Fix**: `getPlannedOrders` SQL widened to `status IN ('planned','deferred')`;
-  per-day filter matched. UI day-advance logic respects deferred rows and
-  shows a tooltip explaining the rollover-then-retry path.
-- **R4 (P1): Hygiene POST retried on 5xx.** See M1 extension above.
-- **R5 (P1, originally flagged P2): Region selector ignored.** `namespaces.js`
-  and `identityGraph.js` used the process-wide `config.aep.identityRegion`,
-  ignoring the per-credential `region`. Wrong-region calls to
-  `/clusters/members` return 200 with empty cluster data — silent partial
-  deletes. **Fix**: `decryptCreds()` now returns `region`; both endpoint
-  builders use `creds.region` with the global as fallback. Test in
-  `test/region.test.js`.
-- **R6 (P2): Monthly-disabled jobs decremented monthly ledger on release.**
-  `release()` always touched both ledgers regardless of whether reserve
-  had used the monthly one. A failed job with monthly tracking off was
-  eating monthly headroom from unrelated jobs on the same org.
-  **Fix**: `release(orgId, count, monthlyLimit)` mirrors `reserve`'s gate;
-  callers pass `job.monthly_limit`. Test in `test/quotaManager.test.js`.
-- **R7 (P2): Recovery rolled back on 400.** A 400 from Adobe's list endpoint
-  used to be treated as "Adobe doesn't have this work order" → roll back to
-  `planned` + release quota. If Adobe had actually received the original
-  POST, the next submit created a duplicate.
-  **Fix**: 400 returns a `LOOKUP_INDETERMINATE` sentinel; the orphan stays
-  in `submitting` for next-startup retry. Test in `test/recovery.test.js`.
-- **R8 (P3): UI loaded Google Fonts.** Previous session added a Google
-  Fonts CDN load for Source Sans 3, contradicting the CLAUDE.md "no
-  outbound calls beyond Adobe" rule. **Fix**: 4 weights of Source Sans 3
-  woff2 self-hosted under `src/web/fonts/` (OFL-licensed).
+  4. Orphan recovery — if the process crashes between quota reservation
+     and Adobe's ACK, startup recovery looks up the work order by
+     displayName prefix. Confirmed-absent → roll back. Indeterminate
+     (Adobe returned 400 or network error) → leave as-is; retry next boot.
+     Never roll back when the answer is ambiguous.
+```
 
 ---
 
-## 6. Known limitations
+## 8. Environment Configuration Reference
 
-- **Single-process only.** Running two instances against the same `state.db`
-  will corrupt the WAL. No advisory lock today.
-- **OneDrive path locks** (Windows-specific). `data/` inside a OneDrive-synced
-  path can trigger `SQLITE_BUSY` during sync. Safer to move it outside.
-- **Monthly quota default is 3M.** This is a guess for a typical base Data
-  Hygiene contract — verify your actual monthly entitlement and override on
-  the Config tab.
-- **Quota release on network timeout.** If Adobe received the POST but the
-  response was dropped, we don't know and might under-count quota. Mitigated
-  by the hygiene POST being non-idempotent (no auto-retry on 5xx or network
-  errors; CLAUDE.md I11) and by the orphan-recovery routine on next startup
-  attempting reconciliation by `displayName` lookup.
-- **No multi-file upload.** One CSV per job.
-- **No built-in export-import of credentials.** Each machine encrypts with
-  its own `data/.key`. Moving creds requires re-entering them.
-- **UTC midnight rollover** — a job submitted at 11:59 PM local time that
-  Adobe processes after 00:00 UTC counts against the next day's quota.
-  Usually fine but worth knowing for operators outside UTC.
+### 8.1 Complete Environment Variable Reference
+
+All variables are optional. The tool runs with zero `.env` configuration
+on first launch. Set these to tune behavior for your deployment.
+
+#### Network & Server
+
+| Variable       | Default         | Description                                                                                                           |
+|----------------|-----------------|-----------------------------------------------------------------------------------------------------------------------|
+| `PORT`         | `3000`          | HTTP port the Express server listens on. Change if 3000 is in use.                                                    |
+| `HOST`         | `127.0.0.1`     | Bind address. Default is loopback-only (safe). Set to `0.0.0.0` ONLY for SSH-tunnel demos. Exposes the unauthenticated API to the LAN — add authentication before doing this in any shared environment. |
+| `OPEN_BROWSER` | `1`             | Set to `0` to prevent automatic browser launch on `npm start`.                                                        |
+
+#### Storage Paths
+
+| Variable      | Default                  | Description                                                                                                          |
+|---------------|--------------------------|----------------------------------------------------------------------------------------------------------------------|
+| `DATA_DIR`    | `./data`                 | Directory for all persistent state (database, encryption key, uploads, output). **Move this outside OneDrive / iCloud / Dropbox** to avoid cloud-sync interference with SQLite WAL files. Recommended: `%LOCALAPPDATA%\aep-lifecycle-helper` on Windows, `~/.local/share/aep-lifecycle-helper` on Linux/macOS. |
+| `DB_PATH`     | `$DATA_DIR/state.db`     | Override the SQLite database file path directly. Useful for pointing at an existing database from a different `DATA_DIR`. |
+| `UPLOAD_DIR`  | `$DATA_DIR/uploads`      | Directory for streamed CSV uploads. Must be writeable.                                                               |
+| `OUTPUT_DIR`  | `$DATA_DIR/output`       | Directory for exported result CSVs.                                                                                  |
+
+#### Security
+
+| Variable         | Default                 | Description                                                                                                           |
+|------------------|-------------------------|-----------------------------------------------------------------------------------------------------------------------|
+| `ENCRYPTION_KEY` | *(auto-generated)*      | 32-byte hex string used for AES-256-GCM encryption of client secrets. If not set, the key is auto-generated and stored in `$DATA_DIR/.key` on first run. Set this explicitly if you want the key to survive a `data/` reset, or to use a key managed by your secrets manager. **Do not commit this value.** |
+
+#### Performance Tuning (scalability knobs)
+
+| Variable                  | Default     | Description                                                                                                           |
+|---------------------------|-------------|-----------------------------------------------------------------------------------------------------------------------|
+| `SQLITE_CACHE_MB`         | `512`       | SQLite page cache in megabytes. Larger cache = fewer disk I/Os during expansion and planning. Each MB covers approximately 256 × 4KB pages. See per-machine recommendations below. |
+| `IDENTITY_CONCURRENCY`    | `10`        | Maximum parallel `POST /clusters/members` calls during expansion. Adobe's Identity Graph supports up to ~10–20 concurrent requests before 429 rate-limiting becomes frequent. |
+| `IDENTITY_BATCH_SIZE`     | `1000`      | Source identifiers per Identity Graph batch call. 1,000 is Adobe's hard maximum — do not increase. Decrease only if you encounter payload-size errors. |
+| `WORK_ORDER_CONCURRENCY`  | `2`         | Parallel work-order POSTs during submission. Adobe's Hygiene API is not highly parallelized — keep at 1–3. |
+| `MAX_IDS_PER_WORK_ORDER`  | `100000`    | Identifiers per work order. 100,000 is Adobe's hard maximum. Do not increase. Decrease only for debugging. |
+| `REQUEST_TIMEOUT_MS`      | `60000`     | HTTP request timeout in milliseconds (60 seconds). Increase for very slow network connections or VPN routing. |
+
+#### Quota Fallbacks
+
+These values are **fallbacks only**. The tool always prefers live quota from
+Adobe's `GET /quota` endpoint. These are used only when the endpoint is
+unreachable and no cache exists.
+
+| Variable                   | Default       | Description                                                                                                           |
+|----------------------------|---------------|-----------------------------------------------------------------------------------------------------------------------|
+| `DAILY_IDENTIFIER_LIMIT`   | `1000000`     | Fallback daily identifier deletion cap. Match your Adobe contract entitlement. |
+| `MONTHLY_IDENTIFIER_LIMIT` | `3000000`     | Fallback monthly identifier deletion cap. Match your Adobe contract. Set to `0` to disable monthly quota tracking (useful for contracts with no monthly cap). |
+
+#### Adobe Endpoints (advanced)
+
+| Variable              | Default                                    | Description                                                                                                           |
+|-----------------------|--------------------------------------------|-----------------------------------------------------------------------------------------------------------------------|
+| `AEP_GATEWAY`         | `https://platform.adobe.io`                | Base URL for all non-Identity AEP APIs. Override only for on-premise or staging environments. |
+| `IMS_HOST`            | `https://ims-na1.adobelogin.com`           | IMS authentication host. Override for non-production IMS environments. |
+| `IMS_SCOPE`           | *(standard AEP scopes)*                    | OAuth 2.0 scopes included in the token request. Change only if your Adobe organization uses a non-standard scope set. |
+| `AEP_IDENTITY_REGION` | `va7`                                      | Global fallback identity region. Used only when a credential row lacks a `region` value (pre-migration data). For all new credentials, region is stored per-credential. |
+
+### 8.2 Per-Machine Tuning Recommendations
+
+```
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │  QUICK-START  .env  (place in project root, never commit)            │
+  │                                                                      │
+  │  # ─── Storage (keep outside cloud sync) ─────────────────────────  │
+  │  # Windows: DATA_DIR=C:\Users\YourName\AppData\Local\aep-helper      │
+  │  # macOS:   DATA_DIR=/Users/YourName/.local/share/aep-helper         │
+  │  # Linux:   DATA_DIR=/home/YourName/.local/share/aep-helper          │
+  │                                                                      │
+  │  # ─── Performance (tune to your machine) ─────────────────────────  │
+  │  SQLITE_CACHE_MB=1024         # 16 GB laptop                         │
+  │  IDENTITY_CONCURRENCY=10      # default, safe for most orgs          │
+  └──────────────────────────────────────────────────────────────────────┘
+```
+
+| Machine type                 | `SQLITE_CACHE_MB` | `IDENTITY_CONCURRENCY` | Notes                                    |
+|------------------------------|-------------------|------------------------|------------------------------------------|
+| Laptop, 8–16 GB RAM          | `512` – `1024`    | `8` – `10`             | Default settings; no change needed       |
+| Laptop, 32 GB RAM            | `8192`            | `15`                   | Entire B-tree fits in RAM; no I/O degradation on large jobs |
+| Dedicated server, 8–16 GB RAM | `2048`           | `15` – `20`            | More headroom; adjust to available RAM   |
+| Dedicated server, 32+ GB RAM  | `4096`           | `20`                   | High throughput; watch Adobe 429 rate   |
+
+### 8.3 Development / Testing
+
+| Variable      | Default | Description                                                                                                           |
+|---------------|---------|-----------------------------------------------------------------------------------------------------------------------|
+| `SMOKE_SUBMIT`| *(unset)* | Set to `1` to allow the live smoke test (`test/smoke.live.js`) to submit actual work orders to Adobe. **Requires real credentials in environment variables.** Never set this in CI unless you intend live deletions. |
+
+### 8.4 Sample `.env` Files
+
+**Minimal (laptop, first run):**
+```env
+# No configuration needed — defaults work out of the box.
+# Optionally set DATA_DIR to keep data outside cloud sync:
+DATA_DIR=C:\Users\YourName\AppData\Local\aep-lifecycle-helper
+```
+
+**Tuned for a 32 GB Windows laptop:**
+```env
+DATA_DIR=C:\Users\YourName\AppData\Local\aep-lifecycle-helper
+SQLITE_CACHE_MB=8192
+IDENTITY_CONCURRENCY=15
+```
+
+**Tuned for a dedicated server:**
+```env
+DATA_DIR=/var/lib/aep-lifecycle-helper
+SQLITE_CACHE_MB=4096
+IDENTITY_CONCURRENCY=20
+WORK_ORDER_CONCURRENCY=2
+HOST=127.0.0.1
+OPEN_BROWSER=0
+```
+
+**Externally managed encryption key:**
+```env
+DATA_DIR=/var/lib/aep-lifecycle-helper
+ENCRYPTION_KEY=<32-byte-hex-from-your-secrets-manager>
+```
 
 ---
 
-## 7. Security model
+## 9. Operational Procedures
 
-### 7.1 In scope
+### 9.1 Prerequisites
 
-- Client secrets encrypted at rest (AES-256-GCM, per-row 12-byte IV,
-  16-byte auth tag) so that anyone with read access to `data/state.db`
-  but NOT the encryption key cannot impersonate credentials.
-- Encryption key lives at `data/.key`, 0600 permissions, auto-generated.
-- IMS tokens never written to disk.
-- Logs never print full tokens or client secrets (prefix-only for debug).
+```
+  Node.js 20 LTS  (required — better-sqlite3 needs prebuilt binaries)
 
-### 7.2 Out of scope
+  Windows:
+    winget install CoreyButler.NVMforWindows
+    nvm install 20.18.0
+    nvm use 20.18.0
 
-- **Compromised host.** If an attacker reads both `data/.key` AND
-  `data/state.db`, all secrets are exposed — but so is every other
-  credential on the machine.
-- **Network protection.** HTTP binds to `127.0.0.1` by default (now
-  enforced explicitly via `app.listen(port, host)`, not relied on as a
-  Node default), trusts whoever reaches the loopback socket. No auth on
-  the local UI by design. Setting `HOST=0.0.0.0` to expose the API
-  explicitly opts out of this security model.
-- **Multi-user separation.** This is a single-operator tool.
+  macOS / Linux:
+    curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
+    nvm install 20
+    nvm use 20
+```
 
----
+### 9.2 Installation & First Run
 
-## 8. Operational procedures
+```bash
+npm install          # compiles better-sqlite3 native binding
 
-### 8.1 First-time setup
+# Optional: create a .env file (see §8.4 above)
 
-1. `nvm install 20.18.0 && nvm use 20.18.0` (required — `better-sqlite3`
-   doesn't have prebuilt binaries for Node 24+ as of writing)
-2. `npm install` in the project directory
-3. `npm start` — browser opens to `http://localhost:3000`
-4. Enter IMS credentials on the Config tab; click Test Connection
-5. Pick a sandbox; datasets and namespaces auto-load
-6. Select deletion mode (specific datasets / ALL / profile-only)
-7. Go to Upload tab; pick the source namespace from the dropdown
-8. Drop the CSV; click Start Identity Expansion
-9. When expansion reaches 100%, click Plan Work Orders
-10. Review the plan; click Submit Day 1
+npm start            # starts server, opens browser at http://localhost:3000
+```
 
-### 8.2 Running tests
+1. **Config tab** — enter IMS credentials (Environment, IMS Org ID, Client ID,
+   Client Secret, Region). Click **Test Connection**. The tool fetches your live
+   daily and monthly quota and displays it in the banner.
+2. **Pick a sandbox** from the dropdown. Datasets and namespace registry load
+   automatically.
+3. **Select deletion scope**: ALL datasets, specific datasets, or profile-only
+   (Identity + Profile + AJO, no data lake).
+4. **Upload tab** — select the source namespace (e.g. `hashedKocid`), drop the
+   CSV, click **Start Identity Expansion**.
+5. Wait for expansion to complete (progress bar in the Jobs tab).
+6. Click **Plan Work Orders**. Review the day/month breakdown.
+7. Click **Submit Day 1**. Work orders are sent to Adobe.
+8. Switch to the **Monitor tab** to track progress.
+
+### 9.3 Running Tests
 
 ```bash
 node --test test
 ```
 
-Expected: **113 tests pass, 0 fail**. Current suite: 12 test files covering
-hygiene validators (27), namespace canonicalization (11), IMS token cache (7),
-quota manager (12, both daily + monthly + monthly-disabled release gating),
-plan logic (12, includes replan guard and deferred-tolerance tests),
-startup recovery (6, includes the 400-indeterminate test),
-adobeClient error enrichment + idempotency-aware retries (11),
-region routing per credential (3), deferred-row surfacing (1),
-credentials routes — PATCH non-secret-only safety + DELETE 409
-when jobs reference the cred (7), Monitor tab feed (filter, in-flight-first
-sort, within-bucket activity sort, sandbox filter, monitorTotals bucketing,
-monitorSandboxes distinct-with-counts, search-filter propagation) (11), and
-an end-to-end integration test with a fully-mocked Adobe (3) — last confirmed
-green on 2026-04-28.
+All 178 tests should pass. The suite covers:
+- Work-order payload validators (27 tests)
+- Namespace canonicalization (11 tests)
+- IMS token cache (7 tests)
+- Quota manager — daily, monthly, null-monthly release gating (12 tests)
+- Planner — cluster packing, replan guard, deferred tolerance (12 tests)
+- Startup recovery — orphan reconciliation, 400-indeterminate handling (6 tests)
+- Adobe client — error enrichment, idempotency-aware retries (11 tests)
+- Per-credential region routing (3 tests)
+- Credentials routes — PATCH non-secret safety, DELETE 409 (7 tests)
+- Monitor feed — sorting, filters, aggregates, sandbox filter (11 tests)
+- Approve-month gate (9 tests)
+- End-to-end integration with fully-mocked Adobe (3 tests)
 
-### 8.3 Recovering from a crash
+### 9.4 Recovering From a Crash
 
-Just restart the app. On startup, `runStartupRecovery()` will:
-- Resume any job in `status='expanding'` from its last committed source IDs.
-- Reconcile any work order in `status='submitting'` with no Adobe ID —
-  look up in Adobe, record ID if found; on confirmed no-match roll back to
-  `planned` and release quota; on indeterminate (400 from the listing
-  endpoint) or transient error, leave the orphan in `submitting` for the
-  next startup to retry. Never roll back when the answer is indeterminate.
+Restart the application — no manual action needed in the common case.
 
-No manual SQL intervention required in the common case.
+On startup, `runStartupRecovery()` automatically:
+- **Resumes expanding jobs.** Re-reads the CSV but skips already-processed
+  source IDs (built from the existing `expanded_identities` rows). No
+  redundant Adobe calls.
+- **Reconciles orphan work orders.** For each work order stuck in `submitting`
+  with no Adobe ID (the crash window), looks up the order in Adobe by its
+  `displayName` prefix:
+  - **Match found** — records the Adobe ID and hands off to the monitor.
+  - **Confirmed absent** — rolls back to `planned` and releases quota.
+  - **Indeterminate** (Adobe returned 400, network error) — leaves the orphan
+    for the next startup to retry. Never rolls back ambiguous cases.
 
-### 8.4 Rotating credentials
+### 9.5 Rotating Credentials
 
-1. Update the secret in the Adobe Developer Console.
-2. In the UI: Config tab → pick the saved credential → update the Client
-   Secret field → Test Connection. This re-saves the encrypted secret.
-   The in-memory IMS token cache auto-invalidates on the next 401.
+1. Update the secret in the **Adobe Developer Console**.
+2. Config tab → pick the saved credential from the dropdown → update
+   **Client Secret** → click **Test Connection**. The new encrypted secret
+   is saved. The in-memory token cache auto-invalidates on the next 401.
 
-### 8.5 Full reset
+### 9.6 Full Reset (wipe all state)
 
 ```bash
-# Close the app first (Ctrl+C)
+# Close the app first (Ctrl+C / close window)
 rm -rf data/
 npm start
 ```
 
-Wipes SQLite state, encryption key, uploads, exports. A fresh Config tab
-awaits.
+Deletes the SQLite database, encryption key, all uploads and exports.
+A fresh Config tab awaits on next start.
+
+### 9.7 Auto-Resume Scheduler
+
+The scheduler allows unattended operation across multi-day and multi-month
+jobs without the operator needing to manually click Submit each morning.
+
+Configure via **Settings tab** (or `PUT /api/settings/auto-resume`):
+
+| Setting               | Options                                    | Default    |
+|-----------------------|--------------------------------------------|------------|
+| Enabled               | on / off                                   | off        |
+| Local time            | HH:MM (24h, operator's local time)         | `09:00`    |
+| Days                  | every-day / weekdays / first-of-month      | every-day  |
+
+When the scheduler fires, it runs the full `runSubmission` pipeline
+(live quota refresh → redistribute → submit). A catch-up tick runs at boot
+so a laptop that was off at the scheduled time resumes within seconds.
 
 ---
 
-## 9. Extension points
+## 10. Design Decisions
 
-For future work:
+### 10.1 Why SQLite, Not Postgres or Redis
 
-- **Multi-operator support.** Would require moving state to Postgres,
-  locks for concurrent planning, and auth on the web UI.
-- **Webhook-based status updates.** Adobe doesn't currently emit webhooks
-  for work-order status; this is polling by necessity. If Adobe adds
-  webhooks, the monitor could be replaced with a `POST /api/callback` handler.
-- **Audit log.** `docs/CHANGELOG.md` tracks engineering changes but there's
-  no operator-facing log of every submission. Would be a one-table addition
-  and a new route.
-- **Batch CSV upload.** Today one CSV per job; a folder upload of many CSVs
-  would help ops running many deletions per day.
-- **Schema-aware dataset filtering.** Beyond `unifiedIdentity: enabled:true`,
-  pre-check each dataset's primary identity to warn the operator if a
-  namespace they're deleting isn't the dataset's primary identity (Adobe
-  silently skips such rows).
+This tool runs on one operator's laptop, not a distributed service. SQLite
+in WAL mode delivers:
+- Zero-administration durability (one file, crash-safe)
+- Fast concurrent reads during long writes
+- ~100k rows/sec bulk insert with prepared statements
+- No deployment complexity
+
+A distributed database would only be needed for multi-operator shared state —
+explicitly out of scope (see §11).
+
+### 10.2 Why Validate Before the Network
+
+Adobe's Data Hygiene API returns HTTP 400 on malformed payloads, but the cost
+of an undetected error (wrong namespace, wrong dataset ID) is a no-op delete
+that uses quota. Pre-validating also eliminates:
+- Wasted IMS token exchanges on doomed requests.
+- Cryptic Adobe error messages leaking to the UI.
+- Round-trip latency for mistakes catchable in microseconds.
+
+### 10.3 Why In-Memory IMS Tokens (Not Persisted)
+
+Bearer tokens are temporary secrets. Persisting them opens a ~24h window
+where anyone reading `data/state.db` can impersonate the operator. In-memory
+caching with thundering-herd coalescing regenerates in ~300ms on restart —
+the performance cost is negligible; the security benefit is material.
+
+### 10.4 Why the Hygiene POST Is Never Retried on 5xx
+
+Adobe's Data Hygiene work order creation is irreversible. A 5xx response could
+mean Adobe processed the request (and is returning an internal error) or did
+not (transient failure). Auto-retrying would create duplicate deletions in the
+first case. The safe path: don't retry; let startup recovery reconcile via
+`displayName` lookup on next boot.
+
+### 10.5 Why Deferred Dedup (No Unique Index on `expanded_identities`)
+
+On large jobs (8M+ rows), SQLite's B-tree unique index for deduplication
+becomes the dominant bottleneck:
+
+- Each `INSERT OR IGNORE` must traverse the full B-tree to check for
+  duplicates (~400MB of index pages at 8M rows)
+- With only 512MB cache, most page lookups hit disk
+- On Windows, each SQLite checkpoint triggers a Windows Defender scan,
+  inflating each fsync from ~1ms to 10–50ms
+
+Solution: remove the unique index; do plain `INSERT`; deduplicate at
+planning time via `GROUP BY (ns_code, ns_id, identity_id)`. This is O(1)
+per insert during expansion and the GROUP BY uses a full table scan once
+at planning time — much faster overall.
+
+### 10.6 Why Wave-Based Expansion Scheduling
+
+Creating all 1,570 batch promises at once (for a 1.57M-row CSV) allocates
+memory for every batch before any batch has completed, preventing garbage
+collection. Wave scheduling processes `concurrency × 2` batches at a time
+and pauses the CSV stream at each wave boundary. Memory use stays constant
+regardless of file size.
 
 ---
 
-## 10. Appendix — file map
+## 11. Known Limitations & Extension Points
+
+### 11.1 Current Limitations
+
+| Limitation                   | Detail                                                                                       |
+|------------------------------|----------------------------------------------------------------------------------------------|
+| Single-process only          | Running two instances against the same `data/state.db` will corrupt the WAL. No advisory lock. |
+| No multi-user auth           | The local web UI has no authentication. Whoever can reach `127.0.0.1:3000` has full access. |
+| Single source namespace      | All rows in the CSV are treated as one namespace. For mixed-namespace sources, run separate jobs per namespace. |
+| One CSV per job              | No batch/folder upload. Each deletion batch requires a separate job.                         |
+| No credential export         | Each machine encrypts with its own `data/.key`. Moving credentials to a new machine requires re-entering them. |
+| Monitor polls 60s            | Adobe doesn't emit webhooks for work-order status. 60-second polling is the only option.    |
+| UTC midnight quota rollover  | A job submitted at 11:59 PM local time that Adobe processes after 00:00 UTC counts against the next day's quota. |
+| OneDrive path warning        | SQLite WAL files inside a cloud-synced path can trigger `SQLITE_BUSY` errors. Set `DATA_DIR` outside the sync folder. |
+
+### 11.2 Extension Points
+
+These features are not currently implemented but are architecturally
+straightforward to add:
+
+| Feature                      | Implementation path                                                                          |
+|------------------------------|----------------------------------------------------------------------------------------------|
+| Multi-operator support       | Move state to Postgres; add session auth on the web UI; add advisory locks for concurrent planning |
+| Webhook-based status updates | Replace the 60s monitor with a `POST /api/callback` handler when Adobe adds webhook support  |
+| Operator audit log           | Wire `adobeClient.js` to insert one row per Adobe call into the existing `api_audit` table stub |
+| Batch CSV upload             | Add a folder-drop endpoint that creates one job per CSV file                                  |
+| Schema-aware dataset filter  | Pre-check each dataset's XDM primary identity via the Schema Registry API; warn if the deletion namespace isn't the primary |
+
+---
+
+## 12. Appendix — File Map
 
 ```
-src/
-├── index.js                        Express entrypoint + boot sequence
-├── config.js                       Env-overridable defaults
-├── db.js                           SQLite open + schema + migrations + prep stmts
-├── services/
-│   ├── imsAuth.js                  IMS token cache
-│   ├── adobeClient.js              axios client factory
-│   ├── sandboxes.js                Sandbox listing
-│   ├── datasets.js                 Dataset catalog (Identity-filtered)
-│   ├── namespaces.js               Namespace registry + canonicalize
-│   ├── identityGraph.js            Cluster expansion (both shape versions)
-│   ├── hygiene.js                  Work-order validation + POST
-│   └── quotaManager.js             Daily + monthly quota ledgers
-├── runner/
-│   ├── expansion.js                CSV → Identity Graph → SQLite
-│   ├── submission.js               Plan + quota-gated submit
-│   ├── monitor.js                  60s status poll
-│   └── recovery.js                 Startup reconciliation
-├── routes/
-│   ├── config.js                   Credential CRUD
-│   ├── adobe.js                    Sandbox / dataset / namespace endpoints
-│   ├── upload.js                   CSV upload + job create
-│   └── jobs.js                     Plan / submit / progress / export
-├── utils/
-│   ├── csv.js                      Streaming CSV read / write
-│   ├── crypto.js                   AES-256-GCM envelope
-│   └── logger.js                   Structured logger
-└── web/
-    ├── index.html                  UI templates (favicon + page-header gradient
-    │                               wrapper + cred-picker bar + identity-lock UI)
-    ├── styles.css                  Spectrum tokens + [hidden] fix + @font-face +
-    │                               .cred-picker / .identity-lock-row / .f-hint /
-    │                               .page-header gradient
-    ├── app.js                      Vanilla JS state + fetch orchestrator +
-    │                               cred-picker functions (refresh / add / remove /
-    │                               identity-lock toggle) + Save persistence
-    ├── aep-icon.svg                Local AEP brand mark (top bar + favicon)
-    ├── data-cleansing-icon.svg     Adobe's official Data Cleansing icon
-    │                               (sidebar app block via CSS mask, white on gradient)
-    └── fonts/                      Self-hosted Source Sans 3 woff2 (4 weights)
-
-test/
-├── hygiene.test.js                 Payload validators (27 tests)
-├── namespaces.test.js              Canonicalize + index (11 tests)
-├── imsAuth.test.js                 Token cache + nock (7 tests)
-├── quotaManager.test.js            Daily + monthly ledgers + null-monthly release (12)
-├── planWorkOrders.test.js          Cluster packing + replan guard + deferred (12)
-├── recovery.test.js                Startup reconciliation + 400-indeterminate (6)
-├── adobeClient.test.js             Error enrichment + idempotency-aware retries (11)
-├── region.test.js                  Per-credential region routing (3)
-├── deferred.test.js                Deferred-row surfacing (1)
-├── credentialsRoutes.test.js       PATCH non-secret-only + DELETE 409 (7)
-├── monitorJobs.test.js             Monitor feed: filter, in-flight-first sort, within-bucket activity sort, aggregates, search, sandbox filter, monitorTotals bucketing, monitorSandboxes distinct + search propagation (11)
-└── integration.test.js             End-to-end with full Adobe mocks (3 tests)
-
-docs/
-├── ARCHITECTURE.md                 Living architecture overview (orient here)
-├── CHANGELOG.md                    Append-only session log
-├── REVIEW.md                       Full review brief + Adobe contracts
-├── DESIGN_DOC.md                   This file (source for the Word export)
-├── DESIGN_DOC.docx                 Word-format export
-└── sample-source.csv               Tiny CSV for smoke testing
+aep-lifecycle-helper/
+├── src/
+│   ├── index.js                    Express entrypoint + boot sequence + runner startup
+│   ├── config.js                   All env-overridable defaults (the only place to add env vars)
+│   ├── db.js                       SQLite open + schema + migrations + all prepared statements
+│   │
+│   ├── services/                   Thin wrappers over Adobe APIs
+│   │   ├── imsAuth.js              IMS token cache + thundering-herd guard
+│   │   ├── adobeClient.js          axios factory (retry, backoff, auth inject, error enrichment)
+│   │   ├── sandboxes.js            GET /sandbox-management/
+│   │   ├── datasets.js             GET /catalog/dataSets (filtered to Identity-enabled)
+│   │   ├── namespaces.js           GET /idnamespace/identities + canonicalize()
+│   │   ├── identityGraph.js        POST /clusters/members (handles both response shapes)
+│   │   ├── hygiene.js              Work-order payload validation + POST /workorder
+│   │   ├── quotaApi.js             GET /quota (1h cache, 24h hard floor on stale)
+│   │   └── quotaManager.js         SQLite daily + monthly ledgers (atomic reserve/release)
+│   │
+│   ├── runner/                     In-process background work
+│   │   ├── expansion.js            CSV stream → wave-scheduled Identity Graph → SQLite
+│   │   ├── submission.js           Planner (replan guard) + quota-gated submission
+│   │   ├── redistributor.js        Re-buckets unshipped WOs against live Adobe quota
+│   │   ├── scheduler.js            Configurable daily auto-resume (setInterval 60s tick)
+│   │   ├── monitor.js              pLimit(5) status poll every 60s (up to 100 WOs per tick)
+│   │   └── recovery.js             Boot-time expansion resume + orphan WO reconciliation
+│   │
+│   ├── middleware/
+│   │   └── security.js             Host-header guard, Origin/Referer CSRF guard, error handler
+│   │
+│   ├── routes/
+│   │   ├── config.js               Credential CRUD (allowlisted region + environment)
+│   │   ├── adobe.js                Sandbox / dataset / namespace discovery + /quota
+│   │   ├── upload.js               CSV upload + job creation
+│   │   ├── jobs.js                 Plan / approve-month / submit / progress / export
+│   │   └── settings.js             GET/PUT /api/settings/auto-resume
+│   │
+│   ├── utils/
+│   │   ├── csv.js                  Streaming CSV read/write + formula-injection sanitiser
+│   │   ├── crypto.js               AES-256-GCM envelope + O_EXCL first-run key creation
+│   │   └── logger.js               Structured JSON or text logger
+│   │
+│   └── web/                        Zero-build static UI (no framework, no bundler)
+│       ├── index.html              Page template (Spectrum-styled, no CDN references)
+│       ├── styles.css              Spectrum tokens + @font-face (self-hosted only)
+│       ├── app.js                  Vanilla JS controller (~1,200 lines)
+│       ├── aep-icon.svg            Local AEP brand mark (top bar + favicon)
+│       ├── data-cleansing-icon.svg Adobe Data Cleansing icon (sidebar)
+│       └── fonts/                  Self-hosted Source Sans 3 (.woff2, OFL-licensed)
+│
+├── test/
+│   ├── hygiene.test.js             Work-order payload validators (27 tests)
+│   ├── namespaces.test.js          Namespace canonicalization + index (11 tests)
+│   ├── imsAuth.test.js             Token cache + thundering-herd + nock (7 tests)
+│   ├── quotaManager.test.js        Daily + monthly ledgers + null-monthly gate (12 tests)
+│   ├── planWorkOrders.test.js      Cluster packing + replan guard + deferred (12 tests)
+│   ├── recovery.test.js            Orphan reconciliation + 400-indeterminate (6 tests)
+│   ├── adobeClient.test.js         Error enrichment + idempotency-aware retries (11 tests)
+│   ├── region.test.js              Per-credential region routing (3 tests)
+│   ├── deferred.test.js            Deferred-row surfacing in submission (1 test)
+│   ├── credentialsRoutes.test.js   PATCH non-secret-only + DELETE 409 (7 tests)
+│   ├── monitorJobs.test.js         Monitor feed: sort, filter, aggregates (11 tests)
+│   ├── approveMonth.test.js        Per-month approval gate (9 tests)
+│   └── integration.test.js         End-to-end with fully-mocked Adobe (3 tests)
+│
+├── data/                           Created at runtime — NOT committed
+│   ├── state.db                    SQLite database (WAL mode)
+│   ├── .key                        AES-256 encryption key (chmod 600)
+│   ├── uploads/                    Streamed CSV uploads
+│   └── output/                     Exported result CSVs
+│
+├── docs/
+│   ├── DESIGN_DOC.md               This document
+│   ├── ARCHITECTURE.md             Living system overview (internal reference)
+│   ├── CHANGELOG.md                Append-only session log (internal reference)
+│   └── REVIEW.md                   Full review brief + Adobe API contracts (internal)
+│
+├── CLAUDE.md                       AI assistant guidelines + invariants (internal)
+├── README.md                       Quick-start guide
+├── package.json
+└── .gitignore                      Excludes data/, .env, node_modules/
 ```
+
+---
+
+*Document end — AEP Data Lifecycle Helper Design Document v2.0.0*
