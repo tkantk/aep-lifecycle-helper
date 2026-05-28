@@ -24,7 +24,9 @@ if (config.dbPath !== ':memory:') {
 export const db = new Database(config.dbPath);
 db.pragma('journal_mode = WAL');
 db.pragma('synchronous = NORMAL');
-db.pragma('cache_size = -262144');   // 256 MB — keeps B-tree pages hot during large expansion/planning
+// Negative cache_size = kilobytes; keeps B-tree pages hot during large expansion/planning.
+// Override via SQLITE_CACHE_MB env var (see config.js for per-machine recommendations).
+db.pragma(`cache_size = -${config.sqliteCacheMb * 1024}`);
 db.pragma('temp_store = MEMORY');
 db.pragma('foreign_keys = ON');
 db.pragma('wal_autocheckpoint = 8000'); // checkpoint every ~32 MB instead of default ~4 MB
@@ -92,8 +94,14 @@ export function initDb() {
 
     -- ─── Expanded identities ────────────────────────────────────────
     -- Stores both namespace CODE and numeric ID when available.
-    -- Dedup key is (job, code-or-nsid, id). We prefer code in the key; if
-    -- code is null we fall back to nsid so we still enforce uniqueness.
+    -- No unique index — dedup is deferred to planning time via GROUP BY in
+    -- streamIdentitiesBySource. This allows O(1) batch inserts during expansion
+    -- instead of O(log n) B-tree lookups that degrade progressively on large jobs
+    -- (8M rows → ~400 MB index pages, each lookup requiring multiple disk reads
+    -- when pages spill out of cache). Correctness is preserved:
+    --   • The planner GROUP BY emits one row per (ns, identity, source) triplet.
+    --   • normalizeNamespacesIdentities in hygiene.js deduplicates ids[] within
+    --     each namespace group before the Adobe POST.
     CREATE TABLE IF NOT EXISTS expanded_identities (
       job_id          TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
       ns_code         TEXT,
@@ -102,10 +110,6 @@ export function initDb() {
       source_id       TEXT NOT NULL,                   -- the original hashedKocid that led us here
       discovered_at   TEXT NOT NULL DEFAULT (datetime('now'))
     );
-    -- One of ns_code or ns_id must be present; enforce at insert time.
-    -- Unique constraint uses COALESCE to handle either-or:
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_ei_unique
-      ON expanded_identities(job_id, COALESCE(ns_code, ''), COALESCE(ns_id, 0), identity_id);
     CREATE INDEX IF NOT EXISTS idx_ei_job_source
       ON expanded_identities(job_id, source_id);
     CREATE INDEX IF NOT EXISTS idx_ei_job_ns
@@ -196,6 +200,12 @@ export function initDb() {
       if (!/duplicate column/i.test(err.message)) throw err;
     }
   }
+
+  // Drop the old unique index on expanded_identities if it still exists on an
+  // existing DB. Dedup is now deferred to planning time (GROUP BY in
+  // streamIdentitiesBySource), eliminating the O(log n) B-tree lookup on every
+  // insert that caused progressive slowdown on large jobs (>1M source IDs).
+  db.exec('DROP INDEX IF EXISTS idx_ei_unique');
 
   logger.info({ path: config.dbPath }, 'SQLite initialized');
 }
@@ -356,26 +366,51 @@ function prepared() {
     setPlannedOrders: db.prepare(`UPDATE jobs SET planned_orders = ?, updated_at = datetime('now') WHERE id = ?`),
 
     // ─── Identities ──────────────────────────────────────────────────
-    // Takes (job_id, ns_code, ns_id, identity_id, source_id)
+    // Takes (job_id, ns_code, ns_id, identity_id, source_id).
+    // Plain INSERT (no OR IGNORE) — dedup is deferred to planning time via
+    // GROUP BY in streamIdentitiesBySource, avoiding the O(log n) B-tree
+    // lookup on the old unique index that degraded on multi-million-row jobs.
     insertIdentity: db.prepare(`
-      INSERT OR IGNORE INTO expanded_identities (job_id, ns_code, ns_id, identity_id, source_id)
+      INSERT INTO expanded_identities (job_id, ns_code, ns_id, identity_id, source_id)
       VALUES (?, ?, ?, ?, ?)
     `),
+    // Dedup matches the old unique-index semantics: (ns_code, ns_id, identity_id)
+    // without source_id. The outer GROUP BY namespace collapses the deduplicated
+    // rows into per-namespace counts.
     countIdentitiesByNamespace: db.prepare(`
-      SELECT COALESCE(ns_code, 'nsid:' || ns_id) AS namespace,
-             COUNT(*) AS count
-        FROM expanded_identities
-       WHERE job_id = ?
-       GROUP BY namespace
+      SELECT COALESCE(ns_code, 'nsid:' || ns_id) AS namespace, COUNT(*) AS count
+        FROM (
+          SELECT ns_code, ns_id, identity_id
+            FROM expanded_identities WHERE job_id = ?
+           GROUP BY COALESCE(ns_code, ''), COALESCE(ns_id, 0), identity_id
+        )
+       GROUP BY COALESCE(ns_code, 'nsid:' || ns_id)
        ORDER BY count DESC
     `),
     // Iterate identities ordered by (source_id, ns_code) so cluster members
     // arrive contiguously; this lets the planner pack them together.
+    // GROUP BY on (ns_code, ns_id, identity_id) — same dedup key as the old
+    // unique index — ensures each identity appears at most once regardless of
+    // how many source_ids linked to it. MIN(source_id) picks the earliest
+    // cluster as the identity's home for packing purposes.
     streamIdentitiesBySource: db.prepare(`
-      SELECT ns_code, ns_id, identity_id, source_id
+      SELECT ns_code, ns_id, identity_id, MIN(source_id) AS source_id
         FROM expanded_identities
        WHERE job_id = ?
-       ORDER BY source_id, ns_code
+       GROUP BY COALESCE(ns_code, ''), COALESCE(ns_id, 0), identity_id
+       ORDER BY MIN(source_id), ns_code
+    `),
+    // Count of globally distinct (ns, identity) pairs — used after expansion
+    // completes to overwrite the running found_count with the true deduplicated
+    // total (matching the old unique-index semantics).
+    countDistinctIdentities: db.prepare(`
+      SELECT COUNT(*) AS n FROM (
+        SELECT DISTINCT COALESCE(ns_code, ''), COALESCE(ns_id, 0), identity_id
+          FROM expanded_identities WHERE job_id = ?
+      ) sub
+    `),
+    setFoundCount: db.prepare(`
+      UPDATE jobs SET found_count = ?, updated_at = datetime('now') WHERE id = ?
     `),
 
     // ─── Work orders ─────────────────────────────────────────────────
@@ -540,17 +575,14 @@ function prepared() {
 /**
  * Insert a batch of identities atomically.
  * Rows: Array<[job_id, ns_code, ns_id, identity_id, source_id]>
- * Returns count of NEW rows inserted (duplicates silently ignored).
+ * Returns the number of rows inserted (= rows.length; dedup is deferred to
+ * planning time — see streamIdentitiesBySource and countDistinctIdentities).
  */
 export function bulkInsertIdentities(rows) {
   const p = prepared();
   const tx = db.transaction((batch) => {
-    let inserted = 0;
-    for (const r of batch) {
-      const result = p.insertIdentity.run(r[0], r[1], r[2], r[3], r[4]);
-      inserted += result.changes;
-    }
-    return inserted;
+    for (const r of batch) p.insertIdentity.run(r[0], r[1], r[2], r[3], r[4]);
+    return batch.length;
   });
   return tx(rows);
 }
