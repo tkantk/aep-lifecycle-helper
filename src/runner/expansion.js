@@ -182,8 +182,17 @@ export async function runExpansion({
 
   try {
     await drainWave();
+
+    // With deferred dedup (no unique index), found_count was incremented with
+    // raw insert counts that may include duplicates. Overwrite with the true
+    // distinct total now that all rows are in the table. This is a single
+    // COUNT DISTINCT subquery — cheap compared to a full expansion run.
+    const distinct = q().countDistinctIdentities.get(jobId)?.n ?? 0;
+    q().setFoundCount.run(distinct, jobId);
+    progress.found = distinct;
+
     q().updateJobStatus.run('expanded', null, jobId);
-    logger.info({ jobId, processed: progress.processed, found: progress.found }, 'expansion complete');
+    logger.info({ jobId, processed: progress.processed, found: distinct }, 'expansion complete');
   } catch (err) {
     q().updateJobStatus.run('failed', err.message, jobId);
     throw err;
