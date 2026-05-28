@@ -94,6 +94,12 @@ export function planWorkOrders({ jobId, datasetIds, dailyLimit, targetServices, 
   let bundle = [];
   let bundleSourceId = null;
 
+  // Phase 1 accumulator: built up during streaming iteration, then bulk-
+  // inserted in a single transaction in Phase 2 (see below). Keeping this
+  // out of the DB during iteration is what lets us use .iterate() — the
+  // big memory win over the previous .all()-then-write approach.
+  const pendingOrders = [];
+
   const commitBundle = () => {
     if (bundle.length === 0) return;
 
@@ -127,7 +133,7 @@ export function planWorkOrders({ jobId, datasetIds, dailyLimit, targetServices, 
     plannedThisDay += current.total;
 
     const groups = [...current.byNs.values()];
-    q().insertWorkOrder.run({
+    pendingOrders.push({
       id: uuid(),
       jobId,
       dayIndex,
@@ -141,28 +147,34 @@ export function planWorkOrders({ jobId, datasetIds, dailyLimit, targetServices, 
     current = makeEmptyOrder();
   };
 
-  // ─── Iterate identities from SQLite, source-ordered ───────────────────
-  // Use .all() (not .iterate()) because better-sqlite3 locks the connection while
-  // an iterator is active. The planner must insert work orders mid-flow (whenever
-  // flushOrder fires on a cluster boundary), which would otherwise throw
-  // "This database connection is busy executing a query".
+  // ─── Two-phase planning ───────────────────────────────────────────────
+  // Phase 1: stream identities with .iterate() — no DB writes during the
+  //   loop, so better-sqlite3's "connection busy" lock doesn't trip.
+  //   Builds work-order plans into `pendingOrders` (an array of JS objects).
+  //   Streaming avoids materialising the deduplicated identity set in JS
+  //   heap; on a 6M-unique-identity job that's ~480 MB → ~120 MB (plan only).
   //
-  // All insertWorkOrder.run() calls are wrapped in a single db.transaction so
-  // that all work-order rows are flushed to WAL in one fsync instead of one
-  // fsync per work order. At 1,500+ work orders on Windows (where each fsync
-  // can take 10–50ms under Defender), this cuts planning time from ~minutes
-  // to ~seconds.
-  const rows = q().streamIdentitiesBySource.all(jobId);
-  db.transaction(() => {
-    for (const row of rows) {
-      if (row.source_id !== bundleSourceId) {
-        commitBundle();
-        bundleSourceId = row.source_id;
-      }
-      bundle.push(row);
+  // Phase 2: bulk-insert all work orders in a single db.transaction so all
+  //   rows are flushed to WAL in one fsync rather than one per WO. On
+  //   Windows (where each fsync can take 10-50ms under Defender), this
+  //   cuts planning time from ~minutes to ~seconds for 1500+ WO jobs.
+  //
+  // The two phases MUST stay strictly separated: better-sqlite3 locks the
+  // connection while an iterator is active, so any insertWorkOrder.run()
+  // call inside the iterate() loop would throw "This database connection
+  // is busy executing a query".
+  for (const row of q().streamIdentitiesBySource.iterate(jobId)) {
+    if (row.source_id !== bundleSourceId) {
+      commitBundle();
+      bundleSourceId = row.source_id;
     }
-    commitBundle();
-    flushOrder();
+    bundle.push(row);
+  }
+  commitBundle();
+  flushOrder();
+
+  db.transaction(() => {
+    for (const wo of pendingOrders) q().insertWorkOrder.run(wo);
   })();
 
   q().setPlannedOrders.run(planned, jobId);

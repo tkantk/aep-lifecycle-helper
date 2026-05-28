@@ -9,6 +9,52 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-05-28 — Follow-up perf review (Opus 4.7)
+
+Second-pass review of the day's perf fixes. Two further wins applied:
+
+### Backend — monitor (`src/runner/monitor.js`)
+
+- **Per-tick `decryptCreds` cache** — the previous tick called `decryptCreds`
+  once per work order, but with up to 100 WOs sharing typically 1-3 distinct
+  credentials, that meant 95-99 wasted AES-256-GCM decrypts per minute. New
+  `getCreds(credsId)` helper caches the **Promise** (not the resolved value)
+  inside the tick closure, so parallel `pLimit(5)` callers all share one
+  in-flight decrypt for any given creds_id. Saves ~100-500 ms CPU/tick.
+
+### Backend — planning (`src/runner/submission.js`)
+
+- **Two-phase planner refactor** — replaced
+  `const rows = streamIdentitiesBySource.all(jobId)` (which materialised the
+  full deduplicated identity set into JS objects — ~480 MB for a 6M-unique
+  job) with a streaming `.iterate()` loop that builds a `pendingOrders` array
+  of work-order plans. Phase 2 bulk-inserts all work orders in one
+  `db.transaction()`. Memory drops from ~480 MB → ~120 MB on the big job
+  shape; planning time unchanged (the single-tx fsync win still applies).
+  Strict separation between phases is mandatory: better-sqlite3 locks the
+  connection while an iterator is active, so any `insertWorkOrder.run()`
+  during the iterate() loop would throw "connection busy".
+
+### Docs (`docs/DESIGN_DOC.md`, `docs/DESIGN_DOC.docx`)
+
+- **Architecture diagram** — rebuilt at uniform 78-char width. Fixes a 1-col
+  misalignment between the bottom-border `╤` (col 35) and the arrow `│`
+  below it (col 36). Replaced the nested inner-box layout with flat sections
+  (Routes / Runners / Adobe Services / Security / Persistence) — easier to
+  scan in print.
+- **State machine diagram (§4.1)** — complete redesign. The previous diagram
+  had inconsistent box widths, an arrow that pointed into the side of the
+  SUBMITTING box (`└──────────────►│  Failure`), and an unclear
+  AWAITING_APPROVAL connection that hung off the bottom of the main flow.
+  New version uses a coherent top-down flow: PLANNED + AWAITING_APPROVAL
+  entry → runSubmission → quota decision → SUBMITTING / DEFERRED →
+  SUBMITTED / FAILED → terminal. Crash recovery is documented separately
+  in a text block instead of dangling arrows.
+
+178 tests still pass.
+
+---
+
 ## 2026-05-28 — Performance fixes for large jobs (1M+ source IDs)
 
 Context: a 1.57M source-ID job was run on a corporate Windows laptop. Identity
