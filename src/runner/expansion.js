@@ -83,12 +83,21 @@ export async function runExpansion({
   }
 
   // ─── Pipeline: CSV stream → batch buffer → p-limit workers → SQLite ───
+  //
+  // Wave-based scheduling: instead of pushing all ~1500 batch tasks into
+  // p-limit at once (which keeps every batch array + Adobe response in heap
+  // until Promise.all resolves at the very end), we submit WAVE_SIZE tasks
+  // at a time and await each wave before the CSV stream advances. This keeps
+  // peak heap usage proportional to (concurrency × wave multiplier) rather
+  // than the total number of batches, and lets GC reclaim completed batch
+  // data continuously across the run. Critical for multi-million-ID jobs on
+  // memory-constrained Windows laptops.
   const limit = pLimit(config.identityConcurrency);
+  const WAVE_SIZE = config.identityConcurrency * 2; // 20 batches max in-flight
   let buffer = [];
-  const tasks = [];
-  // Abort flag: once any batch throws, in-queue batches skip their DB writes
-  // so the progress counters don't keep incrementing after the job is failed.
+  let wave   = [];
   let aborted = false;
+  let skipped = 0;
 
   const submitBatch = (batch) => limit(async () => {
     if (aborted) return;
@@ -136,29 +145,43 @@ export async function runExpansion({
     }
   });
 
-  let skipped = 0;
+  // Drain the current wave: await all in-flight tasks, then clear so GC can
+  // reclaim the batch arrays and Adobe response objects from completed tasks.
+  const drainWave = async () => {
+    if (wave.length === 0) return;
+    const current = wave;
+    wave = [];
+    await Promise.all(current); // propagates the first rejection if any task failed
+  };
+
+  // onRow is async so that csv.js's `await onRow(...)` provides natural
+  // backpressure — the CSV stream pauses at each wave boundary until the
+  // in-flight Adobe calls complete.
   await streamIds(uploadPath, {
     column,
-    onRow: (value) => {
-      if (skipSourceIds && skipSourceIds.has(value)) {
-        skipped++;
-        return;
-      }
+    onRow: async (value) => {
+      if (aborted) return;
+      if (skipSourceIds?.has(value)) { skipped++; return; }
       buffer.push(value);
       if (buffer.length >= config.identityBatchSize) {
-        tasks.push(submitBatch(buffer));
+        wave.push(submitBatch(buffer));
         buffer = [];
+        if (wave.length >= WAVE_SIZE) {
+          await drainWave(); // blocks CSV stream until this wave clears
+        }
       }
-    }
+    },
   });
-  if (skipSourceIds) {
-    logger.info({ jobId, skipped, remaining: buffer.length + tasks.length * config.identityBatchSize },
-      'resumed expansion: skipped already-processed source ids');
+
+  if (skipSourceIds && skipped > 0) {
+    logger.info({ jobId, skipped }, 'resumed expansion: skipped already-processed source ids');
   }
-  if (buffer.length > 0) tasks.push(submitBatch(buffer));
+
+  // Flush any remaining partial buffer and the last partial wave.
+  if (buffer.length > 0) wave.push(submitBatch(buffer));
 
   try {
-    await Promise.all(tasks);
+    await drainWave();
     q().updateJobStatus.run('expanded', null, jobId);
     logger.info({ jobId, processed: progress.processed, found: progress.found }, 'expansion complete');
   } catch (err) {
