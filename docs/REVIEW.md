@@ -50,10 +50,13 @@ plus UUID validation on every `:id` / `:credsId` path param.
 `quota_usage`, `quota_usage_monthly`, `app_settings`.
 
 **Concurrency**: all work happens in the event loop. Identity-graph
-expansion uses `p-limit(10)` for 10 parallel Adobe calls; work-order
-submission uses `p-limit(2)`. Two `setInterval(60s)` background tickers
-— the monitor (status polling) and the scheduler (auto-resume,
-Phase 3). No worker threads, no child processes.
+expansion uses `p-limit(10)` for 10 parallel Adobe calls with a
+wave-based scheduler (WAVE_SIZE = 20) so peak heap stays bounded
+regardless of job size; work-order submission uses `p-limit(2)`;
+monitor status polling uses `p-limit(5)` over up to 100 open WOs per
+tick. Two `setInterval(60s)` background tickers — the monitor (status
+polling) and the scheduler (auto-resume, Phase 3). No worker threads,
+no child processes.
 
 **Quota model**: Adobe `GET /data/core/hygiene/quota` is the source of
 truth at runtime. Cached 1h in-memory per `imsOrgId`; refreshed before
@@ -113,9 +116,14 @@ with auto-populated forms and live quota banners.
 │              │    (region from creds, NOT process default; allowlist
 │              │     defence-in-depth in services/namespaces.js +
 │              │     services/identityGraph.js).
-│              │    Canonicalize every returned identity to {code, id}
-│              │    INSERT OR IGNORE into expanded_identities
-│              │    (dedup key: job_id, ns_code||'', ns_id||0, identity_id).
+│              │    Canonicalize every returned identity to {code, id}.
+│              │    Plain INSERT into expanded_identities (no unique index;
+│              │    dedup deferred to planning-time GROUP BY — O(1) per row
+│              │    vs. O(log n) B-tree lookup on old unique index).
+│              │    Wave-based: WAVE_SIZE batches in-flight at once; onRow
+│              │    is async so CSV stream pauses at each wave boundary.
+│              │    After all waves drain, COUNT DISTINCT overwrites
+│              │    found_count with the true deduplicated total.
 │              │  Progress updated in memory + DB.
 └──────┬───────┘
        ▼
@@ -171,9 +179,9 @@ with auto-populated forms and live quota banners.
 ┌──────────────┐  setInterval(60s). Finds work orders where
 │ 6. Monitor   │    adobe_workorder_id IS NOT NULL AND
 │              │    adobe_status NOT IN ('completed','failed').
-│              │  GET /data/core/hygiene/workorder/{id}
+│              │  pLimit(5) concurrent GET /data/core/hygiene/workorder/{id}.
 │              │  Update adobe_status, product_status_details.
-│              │  Up to 30 polls per tick (rate limiting).
+│              │  Up to 100 polls per tick (~15 min for 1,500 open WOs).
 │              │  UI: per-work-order rich cards (Adobe ID, dates,
 │              │  identifier count, status pill, "Status by service"
 │              │  breakdown matching AEP's own detail screen).
@@ -624,7 +632,9 @@ After canonicalization, we insert these tuples (job_id, ns_code, ns_id, identity
 
 ### Step 5 — plan work orders
 
-Query `SELECT … FROM expanded_identities WHERE job_id=? ORDER BY source_id, ns_code`.
+Query uses `GROUP BY COALESCE(ns_code,''), COALESCE(ns_id,0), identity_id` with
+`MIN(source_id)` to deduplicate at read time (same semantics as the old unique
+index, but deferred so inserts stay O(1)).
 
 Planner collects cluster bundles (all rows with same `source_id`), packs
 them into a single work order (total 7 ids << 100k):
@@ -676,9 +686,12 @@ Full DDL in `src/db.js::initDb()`. Summary:
   month_index for shift detection — used by the UI to render the
   per-poll "plan extended" toast/modal.
 - **expanded_identities** — per-cluster-member rows. Both `ns_code` and
-  `ns_id` stored. Unique index on `(job_id, COALESCE(ns_code,''),
-  COALESCE(ns_id,0), identity_id)` so dedup works regardless of whether
-  Adobe returned us the code, the nsid, or both.
+  `ns_id` stored. **No unique index** — dedup is deferred to planning
+  time via `GROUP BY COALESCE(ns_code,''), COALESCE(ns_id,0), identity_id`
+  in `streamIdentitiesBySource`. The old unique index (`idx_ei_unique`)
+  is dropped at boot via migration on existing DBs. This makes each
+  INSERT O(1) instead of O(log n), eliminating the progressive slowdown
+  on jobs with 1M+ source IDs where the index would grow to ~400 MB.
 - **work_orders** — one per Adobe work order. `namespaces_identities` is
   the full JSON payload (we store it so we can retry or audit later).
   `month_index` (Phase 2) + `day_index` form the bucket label assigned
@@ -699,13 +712,18 @@ Full DDL in `src/db.js::initDb()`. Summary:
 
 ### Within expansion
 - CSV stream feeds a buffer. Every 1000 rows, a `p-limit(N)`-gated
-  async task is kicked off.
-- All tasks resolve before the runner returns.
+  async task is queued into the current wave.
+- Wave-based scheduling: at most `WAVE_SIZE = concurrency × 2` (default 20)
+  in-flight tasks at once. `onRow` is async, so `await drainWave()` blocks
+  the CSV stream at each wave boundary. This caps peak heap at
+  O(concurrency × batchSize) regardless of job size.
 - Each task:
   - Calls Adobe once (via retry-wrapped axios).
   - Builds a row array.
   - Calls `bulkInsertIdentities(rows)` which runs a single SQLite
-    transaction. `INSERT OR IGNORE` handles dedup.
+    transaction. Plain `INSERT` (no `OR IGNORE`) — O(1) per row.
+- After all waves complete, `countDistinctIdentities` computes the true
+  deduped total and `setFoundCount` overwrites `found_count` on the job row.
 
 ### Within submission
 - `p-limit(2)` over planned-or-deferred orders.
@@ -721,9 +739,10 @@ Full DDL in `src/db.js::initDb()`. Summary:
 
 ### Status monitor
 - `setInterval(60_000, tick)`.
-- Each tick selects up to 30 open work orders (to avoid overrunning
-  Adobe's rate limits on GETs during long runs).
-- Polls each serially within the tick.
+- Each tick selects up to 100 open work orders.
+- Polls via `pLimit(5)` — 5 concurrent Adobe GETs per tick instead of
+  serial. At 1,500+ open WOs the full poll cycle drops from ~52 min to
+  ~15 min.
 
 ### Auto-resume scheduler (Phase 3)
 - `setInterval(60_000, tick)` (separate from the monitor's interval).
@@ -745,9 +764,12 @@ Full DDL in `src/db.js::initDb()`. Summary:
   throws `quota_unavailable` so Plan + Submit refuse to ship blind.
 
 ### Race conditions we explicitly considered
-- **Two expansion batches inserting the same identity**: handled by
-  `INSERT OR IGNORE` on the unique index. Both may succeed; only one row
-  lands.
+- **Two expansion batches inserting the same identity**: wave-based
+  scheduling limits concurrent inserts to `WAVE_SIZE` tasks. Duplicate
+  rows may land (no unique index), but `streamIdentitiesBySource`'s
+  GROUP BY deduplicates them at planning time. The work-order payload
+  is always clean because `normalizeNamespacesIdentities` further
+  deduplicates `ids[]` before the Adobe POST.
 - **Parallel submissions racing for quota**: SQLite serializes writes;
   `reserve()` reads-then-writes inside the same statement via
   `ON CONFLICT DO UPDATE`. No lost-update possible.
@@ -892,7 +914,7 @@ Documented in `CLAUDE.md` but critical for review:
 
 ## 10. Test coverage and gaps
 
-**169 tests** as of the current codebase (`npm test`).
+**178 tests** as of the current codebase (`npm test`).
 
 ### What IS covered (`test/*.test.js`)
 
@@ -930,6 +952,14 @@ Documented in `CLAUDE.md` but critical for review:
 - Shipped work orders are immutable — redistributor never touches them.
 - Empty job → no-op.
 - `shiftedFromPrevious` flag set correctly when quota forces a shift.
+
+**Approval gate (`approveMonth.test.js`, 9 tests)**
+- Happy path: 2 awaiting_approval WOs flipped to planned.
+- Idempotency: re-approving the same month returns 404.
+- Validation: monthIndex=1 (auto-submitted, no approval needed) → 400;
+  non-integer, missing, zero → 400.
+- No awaiting WOs for the month → 404.
+- Unknown job → 404.
 
 **Phase 3 — scheduler (`scheduler.test.js`, 20 tests)**
 - Pure-function `shouldFireNow` covers: disabled; before fire time;
@@ -1046,6 +1076,10 @@ Please consider these explicitly in your audit:
     better-sqlite3 transactions are synchronous but our caller is async.
     Is there any code path where two async tasks could call
     `bulkInsertIdentities` simultaneously and confuse better-sqlite3?
+    (With deferred dedup, simultaneous inserts of the same identity are
+    now allowed — both rows land. Dedup happens in `streamIdentitiesBySource`
+    at planning time. Is there a scenario where this two-step dedup could
+    produce an incorrect work-order payload?)
 
 11. The quota `reserve()` function does:
     ```js
