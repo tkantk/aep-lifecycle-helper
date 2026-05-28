@@ -91,91 +91,69 @@ operators can stop and resume at any time.
 
 ### 2.1 High-Level Architecture
 
+The tool is a single Node.js process running on the operator's machine.
+There is no cloud infrastructure — all data, state, and secrets live
+locally. The only outbound traffic is HTTPS calls to Adobe's documented
+APIs.
+
 ```
-╔══════════════════════════════════════════════════════════════════════════╗
-║                         OPERATOR'S MACHINE                               ║
-║                                                                          ║
-║  ┌─────────────────────────────────────────────────────────────────┐    ║
-║  │  Web Browser  (http://127.0.0.1:3000)                           │    ║
-║  │                                                                  │    ║
-║  │  ┌──────────────┐  ┌──────────────┐  ┌───────────┐  ┌───────┐  │    ║
-║  │  │  Config tab  │  │  Upload tab  │  │ Jobs tab  │  │Monitor│  │    ║
-║  │  │  Credentials │  │  CSV ingest  │  │ Plan+     │  │  tab  │  │    ║
-║  │  │  Sandbox pick│  │  Expansion   │  │ Submit    │  │ 60s   │  │    ║
-║  │  └──────────────┘  └──────────────┘  └───────────┘  └───────┘  │    ║
-║  └─────────────────────────────┬───────────────────────────────────┘    ║
-║                                 │  HTTP  fetch /api/*                    ║
-║                                 ▼                                        ║
-║  ┌──────────────────────────────────────────────────────────────────┐   ║
-║  │  Node.js Express Server  (src/index.js)                          │   ║
-║  │                                                                  │   ║
-║  │  ┌─────────────────────────┐   ┌──────────────────────────────┐ │   ║
-║  │  │  REST API Routes        │   │  Background Runners          │ │   ║
-║  │  │                         │   │                              │ │   ║
-║  │  │  /api/config/*          │   │  expansion.js                │ │   ║
-║  │  │    Credential CRUD      │   │    CSV → Identity Graph      │ │   ║
-║  │  │  /api/jobs/*            │   │                              │ │   ║
-║  │  │    Plan/Submit/Progress │   │  submission.js               │ │   ║
-║  │  │  /api/adobe/*           │   │    Quota-gated work order    │ │   ║
-║  │  │    Sandbox/Dataset/NS   │   │    creation + Adobe POST     │ │   ║
-║  │  │  /api/settings/*        │   │                              │ │   ║
-║  │  │    Auto-resume config   │   │  monitor.js (every 60s)      │ │   ║
-║  │  │                         │   │    Poll Adobe WO status      │ │   ║
-║  │  │  Security Middleware    │   │                              │ │   ║
-║  │  │    Host-header guard    │   │  recovery.js (boot-time)     │ │   ║
-║  │  │    CSRF guard           │   │    Reconcile orphan orders   │ │   ║
-║  │  │    Helmet / CSP         │   │                              │ │   ║
-║  │  └─────────────────────────┘   │  scheduler.js (opt-in)       │ │   ║
-║  │                                │    Daily auto-resume         │ │   ║
-║  │                                └──────────────────────────────┘ │   ║
-║  │                                                                  │   ║
-║  │  ┌──────────────────────────────────────────────────────────┐   │   ║
-║  │  │  Adobe Service Layer                                      │   │   ║
-║  │  │                                                           │   │   ║
-║  │  │  imsAuth.js      ·  adobeClient.js  ·  sandboxes.js      │   │   ║
-║  │  │  datasets.js     ·  namespaces.js   ·  identityGraph.js  │   │   ║
-║  │  │  hygiene.js      ·  quotaApi.js     ·  quotaManager.js   │   │   ║
-║  │  └──────────────────────────────────────────────────────────┘   │   ║
-║  │                                                                  │   ║
-║  │  ┌──────────────────────────────────────────────────────────┐   │   ║
-║  │  │  SQLite (WAL mode)  data/state.db                        │   │   ║
-║  │  │                                                           │   │   ║
-║  │  │  credentials        ·  sandbox_configs                    │   │   ║
-║  │  │  jobs               ·  expanded_identities                │   │   ║
-║  │  │  work_orders        ·  quota_usage                        │   │   ║
-║  │  │  quota_usage_monthly·  app_settings                       │   │   ║
-║  │  └──────────────────────────────────────────────────────────┘   │   ║
-║  └──────────────────────────────────────────────────────────────────┘   ║
-║                                                                          ║
-║  data/                                                                   ║
-║    state.db       ← all persistent state                                 ║
-║    .key           ← AES-256 encryption key (chmod 600, never synced)     ║
-║    uploads/       ← streamed CSV files                                   ║
-║    output/        ← exported result CSVs                                 ║
-╚═════════════════════════════════╤════════════════════════════════════════╝
-                                   │  HTTPS  (TLS 1.2+, Adobe mTLS)
-                                   ▼
-         ╔═════════════════════════════════════════════════════╗
-         ║           Adobe Experience Platform                  ║
-         ║                                                      ║
-         ║  ┌────────────────────┐  ┌───────────────────────┐  ║
-         ║  │  IMS Auth          │  │  Identity Service     │  ║
-         ║  │  ims-na1.adobe.    │  │  platform-{region}.   │  ║
-         ║  │  login.com         │  │  adobe.io             │  ║
-         ║  │                    │  │  /clusters/members    │  ║
-         ║  │  /ims/token/v3     │  │  /idnamespace/        │  ║
-         ║  │  Bearer token      │  │    identities         │  ║
-         ║  └────────────────────┘  └───────────────────────┘  ║
-         ║                                                      ║
-         ║  ┌────────────────────┐  ┌───────────────────────┐  ║
-         ║  │  Platform Services │  │  Data Hygiene API     │  ║
-         ║  │  platform.adobe.io │  │  platform.adobe.io    │  ║
-         ║  │                    │  │                       │  ║
-         ║  │  /sandbox-mgmt/    │  │  POST /workorder      │  ║
-         ║  │  /catalog/dataSets │  │  GET  /workorder/{id} │  ║
-         ║  └────────────────────┘  │  GET  /quota          │  ║
-         ║                          └───────────────────────┘  ║
-         ╚═════════════════════════════════════════════════════╝
+┌────────────────────────────────────────────────────────────────────────────┐
+│                          OPERATOR'S MACHINE                                │
+├────────────────────────────────────────────────────────────────────────────┤
+│                                                                            │
+│  Browser  ──HTTP──►  Express server  (src/index.js, 127.0.0.1:3000)        │
+│                                                                            │
+│  REST API Routes                  Background Runners                       │
+│  ─────────────────                ──────────────────────                   │
+│  /api/config/*                    expansion.js   CSV → Identity Graph      │
+│  /api/adobe/*                     submission.js  Plan + quota-gated POST   │
+│  /api/upload                      redistributor  Re-bucket vs live quota   │
+│  /api/jobs/*                      monitor.js     60s WO status polling     │
+│  /api/settings/*                  recovery.js    Boot-time reconciliation  │
+│                                   scheduler.js   Auto-resume (opt-in)      │
+│                                                                            │
+│  Adobe Service Layer              Security Middleware                      │
+│  ─────────────────────            ──────────────────────                  │
+│  imsAuth      adobeClient         Host-header guard (DNS rebinding)        │
+│  sandboxes    datasets            Origin / Referer guard (CSRF)            │
+│  namespaces   identityGraph       Helmet (CSP, COOP, CORP)                 │
+│  hygiene      quotaApi            AES-256-GCM credential encryption        │
+│  quotaManager                                                              │
+│                                                                            │
+│  Persistence  (data/ directory — never committed, never cloud-synced):     │
+│    state.db     SQLite (WAL mode) — every table lives here                 │
+│    .key         AES-256 encryption key (chmod 600, never synced)           │
+│    uploads/     Streamed CSV uploads                                       │
+│    output/      Exported result CSVs                                       │
+│                                                                            │
+│  SQLite tables: credentials · sandbox_configs · jobs · work_orders         │
+│                 expanded_identities · quota_usage · quota_usage_monthly    │
+│                 app_settings                                               │
+│                                                                            │
+└─────────────────────────────────────┬──────────────────────────────────────┘
+                                      │  HTTPS  (TLS 1.2+)
+                                      ▼
+┌────────────────────────────────────────────────────────────────────────────┐
+│                       ADOBE EXPERIENCE PLATFORM                            │
+├────────────────────────────────────────────────────────────────────────────┤
+│                                                                            │
+│  IMS Authentication       POST /ims/token/v3                               │
+│                           Host: ims-na1.adobelogin.com                     │
+│                                                                            │
+│  Identity Service         POST /data/core/identity/clusters/members        │
+│  (region-sharded)         GET  /data/core/idnamespace/identities           │
+│                           Host: platform-{region}.adobe.io                 │
+│                                                                            │
+│  Platform Services        GET  /data/foundation/sandbox-management/        │
+│                           GET  /data/foundation/catalog/dataSets           │
+│                           Host: platform.adobe.io                          │
+│                                                                            │
+│  Data Hygiene API         POST /data/core/hygiene/workorder    (DESTRUCTIVE│
+│  (the destructive one)    GET  /data/core/hygiene/workorder/{id}  — never  │
+│                           GET  /data/core/hygiene/quota         auto-retried)│
+│                           Host: platform.adobe.io                          │
+│                                                                            │
+└────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 2.2 Component Summary
@@ -412,64 +390,86 @@ operators can stop and resume at any time.
 
 ### 4.1 State Machine
 
+The work-order lifecycle is a strict state machine. Every state transition
+is logged. Terminal states (`completed`, `failed`) never move backward.
+
 ```
-                         ┌──────────────────────┐
-                         │  Job in status:       │
-                         │  expanded / ready     │
-                         └──────────┬───────────┘
-                                    │  POST /api/jobs/:id/plan
-                                    ▼
-                         ┌──────────────────────┐
-                   ┌────►│      PLANNED          │
-                   │     │  Ready to submit      │◄──────────────────────┐
-                   │     └──────────┬───────────┘                        │
-                   │                │  runSubmission picks up             │
-                   │                ▼                                     │
-                   │     ┌──────────────────────┐                        │
-                   │     │  Quota available?     │                        │
-                   │     └──┬─────────────────┬─┘                        │
-                   │        │ No              │ Yes                       │
-                   │        ▼                 ▼                           │
-                   │  ┌──────────┐   ┌───────────────────┐               │
-                   │  │ DEFERRED │   │    SUBMITTING      │               │
-                   │  │          │   │  POST in-flight    │               │
-                   │  │  Daily   │   │  (crash window)    │               │
-                   │  │  cap hit │   └──────┬──────┬──────┘               │
-                   │  └─────┬────┘          │      │                      │
-                   │        │ UTC midnight  │      │                      │
-                   │        └──────────────►│  Failure                   │
-                   │                        │  (quota released)           │
-                   │                   Success                            │
-                   │                        │                             │
-                   │                        ▼                             │
-                   │             ┌──────────────────────┐                 │
-                   │             │     SUBMITTED         │                 │
-                   │             │  Adobe has ACKed      │                 │
-                   │             └──────────┬───────────┘                 │
-                   │                        │  monitor polls              │
-                   │                        ▼                             │
-                   │             ┌──────────────────────┐                 │
-                   │             │  Adobe status         │                 │
-                   │             │  received             │                 │
-                   │             │  validated            │                 │
-                   │             │  submitted            │                 │
-                   │             │  ingested             │                 │
-                   │             └──────┬──────┬─────────┘                │
-                   │                    │      │                           │
-                   │               failed  completed  (startup recovery   │
-                   │                    │      │       matches orphan) ───►┘
-                   │                    ▼      ▼
-                   │             ┌────────┐  ┌────────────────┐
-                   │             │ FAILED │  │   COMPLETED    │
-                   │             │        │  │  (terminal)    │
-                   │             └────────┘  └────────────────┘
-                   │
-  ┌────────────────┴──────────────────────┐
-  │        AWAITING_APPROVAL              │
-  │  Month 2+ WOs — held until operator   │
-  │  clicks "Approve Month N"             │──── operator approves ─────────►
-  │  POST /api/jobs/:id/approve-month     │
-  └───────────────────────────────────────┘
+ENTRY — from POST /api/jobs/:id/plan
+─────────────────────────────────────────────────────────────────────────────
+
+        ┌──────────────────┐              ┌─────────────────────────┐
+        │     PLANNED      │              │   AWAITING_APPROVAL     │
+        │   Month 1 WOs    │              │   Month 2+ WOs          │
+        └────────┬─────────┘              └────────────┬────────────┘
+                 │                                     │
+                 │              Operator clicks "Approve Month N":
+                 │              POST /api/jobs/:id/approve-month
+                 │                                     │
+                 │   ┌─────────────────────────────────┘
+                 │   │  (Month N flips to planned)
+                 ▼   ▼
+        ┌──────────────────────────┐
+        │  runSubmission picks up  │ ◄────── DEFERRED rows retry here
+        └────────────┬─────────────┘         after UTC rollover (daily
+                     │                       or monthly)
+                     ▼                                          ▲
+          ┌──────────────────────┐                              │
+          │  Reserve quota       │                              │
+          │  (atomic SQLite tx:  │                              │
+          │   daily + monthly)   │                              │
+          └────┬────────────┬────┘                              │
+        GRANTED            DENIED                               │
+               │              │                                 │
+               ▼              ▼                                 │
+        ┌─────────────┐  ┌──────────────┐                       │
+        │ SUBMITTING  │  │   DEFERRED   │───────────────────────┘
+        │             │  │              │
+        │ POST Adobe  │  │ Quota cap    │
+        │ /workorder  │  │ hit; waits   │
+        └──┬───────┬──┘  │ for rollover │
+       2xx │       │     └──────────────┘
+           │       │ 4xx / 5xx / network
+           │       │ (quota released; never auto-retried)
+           ▼       ▼
+   ┌─────────────┐  ┌──────────────┐
+   │  SUBMITTED  │  │    FAILED    │
+   │  Adobe ACK  │  │  (terminal)  │
+   └──────┬──────┘  └──────────────┘
+          │
+          │  monitor.js polls GET /workorder/{id} every 60 seconds
+          ▼
+  ┌────────────────────────────────────────────────┐
+  │  Adobe-side status progression:                │
+  │    received → validated → submitted →          │
+  │    ingested → COMPLETED   OR   FAILED          │
+  └────────────────┬──────────────────────┬────────┘
+                   ▼                      ▼
+            ┌──────────────┐       ┌──────────────┐
+            │  COMPLETED   │       │    FAILED    │
+            │  (terminal)  │       │  (terminal)  │
+            └──────────────┘       └──────────────┘
+```
+
+**Crash recovery (boot-time, in `runner/recovery.js`):**
+
+When the process crashes between quota reservation and Adobe's POST
+acknowledgment, work orders are left as orphans (`status='submitting'`
+with `adobe_workorder_id IS NULL`). On next startup, recovery looks each
+one up in Adobe by `displayName` prefix and applies the appropriate
+resolution:
+
+```
+ ┌─ Match found in Adobe (displayName-prefix list lookup returns the WO)
+ │     → record adobe_workorder_id; status → SUBMITTED  (monitor takes over)
+ │
+ ├─ Confirmed absent (Adobe returned 200 OK, our prefix not in the list)
+ │     → release quota; status → PLANNED  (next submit run retries safely)
+ │
+ └─ Lookup indeterminate (Adobe returned 4xx / 5xx / network error)
+       → leave as SUBMITTING; retry reconciliation on the NEXT boot
+         Never roll back when the answer is ambiguous, because rolling
+         back could create a duplicate Adobe work order if the original
+         POST had actually been processed.
 ```
 
 ### 4.2 Status Reference

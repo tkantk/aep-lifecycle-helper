@@ -31,10 +31,23 @@ async function tick() {
     const open = q().listOpenWorkOrders.all();
     if (open.length === 0) return;
 
+    // Per-tick credential cache. Most ticks hit 1-3 distinct creds_ids across
+    // 100 work orders; without this we'd decrypt the same secret up to 100x
+    // per minute. Cache the PROMISE so parallel callers share one decrypt.
+    const credsCache = new Map();
+    const getCreds = (credsId) => {
+      let p = credsCache.get(credsId);
+      if (!p) {
+        p = decryptCreds(credsId);
+        credsCache.set(credsId, p);
+      }
+      return p;
+    };
+
     const limit = pLimit(POLL_CONCURRENCY);
     await Promise.all(open.map(wo => limit(async () => {
       try {
-        const creds = await decryptCreds(wo.j_creds_id);
+        const creds = await getCreds(wo.j_creds_id);
         const adobe = await getWorkOrder({
           creds,
           sandboxName: wo.j_sandbox_name,
