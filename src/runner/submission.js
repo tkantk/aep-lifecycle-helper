@@ -4,7 +4,7 @@ import { submitWorkOrder } from '../services/hygiene.js';
 import { reserve, release } from '../services/quotaManager.js';
 import { getOrgQuota } from '../services/quotaApi.js';
 import { redistributeUnshippedOrders } from './redistributor.js';
-import { q } from '../db.js';
+import { q, db } from '../db.js';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { decryptCreds } from '../utils/crypto.js';
@@ -146,16 +146,24 @@ export function planWorkOrders({ jobId, datasetIds, dailyLimit, targetServices, 
   // an iterator is active. The planner must insert work orders mid-flow (whenever
   // flushOrder fires on a cluster boundary), which would otherwise throw
   // "This database connection is busy executing a query".
+  //
+  // All insertWorkOrder.run() calls are wrapped in a single db.transaction so
+  // that all work-order rows are flushed to WAL in one fsync instead of one
+  // fsync per work order. At 1,500+ work orders on Windows (where each fsync
+  // can take 10–50ms under Defender), this cuts planning time from ~minutes
+  // to ~seconds.
   const rows = q().streamIdentitiesBySource.all(jobId);
-  for (const row of rows) {
-    if (row.source_id !== bundleSourceId) {
-      commitBundle();
-      bundleSourceId = row.source_id;
+  db.transaction(() => {
+    for (const row of rows) {
+      if (row.source_id !== bundleSourceId) {
+        commitBundle();
+        bundleSourceId = row.source_id;
+      }
+      bundle.push(row);
     }
-    bundle.push(row);
-  }
-  commitBundle();
-  flushOrder();
+    commitBundle();
+    flushOrder();
+  })();
 
   q().setPlannedOrders.run(planned, jobId);
   q().updateJobStatus.run('ready', null, jobId);
