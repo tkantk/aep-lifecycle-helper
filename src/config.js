@@ -56,6 +56,15 @@ export const config = {
   // ─── Throughput (the scalability knobs) ────────────────────────────
   // These are the only things that matter for scaling up. Bump concurrency
   // if you have fast bandwidth and Adobe isn't 429-ing you.
+
+  // SQLite page cache. Larger = fewer disk I/Os during expansion + planning.
+  // Each MB covers ~256 4 KB pages. Recommended values (set via SQLITE_CACHE_MB):
+  //   16 GB laptop  →  1024   (1 GB)
+  //   32 GB laptop  →  8192   (8 GB — entire B-tree fits in RAM)
+  //   dedicated server →  2048  (2 GB baseline; tune up with available RAM)
+  // Default 512 MB is safe for any machine with ≥4 GB RAM.
+  sqliteCacheMb: Number(process.env.SQLITE_CACHE_MB) || 512,
+
   identityBatchSize: Number(process.env.IDENTITY_BATCH_SIZE) || 1000,
   identityConcurrency: Number(process.env.IDENTITY_CONCURRENCY) || 10,
   workOrderConcurrency: Number(process.env.WORK_ORDER_CONCURRENCY) || 2,
