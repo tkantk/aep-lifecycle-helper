@@ -9,6 +9,95 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-05-28 — Performance fixes for large jobs (1M+ source IDs)
+
+Context: a 1.57M source-ID job was run on a corporate Windows laptop. Identity
+expansion was fast for the first ~700 batches but degraded progressively to the
+point of taking >3.5 hours total. Root cause was a three-layer SQLite + Windows
+interaction: (1) `INSERT OR IGNORE` had to traverse a unique B-tree index that
+grew to ~400 MB / ~8M rows, making each insert O(log n) instead of O(1); (2)
+WAL auto-checkpoint every ~4 MB triggered Windows Defender scans on every
+checkpoint, turning each fsync from ~1 ms to 10–50 ms; (3) all 1,570 wave
+tasks were queued in `Promise.all` at once, keeping every batch array and Adobe
+response in heap until the very end, preventing GC from reclaiming completed work.
+This session lands five fixes across expansion, planning, monitoring, and the
+SQLite config layer.
+
+### Backend — expansion (`src/runner/expansion.js`)
+
+- **Wave-based task scheduling** — replaced a single `Promise.all(tasks)` over
+  all ~1,570 batch closures with a rolling wave-window of
+  `WAVE_SIZE = identityConcurrency × 2` (default 20). The `onRow` callback is
+  now `async`; `await drainWave()` is called when the wave fills up, providing
+  natural CSV backpressure. At completion, GC reclaims completed batch arrays
+  continuously rather than holding all of them until the final `.all()` resolves.
+  This caps peak heap at O(concurrency × batchSize) regardless of job size.
+- **True distinct count after expansion** — with deferred dedup (see db.js),
+  `found_count` was incremented with raw insert counts. After all waves drain,
+  `countDistinctIdentities` runs a single `COUNT DISTINCT` query and overwrites
+  `found_count` via `setFoundCount`, restoring pre-dedup semantics for the UI.
+
+### Backend — planning (`src/runner/submission.js`)
+
+- **Single-transaction work-order flush** — all `insertWorkOrder.run()` calls
+  inside `planWorkOrders` are now wrapped in a single `db.transaction()`. On
+  Windows, each SQLite auto-commit triggers an fsync; for 1,500+ work orders
+  this was taking minutes under Defender. Wrapping in one transaction reduces
+  it to a single fsync (~10–50 ms total).
+
+### Backend — monitor (`src/runner/monitor.js`)
+
+- **Parallel status polling** — `tick()` now uses `pLimit(5)` to fire up to
+  5 concurrent `GET /hygiene/workorder/{id}` calls instead of polling serially.
+  At 1,500+ open work orders the full poll cycle drops from ~52 min to ~15 min.
+  Also raised `listOpenWorkOrders` LIMIT from 30 to 100.
+
+### Backend — SQLite tuning (`src/db.js`, `src/config.js`)
+
+- **Configurable page-cache** — `cache_size` pragma now reads from
+  `config.sqliteCacheMb` (default 512 MB; was hard-coded 256 MB). Set via
+  `SQLITE_CACHE_MB` env var. On a 32 GB laptop `SQLITE_CACHE_MB=8192` keeps
+  the entire B-tree in RAM, preventing the cache-thrash that amplified under
+  Defender once the index spilled past the 256 MB window.
+- **WAL checkpoint threshold raised** — `wal_autocheckpoint` bumped from the
+  SQLite default of 1,000 pages (~4 MB) to 8,000 pages (~32 MB). Reduces
+  checkpoint frequency by 8×, cutting Defender scan overhead proportionally.
+- **Deferred identity dedup** — the most impactful structural fix:
+  - Removed `CREATE UNIQUE INDEX idx_ei_unique` from fresh-DB schema. Added a
+    startup `DROP INDEX IF EXISTS idx_ei_unique` migration for existing DBs.
+  - Changed `insertIdentity` from `INSERT OR IGNORE` to plain `INSERT` —
+    O(1) per insert regardless of table size; no B-tree lookup needed.
+  - Dedup moved to planning time: `streamIdentitiesBySource` now uses
+    `GROUP BY COALESCE(ns_code,''), COALESCE(ns_id,0), identity_id` with
+    `MIN(source_id)` — exactly the same dedup key as the old unique index,
+    so each identity still appears at most once in any work order payload.
+  - `countIdentitiesByNamespace` updated with the same inner `GROUP BY` so
+    the Plan tab's namespace-breakdown table remains correct.
+  - Correctness preserved by `hygiene.js::normalizeNamespacesIdentities`,
+    which already deduplicates `ids[]` within each namespace group before
+    the Adobe POST.
+  - `bulkInsertIdentities` simplified: no longer tracks `result.changes`
+    (every insert now succeeds); returns `batch.length` directly.
+
+### Docs (`README.md`)
+
+- **Tuning guide** added to the Architecture section: a table with recommended
+  `SQLITE_CACHE_MB` and `IDENTITY_CONCURRENCY` values per machine class
+  (16 GB laptop, 32 GB laptop, 8–16 GB server, 32+ GB server), with notes on
+  Adobe 429 headroom. `SQLITE_CACHE_MB` documented in the `.env` config block.
+
+### Expected impact on a 1.57M source-ID job
+
+Removing the unique index + raising the cache size cuts expansion time by
+~70–80% (the dominant bottleneck). Planning drops from ~minutes to ~seconds
+with the transaction fix. Monitor poll cycle: 52 min → ~15 min.
+On a 32 GB laptop with `SQLITE_CACHE_MB=8192` and `IDENTITY_CONCURRENCY=15`
+the 1.57M job should complete expansion in under 45 minutes vs >3.5 hours.
+
+**178/178 tests pass.**
+
+---
+
 ## 2026-05-18 — Per-month approval gate for multi-month deletion plans
 
 Context: the client raised a concern that with multi-month plans the tool was
