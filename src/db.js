@@ -24,9 +24,10 @@ if (config.dbPath !== ':memory:') {
 export const db = new Database(config.dbPath);
 db.pragma('journal_mode = WAL');
 db.pragma('synchronous = NORMAL');
-db.pragma('cache_size = -64000');    // 64 MB
+db.pragma('cache_size = -262144');   // 256 MB — keeps B-tree pages hot during large expansion/planning
 db.pragma('temp_store = MEMORY');
 db.pragma('foreign_keys = ON');
+db.pragma('wal_autocheckpoint = 8000'); // checkpoint every ~32 MB instead of default ~4 MB
 
 export function initDb() {
   db.exec(`
@@ -464,7 +465,7 @@ function prepared() {
         FROM work_orders w JOIN jobs j ON j.id = w.job_id
        WHERE w.adobe_workorder_id IS NOT NULL
          AND (w.adobe_status IS NULL OR w.adobe_status NOT IN ('completed','failed'))
-       LIMIT 30
+       LIMIT 100
     `),
     countWorkOrdersByStatus: db.prepare(`
       SELECT status, COUNT(*) AS count FROM work_orders WHERE job_id = ? GROUP BY status
