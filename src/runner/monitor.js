@@ -1,3 +1,4 @@
+import pLimit from 'p-limit';
 import { getWorkOrder } from '../services/hygiene.js';
 import { q } from '../db.js';
 import { logger } from '../utils/logger.js';
@@ -10,12 +11,13 @@ import { decryptCreds } from '../utils/crypto.js';
  * to Adobe but haven't reached a terminal status yet, and updates their
  * status in the local DB.
  *
- * To avoid hammering Adobe, each poll checks at most 30 open orders per
- * tick. For a typical helper session (tens to low hundreds of orders)
- * this is plenty.
+ * Each tick polls up to 100 open orders with 5 concurrent Adobe GETs.
+ * At 1,500+ work orders (large jobs) this completes a full poll cycle
+ * in ~15 min instead of ~52 min with the old serial/30-limit approach.
  */
 
 const POLL_INTERVAL_MS = 60_000;
+const POLL_CONCURRENCY = 5;
 
 export function startMonitor() {
   setInterval(tick, POLL_INTERVAL_MS);
@@ -29,7 +31,8 @@ async function tick() {
     const open = q().listOpenWorkOrders.all();
     if (open.length === 0) return;
 
-    for (const wo of open) {
+    const limit = pLimit(POLL_CONCURRENCY);
+    await Promise.all(open.map(wo => limit(async () => {
       try {
         const creds = await decryptCreds(wo.j_creds_id);
         const adobe = await getWorkOrder({
@@ -49,7 +52,7 @@ async function tick() {
       } catch (err) {
         logger.warn({ workOrderId: wo.id, err: err.message }, 'status poll failed - will retry');
       }
-    }
+    })));
   } catch (err) {
     logger.error({ err: err.message }, 'monitor tick error');
   }
