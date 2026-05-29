@@ -55,6 +55,50 @@ async function http(method, path, body) {
   return data;
 }
 
+// ─── UI: debounced click handler for destructive buttons ─────────────
+/**
+ * Wraps an async click handler so the button is disabled while it's running.
+ * Prevents the double-submit race that hit the 2026-05-28 1.57M-row run —
+ * a rapid second click (or UI auto-retry) firing the same destructive
+ * endpoint before the first response returned, which on /export tripped
+ * the (now-fixed) cached-prepared-statement "busy" error and on /plan
+ * could have triggered duplicate work-order emission.
+ *
+ * Use for any button that POSTs/PATCHes/DELETEs, kicks off a long-running
+ * server job, or whose duplicate execution would be expensive or destructive.
+ *
+ *   onClickGuarded($('#btn-submit'), submitHandler, { loadingText: 'Submitting…' });
+ *
+ * Behaviour:
+ *   • Click → disable button + set loadingText (if provided) → run handler.
+ *   • On settle (success OR error) → re-enable + restore original text.
+ *   • If a click fires while a handler is in flight, it is dropped silently
+ *     (the disabled attribute prevents most cases; the in-flight flag
+ *     guards programmatic re-enable paths).
+ */
+function onClickGuarded(btn, handler, { loadingText } = {}) {
+  if (!btn) return;
+  let inFlight = false;
+  btn.addEventListener('click', async (ev) => {
+    if (inFlight || btn.disabled) {
+      ev.preventDefault();
+      ev.stopImmediatePropagation();
+      return;
+    }
+    inFlight = true;
+    const originalText = btn.textContent;
+    btn.disabled = true;
+    if (loadingText) btn.textContent = loadingText;
+    try {
+      await handler(ev);
+    } finally {
+      inFlight = false;
+      btn.disabled = false;
+      if (loadingText) btn.textContent = originalText;
+    }
+  });
+}
+
 // ─── Steps & routing ───────────────────────────────────────────────────
 const STEPS = {
   config:  { title: 'Environment Configuration', sub: 'Configure IMS credentials and sandbox for the Data Lifecycle API.', crumbs: ['Data Management', 'Environment Configuration'], render: renderConfig },
@@ -106,15 +150,15 @@ async function renderConfig() {
     $('#toggle-secret').textContent = inp.type === 'password' ? 'show' : 'hide';
   });
 
-  $('#btn-test').addEventListener('click', testConnection);
-  $('#btn-save-creds').addEventListener('click', saveAndContinue);
+  onClickGuarded($('#btn-test'),       testConnection,    { loadingText: 'Testing…' });
+  onClickGuarded($('#btn-save-creds'), saveAndContinue,   { loadingText: 'Saving…'  });
   $('#btn-refresh-sandboxes').addEventListener('click', () => loadSandboxes(true));
   $('#btn-refresh-datasets').addEventListener('click', () => loadDatasets(true));
   $('#btn-refresh-quota').addEventListener('click', () => loadOrgQuota(true));
   $('#c-sandbox-picker').addEventListener('change', onSandboxChange);
   $('#c-delete-mode').addEventListener('change', onDeleteModeChange);
   $('#btn-cred-add').addEventListener('click', addNewCredentialFlow);
-  $('#btn-cred-remove').addEventListener('click', removeCurrentCredential);
+  onClickGuarded($('#btn-cred-remove'), removeCurrentCredential, { loadingText: 'Removing…' });
   $('#btn-edit-identity').addEventListener('click', unlockIdentityFields);
   $('#cred-picker').addEventListener('change', onCredPickerChange);
 
@@ -765,7 +809,9 @@ function renderUpload() {
     handleFile(e.dataTransfer.files[0]);
   });
   fi.addEventListener('change', e => handleFile(e.target.files[0]));
-  $('#btn-start-expand').addEventListener('click', startExpansion);
+  // CRITICAL: a duplicate click would create a second job for the same CSV.
+  // Disable on click until the first request returns.
+  onClickGuarded($('#btn-start-expand'), startExpansion, { loadingText: 'Starting expansion…' });
   $('#c-source-ns').addEventListener('change', onSourceNsChange);
   $('#btn-refresh-namespaces').addEventListener('click', () => loadNamespaces(true));
 
@@ -857,7 +903,14 @@ async function renderExpand() {
     </div>`;
     return;
   }
-  $('#btn-export-csv').addEventListener('click', () => window.location.href = `${API}/jobs/${state.job.id}/export`);
+  // Export is a browser navigation (window.location), so we can't await its
+  // completion. Hold the disable for 3 s so a rapid double-click can't
+  // re-trigger /export — even though the server is now collision-safe
+  // (see fix on 2026-05-29), duplicate downloads still waste resources.
+  onClickGuarded($('#btn-export-csv'), async () => {
+    window.location.href = `${API}/jobs/${state.job.id}/export`;
+    await new Promise(r => setTimeout(r, 3000));
+  }, { loadingText: 'Preparing download…' });
   $('#btn-goto-plan').addEventListener('click', () => goto('plan'));
 
   // Show a loader immediately so the pane isn't blank while we wait for
@@ -952,7 +1005,10 @@ async function renderPlan() {
         <div>No plan yet for this job.</div>
         <button class="btn btn-primary" id="btn-build-plan" style="margin-top:16px">Build plan</button>
       </div>`;
-    $('#btn-build-plan').addEventListener('click', () => buildOrRebuildPlan());
+    // CRITICAL: duplicate Plan clicks could have raced before today's fixes.
+    // Server-side ReplanForbiddenError now guards correctness, but UI-level
+    // debounce keeps a single click from spawning two in-flight Plan calls.
+    onClickGuarded($('#btn-build-plan'), buildOrRebuildPlan, { loadingText: 'Planning…' });
     return;
   }
 
@@ -1125,7 +1181,7 @@ async function renderPlanResults(wos, container) {
     </div>`;
 
   const btn = target.querySelector('#btn-replan');
-  if (btn && !replanDisabled) btn.addEventListener('click', () => buildOrRebuildPlan());
+  if (btn && !replanDisabled) onClickGuarded(btn, buildOrRebuildPlan, { loadingText: 'Re-planning…' });
 
   // Wire up "Approve Month N" buttons. Each button flips that month's
   // awaiting_approval WOs to planned, then re-renders the plan results.
@@ -1282,7 +1338,11 @@ async function renderSubmit() {
 
   await refresh();
 
-  $('#btn-submit-day').addEventListener('click', async () => {
+  // CRITICAL: a duplicate Submit click fires two POST /jobs/:id/submit calls.
+  // The server has its own inFlight guard (submission.js), but UI-level
+  // debounce prevents the user from seeing two confirmation modals at all
+  // and stops the server-side guard from ever needing to engage.
+  onClickGuarded($('#btn-submit-day'), async () => {
     const today = state.workOrders.filter(w => w.day_index === state.currentDay);
     if (today.every(w => !['planned', 'deferred'].includes(w.status))) {
       if (state.currentDay < totalDays) state.currentDay++;

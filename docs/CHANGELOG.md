@@ -9,6 +9,54 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-05-29 — UI button debounce + concurrency audit
+
+Follow-up to the statement-busy fix earlier today. The server side is now
+collision-safe; this lands the UI side so a rapid double-click can't trigger
+duplicate destructive requests in the first place.
+
+### Frontend (`src/web/app.js`)
+
+- **`onClickGuarded(btn, handler, opts)` helper.** Wraps an async click
+  handler to disable the button for the duration of the request and
+  optionally show a "loading" label. Drops any clicks that arrive while
+  the handler is in flight. Pattern doc-commented next to the helper.
+- **Applied to all destructive buttons:**
+  - `#btn-test` — Adobe IMS round-trip
+  - `#btn-save-creds` — POST/PATCH `/credentials`
+  - `#btn-cred-remove` — DELETE `/credentials/:id`
+  - `#btn-start-expand` — kicks off a new job; duplicate would create
+    two parallel expansion runs on the same CSV
+  - `#btn-export-csv` — 3 s hold since browser navigation is fire-and-
+    forget (this is the button that triggered the 2026-05-28 crash)
+  - `#btn-build-plan` / `#btn-replan` — POST `/plan`
+  - `#btn-submit-day` — POST `/submit`; server has its own inFlight
+    guard, this is defence-in-depth
+- **Intentionally NOT guarded:**
+  - `#btn-cred-add`, `#btn-edit-identity` — UI-only state toggles
+  - `#btn-refresh-*` — idempotent reads, safe to retry
+  - `#btn-goto-*` — tab navigation
+  - Auto-resume `#btn-ar-save` — already does manual disable correctly
+
+### Backend concurrency audit (no code changes — confirmation only)
+
+- **`.iterate()` on cached prepared Statements:** 0 remaining sites.
+  Earlier today both planner and export migrated to the
+  `prepareStreamIdentitiesBySource()` factory. No other queries use
+  `.iterate()`.
+- **`db.transaction(...)` callbacks:** 3 sites in `src/` (db.js,
+  redistributor.js, submission.js). All take synchronous callbacks; no
+  `db.transaction(async ...)` anti-pattern (which would commit the
+  transaction before the async work finished).
+- **Per-job locks:** `runSubmission` keeps its module-level `inFlight`
+  Set. Plan / Approve-month handlers are synchronous — concurrent calls
+  serialize on the event loop and the second sees the first's state
+  (e.g. `ReplanForbiddenError` from a duplicate Plan).
+
+179 tests still pass.
+
+---
+
 ## 2026-05-29 — Fix "statement busy" crash on /export (and now planner-during-export)
 
 Root cause traced from a 2026-05-28 production log:
