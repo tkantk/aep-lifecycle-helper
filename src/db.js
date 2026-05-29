@@ -511,6 +511,12 @@ function prepared() {
     countWorkOrdersByStatus: db.prepare(`
       SELECT status, COUNT(*) AS count FROM work_orders WHERE job_id = ? GROUP BY status
     `),
+    // Hard-delete a job and everything that references it. The FK CASCADE on
+    // expanded_identities + work_orders (set up in initDb above) removes the
+    // dependent rows in the same statement, so this single DELETE collapses
+    // potentially millions of rows. Caller is responsible for cleaning up
+    // associated filesystem artefacts (uploaded CSV, exported CSV).
+    deleteJob: db.prepare('DELETE FROM jobs WHERE id = ?'),
 
     // ─── Quota (daily) ────────────────────────────────────────────────
     getQuota: db.prepare(`SELECT used FROM quota_usage WHERE ims_org_id = ? AND utc_date = ?`),

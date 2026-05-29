@@ -10,6 +10,7 @@ import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { registerUuidParamGuards } from '../middleware/security.js';
 import path from 'node:path';
+import fs from 'node:fs';
 
 const router = Router();
 registerUuidParamGuards(router);   // :id is the job UUID (used by /export, /plan, /submit, etc.)
@@ -231,6 +232,86 @@ router.get('/:id/export', async (req, res, next) => {
     }
     await writeCsv(outPath, ['source_id', 'namespace_code', 'namespace_id', 'identity'], iter());
     res.download(outPath);
+  } catch (err) { next(err); }
+});
+
+/** Hard-delete a job and everything associated with it: expanded identities,
+ *  work orders, the uploaded CSV in data/uploads/, and any exported CSV in
+ *  data/output/.
+ *
+ *  Refuses by default (HTTP 409) if any work order is still in flight to
+ *  Adobe — those are real, irreversible destructive operations Adobe is
+ *  currently executing and the local row is the only place we track the
+ *  Adobe-issued workorder ID. Pass ?force=true (or ?force=1) to delete
+ *  anyway; the Adobe-side deletions continue independently — only local
+ *  tracking is lost.
+ *
+ *  States considered "in flight":
+ *    submitting → POST to Adobe in progress
+ *    submitted, received, validated, ingested → Adobe is processing it
+ *  States safe to delete without --force:
+ *    planned, deferred, awaiting_approval → never went to Adobe
+ *    completed, failed → terminal
+ *
+ *  Does NOT refund quota. The local ledger reflects what Adobe actually
+ *  processed; force-deleting an in-flight WO doesn't un-consume that quota
+ *  on Adobe's side, so we mustn't credit it back locally either. */
+router.delete('/:id', async (req, res, next) => {
+  try {
+    const jobId = req.params.id;
+    const job = q().getJob.get(jobId);
+    if (!job) {
+      const err = new Error('job not found');
+      err.status = 404; err.code = 'not_found'; err.publicMessage = 'job not found';
+      return next(err);
+    }
+
+    const force = req.query.force === 'true' || req.query.force === '1';
+
+    const IN_FLIGHT_STATES = new Set([
+      'submitting', 'submitted', 'received', 'validated', 'ingested',
+    ]);
+    const wos = q().getAllOrdersForJob.all(jobId);
+    const inFlight = wos.filter(w => IN_FLIGHT_STATES.has(w.status));
+    if (inFlight.length > 0 && !force) {
+      const distinctStatuses = [...new Set(inFlight.map(w => w.status))].join(', ');
+      const err = new Error(
+        `Cannot delete: ${inFlight.length} work order(s) are still in flight to Adobe ` +
+        `(${distinctStatuses}). Wait for them to reach a terminal state, or pass ` +
+        `?force=true to delete anyway. Forcing does NOT cancel the Adobe-side deletions — ` +
+        `it only removes local tracking, so you lose visibility into completion.`
+      );
+      err.status = 409; err.code = 'in_flight';
+      err.publicMessage = err.message;
+      err.inFlightCount = inFlight.length;
+      return next(err);
+    }
+
+    // CASCADE FK constraints on expanded_identities + work_orders collapse all
+    // dependent rows in this single statement (the deletion is atomic).
+    q().deleteJob.run(jobId);
+
+    // Best-effort filesystem cleanup. Failures here aren't fatal — the DB
+    // rows are already gone — but we log them.
+    if (job.upload_path) {
+      try { await fs.promises.unlink(job.upload_path); }
+      catch (e) { logger.warn({ jobId, path: job.upload_path, err: e.message }, 'upload cleanup failed (non-fatal)'); }
+    }
+    const exportPath = path.join(config.outputDir, `job_${jobId}_identities.csv`);
+    try { await fs.promises.unlink(exportPath); }
+    catch (e) { if (e.code !== 'ENOENT') logger.warn({ jobId, path: exportPath, err: e.message }, 'export cleanup failed (non-fatal)'); }
+
+    logger.warn({
+      jobId, force,
+      workOrders: wos.length,
+      inFlight: inFlight.length,
+    }, 'job deleted');
+    res.json({
+      ok: true,
+      deleted: jobId,
+      workOrdersRemoved: wos.length,
+      inFlightWorkOrdersOrphaned: inFlight.length,
+    });
   } catch (err) { next(err); }
 });
 

@@ -9,6 +9,60 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-05-29 — DELETE /api/jobs/:id + UI Delete Job button
+
+Operator-driven cleanup path for jobs the user no longer wants —
+stuck-mid-expansion, completed-but-noisy, mis-uploaded, etc. Previously
+the only reset path was `rm -rf data/` which also nukes credentials.
+
+### Backend (`src/db.js`, `src/routes/jobs.js`)
+
+- **`deleteJob` prepared statement.** Single `DELETE FROM jobs WHERE
+  id = ?`. The existing FK `ON DELETE CASCADE` on `expanded_identities`
+  and `work_orders` collapses dependent rows in one atomic statement —
+  no per-row delete needed even on multi-million-row jobs.
+- **`DELETE /api/jobs/:id`** route:
+  - 404 when the job doesn't exist
+  - 409 with `{ error: 'in_flight', message: '…' }` when any work order
+    is in a state Adobe is still processing
+    (`submitting`/`submitted`/`received`/`validated`/`ingested`).
+    Forces the operator to acknowledge that the Adobe-side deletes will
+    continue independently of the local cleanup.
+  - `?force=true` (or `?force=1`) bypasses the in-flight guard.
+  - On success: deletes the job row (CASCADE removes WOs + identities),
+    best-effort unlinks the uploaded CSV and any exported result CSV,
+    logs at WARN with `{ force, workOrders, inFlight }`.
+  - Does NOT refund quota — the local ledger reflects what Adobe
+    actually processed; force-deleting an in-flight WO can't
+    un-consume that quota.
+
+### Frontend (`src/web/index.html`, `src/web/app.js`)
+
+- **"🗑 Delete Job" button** on the Expand tab actions row (styled
+  `.btn-danger`). Two-step confirm: native `confirm()` for the basic
+  case; on 409 the UI shows a second confirm with the server's
+  in-flight message and offers a force-delete option.
+- After successful delete: clears `state.job` / `state.progress` /
+  `state.workOrders`, navigates back to the Upload tab.
+
+### Tests (`test/jobsRoutes.test.js`, new file)
+
+9 tests cover the route end-to-end via a real HTTP server:
+  - 404 for unknown UUID
+  - 400 for malformed UUID (the UUID param guard)
+  - 200 + cascade delete for a clean job (no WOs)
+  - 200 + cascade through WOs + expanded_identities
+  - 409 when WOs are in flight (no force)
+  - 200 + delete-anyway with `?force=true`
+  - planned / deferred / awaiting_approval / completed / failed all
+    counted as safe (NOT in-flight) — deletable without force
+  - Uploaded CSV is unlinked on success
+  - Missing uploaded CSV doesn't fail the delete (non-fatal cleanup)
+
+185 → 194 tests pass.
+
+---
+
 ## 2026-05-29 — Friendly errors for non-CSV uploads (MIP / XLSX / UTF-16)
 
 User uploaded a CSV from a new machine and got a 500 with a fast-csv

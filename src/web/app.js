@@ -913,6 +913,54 @@ async function renderExpand() {
   }, { loadingText: 'Preparing download…' });
   $('#btn-goto-plan').addEventListener('click', () => goto('plan'));
 
+  // Delete Job — hard-delete the job and all its data (expanded identities,
+  // work orders, uploaded CSV, exported CSV). Two confirms: a native confirm()
+  // for the basic case, and a second confirm() if the server says any work
+  // orders are still in flight to Adobe (server returns 409 + a message).
+  onClickGuarded($('#btn-delete-job'), async () => {
+    if (!state.job) return;
+    if (!confirm(
+      `Delete job "${state.job.name || state.job.id.slice(0, 8)}" and all of its data?\n\n` +
+      `This removes:\n` +
+      `  • The uploaded CSV\n` +
+      `  • All expanded identities\n` +
+      `  • All planned and submitted work orders\n` +
+      `  • Any exported CSV\n\n` +
+      `This cannot be undone.`
+    )) return;
+    try {
+      await http('DELETE', `/jobs/${state.job.id}`);
+      showToast(`Job deleted.`, { kind: 'success' });
+      state.job = null;
+      state.progress = null;
+      state.workOrders = [];
+      goto('upload');
+    } catch (err) {
+      if (err.status === 409 && err.data?.error === 'in_flight') {
+        // Server said WOs are mid-flight to Adobe. Offer the force path.
+        const forceOk = confirm(
+          `${err.data.message}\n\n` +
+          `Force-delete anyway?\n\n` +
+          `Adobe's deletion of those identifiers will continue independently — ` +
+          `we just lose visibility into when it finishes.`
+        );
+        if (!forceOk) return;
+        try {
+          await http('DELETE', `/jobs/${state.job.id}?force=true`);
+          showToast(`Job force-deleted (Adobe-side deletions still in flight).`, { kind: 'warning' });
+          state.job = null;
+          state.progress = null;
+          state.workOrders = [];
+          goto('upload');
+        } catch (e2) {
+          showToast(`Failed to delete: ${e2.message}`, { kind: 'error' });
+        }
+      } else {
+        showToast(`Failed to delete: ${err.message}`, { kind: 'error' });
+      }
+    }
+  }, { loadingText: 'Deleting…' });
+
   // Show a loader immediately so the pane isn't blank while we wait for
   // the first /progress + /jobs round-trip. First render() overwrites this.
   $('#expand-body').innerHTML = `<div class="empty-state">
