@@ -894,16 +894,25 @@ async function startExpansion() {
   }
 }
 
-// ─── Helper: auto-load an active job after browser refresh ────────────
-// When the server restarts (or the user refreshes the tab), `state.job`
-// is null even though there may be an in-progress job in the DB —
-// `runStartupRecovery` resumes those automatically, but the UI used to
-// show "No job selected" with no way to view the resuming job. This
-// helper queries /api/jobs and picks the most-recently-active one
-// matching `preferredStatuses` (or any non-terminal status as fallback)
-// and loads it into `state.job`. Returns the job, or null if none match.
+// ─── Helpers: auto-load + jobs picker ─────────────────────────────────
+// Why this exists: state.job lives in-memory only, so any browser refresh
+// or server restart loses it. Without help the operator sees "No job
+// selected. Upload a CSV first." even though one or more jobs are running
+// in the database — confusing and (if the operator already ran a CSV
+// today) wrong.
+//
+// Two coordinated pieces:
+//   ensureActiveJobLoaded(preferredStatuses)
+//       Auto-picks the most recent non-terminal job and loads it into
+//       state.job. Best-effort — if the operator wants a different job
+//       they can pick it from the visible jobs list below.
+//   renderJobsPickerInto(containerSelector)
+//       Renders a clickable list of recent jobs. Used as the empty-state
+//       on Expand/Plan/Submit (so the operator can SEE the available
+//       jobs instead of guessing) AND triggerable from a "Switch ▾"
+//       link on the active-job header.
 const NON_TERMINAL_STATUSES = new Set([
-  'expanding', 'expanded', 'ready', 'planning',
+  'created', 'expanding', 'expanded', 'ready', 'planning',
   'submitting', 'submitted', 'partial',
 ]);
 
@@ -917,13 +926,19 @@ async function ensureActiveJobLoaded(preferredStatuses = null) {
     return null;
   }
   // Prefer jobs in the caller-suggested statuses; fall back to any
-  // non-terminal status; then to literally any job. Sorted by
-  // created_at DESC by the server, so first match is most recent.
+  // non-terminal status; then to literally the most recent job. The list
+  // arrives in created_at DESC order so `.find` picks the most recent
+  // match. Logged to console so the operator can diagnose "why did it
+  // pick THIS one" without grepping the source.
   const prefer = preferredStatuses ? new Set(preferredStatuses) : null;
   const candidate =
        (prefer && jobs.find(j => prefer.has(j.status)))
     || jobs.find(j => NON_TERMINAL_STATUSES.has(j.status))
+    || jobs[0]   // last-resort: most recent job, even if terminal
     || null;
+  console.log('ensureActiveJobLoaded:',
+    { preferredStatuses, totalJobs: jobs.length,
+      picked: candidate ? { id: candidate.id.slice(0, 8), name: candidate.name, status: candidate.status } : null });
   if (!candidate) return null;
 
   try {
@@ -937,18 +952,149 @@ async function ensureActiveJobLoaded(preferredStatuses = null) {
   }
 }
 
+/**
+ * Switch the active job and re-render the current tab. Wired into every
+ * jobs picker entry so clicking a job in the list immediately swaps
+ * state.job and shows that job's progress / plan / submit state.
+ */
+async function switchToJob(jobId) {
+  try {
+    const detail = await http('GET', `/jobs/${jobId}`);
+    state.job = detail.job;
+    state.workOrders = [];
+    state.progress = null;
+    state.currentDay = 1;
+    if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
+    // Re-render whatever tab the operator was on.
+    const meta = STEPS[state.step];
+    if (meta) await meta.render();
+  } catch (err) {
+    showToast(`Could not load job: ${err.message}`, { kind: 'error' });
+  }
+}
+
+/**
+ * Fetch up to N recent jobs and render them as a clickable list inside
+ * `containerSelector`. Highlights the currently-loaded job. Useful both
+ * as the empty-state body (when no job is loaded) and as a "show all
+ * recent jobs" popover above the active-job header.
+ */
+async function renderJobsPickerInto(containerSelector, { activeJobId = null, headline = 'Recent jobs (click to load)' } = {}) {
+  const container = $(containerSelector);
+  if (!container) return;
+  let jobs = [];
+  try { jobs = await http('GET', '/jobs?limit=20'); } catch (err) {
+    container.innerHTML = `<div class="alert error"><div>Could not load jobs: ${escape(err.message)}</div></div>`;
+    return;
+  }
+  if (jobs.length === 0) {
+    container.innerHTML = `<div class="empty-state">
+      <div class="big-icon">!</div>
+      <div>No jobs yet. <a href="#" data-goto="upload" style="color: var(--blue600)">Upload a CSV</a> first.</div>
+    </div>`;
+    container.querySelector('[data-goto]')?.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      goto(ev.currentTarget.dataset.goto);
+    });
+    return;
+  }
+  container.innerHTML = `
+    <div class="section" style="margin-bottom: 12px"><div class="section-head">${escape(headline)}</div></div>
+    <div class="jobs-picker" style="display: flex; flex-direction: column; gap: 8px">
+      ${jobs.map(j => {
+        const isActive = j.id === activeJobId;
+        const pct = j.total_source_ids
+          ? Math.round((j.processed_count || 0) / j.total_source_ids * 100)
+          : 0;
+        return `
+        <button class="job-pick-row" data-job-id="${j.id}"
+                style="text-align: left; padding: 12px 14px; border: 1px solid ${isActive ? 'var(--blue500)' : 'var(--g200)'};
+                       border-radius: 6px; background: ${isActive ? 'rgba(38,128,235,0.04)' : '#fff'}; cursor: pointer">
+          <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px">
+            <div style="font-weight: 600">${escape(j.name || j.id.slice(0, 8))}${isActive ? ' <span style="color:var(--blue600); font-size:11px; font-weight:500">· active</span>' : ''}</div>
+            <span class="pill ${escape(j.status)}">${escape(j.status)}</span>
+          </div>
+          <div style="font-size: 12.5px; color: var(--g600); margin-top: 6px; display: flex; gap: 16px">
+            <span>${(j.processed_count || 0).toLocaleString()} / ${(j.total_source_ids || 0).toLocaleString()} processed (${pct}%)</span>
+            <span>${(j.found_count || 0).toLocaleString()} identities</span>
+            <span>${new Date(j.created_at + 'Z').toLocaleString()}</span>
+          </div>
+        </button>`;
+      }).join('')}
+    </div>
+  `;
+  container.querySelectorAll('.job-pick-row').forEach(btn => {
+    btn.addEventListener('click', () => switchToJob(btn.dataset.jobId));
+  });
+}
+
+/**
+ * Inject an "Active job: NAME · status · Switch ▾" header at the top of
+ * a tab body so the operator always knows which job they're looking at
+ * AND can switch to a different one without leaving the tab.
+ *
+ * Renders into the element with id `<tabBodyId>-active-header` if present,
+ * otherwise creates one and prepends it.
+ */
+function renderActiveJobHeader(tabBodyId) {
+  if (!state.job) return;
+  const body = $('#' + tabBodyId);
+  if (!body) return;
+  let header = body.querySelector('.active-job-header');
+  if (!header) {
+    header = document.createElement('div');
+    header.className = 'active-job-header';
+    header.style.cssText = 'margin-bottom: 16px; padding: 10px 14px; background: var(--g50); border: 1px solid var(--g200); border-radius: 6px; display: flex; justify-content: space-between; align-items: center';
+    body.prepend(header);
+  }
+  header.innerHTML = `
+    <div style="display:flex; align-items:center; gap:10px; font-size:13px">
+      <span style="color:var(--g600)">Active job:</span>
+      <span style="font-weight:600">${escape(state.job.name || state.job.id.slice(0, 8))}</span>
+      <span class="pill ${escape(state.job.status)}">${escape(state.job.status)}</span>
+    </div>
+    <button class="btn-link" type="button"
+            style="background:none; border:none; color:var(--blue600); cursor:pointer; font-size:13px">
+      ↻ Switch job
+    </button>
+  `;
+  header.querySelector('.btn-link').addEventListener('click', async () => {
+    // Show the picker inline below the header. Click on a row swaps the
+    // active job and re-renders the tab, which rebuilds the header.
+    let popover = body.querySelector('.active-job-popover');
+    if (popover) { popover.remove(); return; }   // toggle
+    popover = document.createElement('div');
+    popover.className = 'active-job-popover';
+    popover.style.cssText = 'margin-bottom: 16px';
+    popover.id = `${tabBodyId}-picker`;
+    header.after(popover);
+    await renderJobsPickerInto('#' + popover.id, {
+      activeJobId: state.job.id, headline: 'Switch to another job',
+    });
+  });
+}
+
 // ─── Expansion ────────────────────────────────────────────────────────
 async function renderExpand() {
+  // Show a placeholder IMMEDIATELY so the body isn't blank while the
+  // auto-load fetches /jobs and /jobs/:id. Without this the operator
+  // sees an empty pane for 100-500ms and may think nothing's happening
+  // (which is exactly the report we got from the teammate's machine).
+  $('#expand-body').innerHTML = `<div class="empty-state">
+    <div class="big-icon spin">↻</div>
+    <div>Looking for active job…</div>
+  </div>`;
+
   // Auto-resume after a browser refresh / server restart: if there's no
   // current job but one is mid-expansion in the DB, load it so the user
-  // sees the live progress instead of "Upload a CSV first".
+  // sees the live progress.
   await ensureActiveJobLoaded(['expanding', 'expanded', 'ready']);
 
   if (!state.job) {
-    $('#expand-body').innerHTML = `<div class="empty-state">
-      <div class="big-icon">!</div>
-      <div>No job selected. Upload a CSV first.</div>
-    </div>`;
+    // Instead of a generic "No job selected" message, show the clickable
+    // list of all recent jobs. Handles the multi-job case the operator
+    // asked about — they can pick any job to view its expansion state.
+    await renderJobsPickerInto('#expand-body', { activeJobId: null });
     return;
   }
   // Export is a browser navigation (window.location), so we can't await its
@@ -1076,6 +1222,11 @@ async function renderExpand() {
         </div>` : ''}
     `;
 
+    // Inject the "Active job: NAME · status · Switch ↻" header above
+    // everything else so the operator always knows which job they're
+    // viewing and can pivot to a different one (multi-job scenarios).
+    renderActiveJobHeader('expand-body');
+
     $('#btn-export-csv').hidden = !done || total === 0;
     $('#btn-goto-plan').hidden = !done;
   };
@@ -1087,10 +1238,18 @@ async function renderExpand() {
 
 // ─── Plan ─────────────────────────────────────────────────────────────
 async function renderPlan() {
+  $('#plan-body').innerHTML = `<div class="empty-state">
+    <div class="big-icon spin">↻</div>
+    <div>Looking for active job…</div>
+  </div>`;
+
   // Auto-resume after a browser refresh: a job in 'expanded' or 'ready'
   // status (or further along) is what the Plan tab is built around.
   await ensureActiveJobLoaded(['expanded', 'ready', 'planning']);
-  if (!state.job) { $('#plan-body').innerHTML = 'No job. Upload a CSV first.'; return; }
+  if (!state.job) {
+    await renderJobsPickerInto('#plan-body', { activeJobId: null });
+    return;
+  }
   $('#btn-goto-submit').addEventListener('click', () => goto('submit'));
 
   // Don't auto-plan on tab entry: re-planning a job whose orders have already
@@ -1104,6 +1263,7 @@ async function renderPlan() {
         <div>No plan yet for this job.</div>
         <button class="btn btn-primary" id="btn-build-plan" style="margin-top:16px">Build plan</button>
       </div>`;
+    renderActiveJobHeader('plan-body');
     // CRITICAL: duplicate Plan clicks could have raced before today's fixes.
     // Server-side ReplanForbiddenError now guards correctness, but UI-level
     // debounce keeps a single click from spawning two in-flight Plan calls.
@@ -1165,6 +1325,11 @@ async function buildOrRebuildPlan() {
 async function renderPlanResults(wos, container) {
   state.workOrders = wos;
   const target = container || $('#plan-body');
+  // Only paint the active-job header when we're rendering into the main
+  // plan body — not when `container` is passed (renderPlan uses it for
+  // the "already-shipped, show existing plan" path which appends into
+  // a sub-element and would otherwise duplicate the header).
+  const isMainBody = !container;
 
   const planned = wos.length;
   const submittedCount = wos.filter(w => !['planned', 'deferred', 'awaiting_approval'].includes(w.status)).length;
@@ -1279,6 +1444,8 @@ async function renderPlanResults(wos, container) {
       </span>
     </div>`;
 
+  if (isMainBody) renderActiveJobHeader('plan-body');
+
   const btn = target.querySelector('#btn-replan');
   if (btn && !replanDisabled) onClickGuarded(btn, buildOrRebuildPlan, { loadingText: 'Re-planning…' });
 
@@ -1308,6 +1475,11 @@ async function renderPlanResults(wos, container) {
 // ─── Submit ───────────────────────────────────────────────────────────
 let submitPollTimer = null;
 async function renderSubmit() {
+  $('#submit-body').innerHTML = `<div class="empty-state">
+    <div class="big-icon spin">↻</div>
+    <div>Looking for active job…</div>
+  </div>`;
+
   // Auto-resume after a browser refresh: load the active job and its
   // work orders if we don't have them in memory.
   await ensureActiveJobLoaded(['ready', 'planning', 'submitting', 'partial']);
@@ -1316,7 +1488,20 @@ async function renderSubmit() {
       state.workOrders = await http('GET', `/jobs/${state.job.id}/work-orders`);
     } catch { /* server will be queried again by the render loop below */ }
   }
-  if (!state.workOrders.length) { $('#submit-body').innerHTML = 'No work orders. Plan first.'; return; }
+  if (!state.job) {
+    await renderJobsPickerInto('#submit-body', { activeJobId: null });
+    return;
+  }
+  if (!state.workOrders.length) {
+    $('#submit-body').innerHTML = `<div class="empty-state">
+      <div>No work orders yet for this job. <a href="#" data-goto="plan" style="color: var(--blue600)">Plan</a> first.</div>
+    </div>`;
+    renderActiveJobHeader('submit-body');
+    $('#submit-body').querySelector('[data-goto]')?.addEventListener('click', (ev) => {
+      ev.preventDefault(); goto(ev.currentTarget.dataset.goto);
+    });
+    return;
+  }
   const totalDays = Math.max(...state.workOrders.map(w => w.day_index), 1);
 
   const render = (wos) => {
@@ -1364,6 +1549,8 @@ async function renderSubmit() {
           </tbody>
         </table>
       </div>`;
+
+    renderActiveJobHeader('submit-body');
 
     // Day is "done" only when no work order is still planned OR deferred.
     // Deferred orders are quota-blocked but NOT shipped — re-submitting after
