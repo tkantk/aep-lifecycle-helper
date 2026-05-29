@@ -4,6 +4,21 @@ import { config } from '../config.js';
 import { getAuthHeaders, invalidateToken } from './imsAuth.js';
 import { logger } from '../utils/logger.js';
 
+// Module-level rate-limit counter. Bumps on every 429 retry across all
+// Adobe clients in this process. Callers (e.g. the expansion runner)
+// snapshot+reset this around each window so they can report "N 429s in
+// the last 50 batches" — turns "Adobe is slow" into a measurable signal
+// the operator can act on (lower IDENTITY_CONCURRENCY).
+let _rateLimitHitsTotal = 0;
+export function snapshotAndResetRateLimitHits() {
+  const n = _rateLimitHitsTotal;
+  _rateLimitHitsTotal = 0;
+  return n;
+}
+export function getRateLimitHitsTotal() {
+  return _rateLimitHitsTotal;
+}
+
 /**
  * Axios client factory for Adobe APIs. Handles:
  *   - Auto auth header injection (token, api-key, org-id, sandbox)
@@ -74,7 +89,25 @@ export function createAdobeClient(creds, sandboxName) {
       return isNet || s === 401 || s === 429 || (s >= 500 && s < 600);
     },
     onRetry: (n, err, cfg) => {
-      logger.warn({ url: cfg.url, status: err.response?.status, attempt: n }, 'retrying');
+      const status = err.response?.status;
+      // 429 is special: surface it loudly and call out the Retry-After so the
+      // operator can see "I'm being rate-limited, expect this to take longer".
+      // Without this, a sustained 429 storm just looks like 'identity graph is
+      // slow' in higher-level logs.
+      if (status === 429) {
+        _rateLimitHitsTotal++;
+        const ra = err.response?.headers?.['retry-after'];
+        const waitSec = ra
+          ? (isNaN(ra) ? Math.max(0, (new Date(ra) - Date.now()) / 1000) : Number(ra))
+          : null;
+        logger.warn({
+          url: cfg.url, attempt: n,
+          retryAfter: ra || '(none)',
+          waitSec: waitSec != null ? Math.round(waitSec) : null,
+        }, 'ADOBE RATE LIMIT (HTTP 429) — backing off; reduce IDENTITY_CONCURRENCY if this is frequent');
+      } else {
+        logger.warn({ url: cfg.url, status, attempt: n }, 'retrying');
+      }
     },
   });
 

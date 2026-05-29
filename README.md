@@ -374,23 +374,33 @@ and stay well under Adobe's rate limits.
 
 ### Tuning for large jobs
 
-For jobs with 1M+ source IDs, two settings make the biggest difference:
+For jobs with 1M+ source IDs, two settings make the biggest difference.
+**`SQLITE_CACHE_MB` is the safe knob to raise; `IDENTITY_CONCURRENCY` is
+the dangerous one** — Adobe Identity Graph aggressively rate-limits at
+sustained high request rates (a real-world 2026-05-29 run at
+`IDENTITY_CONCURRENCY=15` triggered 60–120 second `Retry-After` waits
+after ~40% of a 1 M-row job).
 
 | Machine | `SQLITE_CACHE_MB` | `IDENTITY_CONCURRENCY` | Notes |
 |---------|------------------|----------------------|-------|
-| 16 GB laptop | `1024` | `10` (default) | B-tree hot path fits in cache |
-| 32 GB laptop | `8192` | `15` | Entire B-tree in RAM, no disk degradation |
-| Dedicated server (8–16 GB RAM) | `2048` | `15–20` | More stable network, higher throughput |
-| Dedicated server (32+ GB RAM) | `4096` | `20` | Well below Adobe 429 threshold |
+| 16 GB laptop | `1024` | `5–10` | B-tree hot path fits in cache |
+| 32 GB laptop | `8192` | `5–10` | Entire B-tree in RAM. **Start at 5.** |
+| Dedicated server (8–16 GB RAM) | `2048` | `10` | Stable network helps; still watch for 429s |
+| Dedicated server (32+ GB RAM) | `4096` | `10–15` | Only push past 10 if you've confirmed no 429s in summary lines |
 
-`SQLITE_CACHE_MB=8192` is the most impactful single change for a 32 GB machine —
-it keeps all B-tree pages in RAM so insert throughput stays constant even at
-8M+ rows in `expanded_identities`.
+**Recommended starting point: `IDENTITY_CONCURRENCY=5`.** Bigger orgs may
+tolerate 10; very few tolerate 15 sustained over a million-row job.
 
-Raising `IDENTITY_CONCURRENCY` beyond 20 risks `429` responses from Adobe's
-Identity Graph. The tool backs off automatically, but a sustained 429 rate
-slows expansion more than the extra concurrency gains. Start at 15, monitor
-for warn-level `retrying` log lines, and bump by 5 at a time if you see none.
+`SQLITE_CACHE_MB=8192` is the most impactful single change for a 32 GB
+machine — it keeps all B-tree pages in RAM so insert throughput stays
+constant even at 8M+ rows in `expanded_identities`.
+
+**Watch for `rateLimitHits > 0`** in the every-50-batch `── expansion
+summary ──` log lines. Any non-zero value means Adobe sent a 429 in that
+window and the client slept (up to 60 s per retry, up to 5 retries =
+**5 minutes of wait per affected request**). If you see this, lower
+`IDENTITY_CONCURRENCY` by 5 and restart — startup recovery will resume
+the in-progress job from where it left off.
 
 ---
 

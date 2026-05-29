@@ -1,6 +1,7 @@
 import pLimit from 'p-limit';
 import { expandBatch } from '../services/identityGraph.js';
 import { listNamespaces, buildNamespaceIndex } from '../services/namespaces.js';
+import { snapshotAndResetRateLimitHits } from '../services/adobeClient.js';
 import { bulkInsertIdentities, q } from '../db.js';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
@@ -175,6 +176,11 @@ export async function runExpansion({
       if (batchesSinceSummary >= BATCHES_PER_SUMMARY) {
         batchesSinceSummary = 0;
         const pctDone = total ? Math.round(progress.processed / total * 100) : 0;
+        // Snapshot the 429 counter across this window. Non-zero means Adobe
+        // throttled us — the climbing adobeMs you'll see is the client
+        // sleeping on Retry-After, not Adobe being slow. Fix: lower
+        // IDENTITY_CONCURRENCY (5 is conservative; 10 is the default).
+        const rateLimitHits = snapshotAndResetRateLimitHits();
         logger.info({
           jobId,
           progress: `${progress.processed.toLocaleString()}/${total.toLocaleString()} (${pctDone}%)`,
@@ -185,6 +191,10 @@ export async function runExpansion({
           sqliteMs_p50: pct(recent.sqliteMs, 0.50),
           sqliteMs_p95: pct(recent.sqliteMs, 0.95),
           sqliteMs_avgAll: Math.round(totalSqliteMs / totalBatches),
+          rateLimitHits,   // # of HTTP 429s Adobe sent in this 50-batch window
+          rateLimitHint: rateLimitHits > 0
+            ? 'Adobe is throttling — reduce IDENTITY_CONCURRENCY in .env'
+            : undefined,
         }, `── expansion summary @ ${pctDone}% ──`);
       }
     } catch (err) {
