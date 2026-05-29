@@ -888,6 +888,10 @@ async function startExpansion() {
   try {
     const res = await http('POST', '/upload', form);
     state.job = { id: res.jobId, total_source_ids: res.totalSourceIds, status: 'expanding' };
+    // Uploading a new CSV is an explicit "I want this one as my active job"
+    // signal — clear any earlier delete-induced auto-load suppression so
+    // subsequent navigations behave normally.
+    clearAutoLoadSuppression();
     goto('expand');
   } catch (err) {
     alert('Upload failed: ' + err.message);
@@ -916,8 +920,31 @@ const NON_TERMINAL_STATUSES = new Set([
   'submitting', 'submitted', 'partial',
 ]);
 
+// Sticky flag set after an explicit Delete Job. Cleared the next time the
+// operator picks a job from the picker. While set, ensureActiveJobLoaded
+// returns null so the picker is shown instead of silently auto-loading
+// some OTHER job from the DB — the operator's mental model after a delete
+// is "the slate is clean", and silently loading a different job
+// contradicts that. Persisted in sessionStorage so it survives a browser
+// refresh within the same tab.
+const SUPPRESS_FLAG = 'aep-suppress-auto-load';
+function suppressAutoLoadOnce() { try { sessionStorage.setItem(SUPPRESS_FLAG, '1'); } catch { /* */ } }
+function clearAutoLoadSuppression() { try { sessionStorage.removeItem(SUPPRESS_FLAG); } catch { /* */ } }
+function isAutoLoadSuppressed() {
+  try { return sessionStorage.getItem(SUPPRESS_FLAG) === '1'; } catch { return false; }
+}
+
 async function ensureActiveJobLoaded(preferredStatuses = null) {
   if (state.job) return state.job;
+
+  // After an explicit Delete Job, don't auto-load anything — let the
+  // picker show so the operator chooses (or doesn't). Suppression ends
+  // the moment they explicitly switch to a job via `switchToJob`.
+  if (isAutoLoadSuppressed()) {
+    console.log('ensureActiveJobLoaded: auto-load suppressed (recent delete)');
+    return null;
+  }
+
   let jobs;
   try {
     jobs = await http('GET', '/jobs?limit=20');
@@ -925,20 +952,23 @@ async function ensureActiveJobLoaded(preferredStatuses = null) {
     console.warn('ensureActiveJobLoaded: /jobs fetch failed', err);
     return null;
   }
-  // Prefer jobs in the caller-suggested statuses; fall back to any
-  // non-terminal status; then to literally the most recent job. The list
-  // arrives in created_at DESC order so `.find` picks the most recent
-  // match. Logged to console so the operator can diagnose "why did it
-  // pick THIS one" without grepping the source.
-  const prefer = preferredStatuses ? new Set(preferredStatuses) : null;
-  const candidate =
-       (prefer && jobs.find(j => prefer.has(j.status)))
-    || jobs.find(j => NON_TERMINAL_STATUSES.has(j.status))
-    || jobs[0]   // last-resort: most recent job, even if terminal
-    || null;
+
+  // ONLY auto-load jobs that are actively in-flight on the server side.
+  // This is the "recovery from server restart" case — runStartupRecovery
+  // resumed the expansion, the UI should pick it up automatically. For
+  // ANY other status ('expanded', 'ready', 'completed', 'failed', etc.)
+  // we deliberately do nothing and let the picker show, so the operator
+  // explicitly chooses which past job they want to view. The previous
+  // behaviour ("auto-load the most-recent of any non-terminal status")
+  // was too aggressive — it silently surfaced jobs the operator had
+  // moved on from (real 2026-05-29 report: delete a job, then go to a
+  // different tab, and a different job auto-loaded). `preferredStatuses`
+  // is intentionally ignored here for the same reason: tab-specific
+  // preferences led to "Expand picks A but Plan picks B" inconsistency.
+  const candidate = jobs.find(j => j.status === 'expanding' || j.status === 'submitting');
   console.log('ensureActiveJobLoaded:',
     { preferredStatuses, totalJobs: jobs.length,
-      picked: candidate ? { id: candidate.id.slice(0, 8), name: candidate.name, status: candidate.status } : null });
+      autoLoadedInProgress: candidate ? { id: candidate.id.slice(0, 8), name: candidate.name, status: candidate.status } : null });
   if (!candidate) return null;
 
   try {
@@ -964,6 +994,10 @@ async function switchToJob(jobId) {
     state.workOrders = [];
     state.progress = null;
     state.currentDay = 1;
+    // Explicit pick — clear the post-delete auto-load suppression so
+    // subsequent tab navigations behave normally (auto-resume any
+    // in-progress job from this point on).
+    clearAutoLoadSuppression();
     if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
     // Re-render whatever tab the operator was on.
     const meta = STEPS[state.step];
@@ -1125,6 +1159,11 @@ async function renderExpand() {
     try {
       await http('DELETE', `/jobs/${state.job.id}`);
       showToast(`Job deleted.`, { kind: 'success' });
+      // Suppress auto-load until the operator explicitly picks a job.
+      // Otherwise the next tab navigation silently loads SOME OTHER job
+      // from the DB, which contradicts the "I deleted, clean slate"
+      // mental model (real 2026-05-29 report).
+      suppressAutoLoadOnce();
       state.job = null;
       state.progress = null;
       state.workOrders = [];
@@ -1142,6 +1181,7 @@ async function renderExpand() {
         try {
           await http('DELETE', `/jobs/${state.job.id}?force=true`);
           showToast(`Job force-deleted (Adobe-side deletions still in flight).`, { kind: 'warning' });
+          suppressAutoLoadOnce();
           state.job = null;
           state.progress = null;
           state.workOrders = [];
