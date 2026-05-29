@@ -4,7 +4,7 @@ import path from 'node:path';
 import { v4 as uuid } from 'uuid';
 import { config } from '../config.js';
 import { q } from '../db.js';
-import { streamIds } from '../utils/csv.js';
+import { streamIds, sniffUpload } from '../utils/csv.js';
 import { runExpansion } from '../runner/expansion.js';
 import { logger } from '../utils/logger.js';
 
@@ -87,6 +87,22 @@ router.post('/', uploadMiddleware, async (req, res, next) => {
 
     if (!credsId || !sandboxName) {
       return res.status(400).json({ error: 'credsId and sandboxName are required' });
+    }
+
+    // Pre-flight: reject files that obviously aren't text CSV BEFORE we
+    // try to parse — turns the fast-csv 30s-into-the-stream stack trace
+    // into a clean 400 with an actionable explanation (MIP-encrypted,
+    // .xlsx-with-.csv-extension, UTF-16, etc.). See utils/csv.js.
+    const sniff = await sniffUpload(req.file.path);
+    if (!sniff.ok) {
+      // Clean up the rejected upload so it doesn't sit in data/uploads/
+      // forever; multer wrote it before our handler got a chance to inspect.
+      try { await import('node:fs').then(m => m.promises.unlink(req.file.path)); } catch { /* */ }
+      const e = new Error(sniff.reason);
+      e.status = 400;
+      e.code = `bad_upload_${sniff.kind}`;
+      e.publicMessage = sniff.reason;
+      return next(e);
     }
 
     // First pass: count rows so we can show a progress denominator.

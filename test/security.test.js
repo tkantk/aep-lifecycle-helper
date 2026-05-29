@@ -33,7 +33,7 @@ const configRouter = (await import('../src/routes/config.js')).default;
 const { hostHeaderGuard, originRefererGuard, makeErrorHandler, UUID_RE } =
   await import('../src/middleware/security.js');
 const { logger } = await import('../src/utils/logger.js');
-const { sanitiseCsvValue } = await import('../src/utils/csv.js');
+const { sanitiseCsvValue, sniffUpload } = await import('../src/utils/csv.js');
 
 let server;
 let port;
@@ -293,4 +293,71 @@ test('sanitiseCsvValue leaves safe values untouched', () => {
   assert.equal(sanitiseCsvValue(''),                  '');
   assert.equal(sanitiseCsvValue(42),                  '42');
   assert.equal(sanitiseCsvValue(null),                null);
+});
+
+// ─── Upload sniffer (CSV format pre-flight) ─────────────────────────────
+// Regression: 2026-05-29 user got a fast-csv stack trace ("Parse Error:
+// expected ',' OR new line got 'q'") with replacement chars in the
+// position context — strong signal the uploaded file was binary
+// (MIP-encrypted / .xlsx / UTF-16). sniffUpload now rejects non-CSV
+// uploads BEFORE fast-csv runs, with an actionable operator message.
+
+async function writeTempFile(bytes) {
+  const p = path.join(os.tmpdir(), `aep-sniff-${Date.now()}-${Math.random().toString(36).slice(2,8)}.csv`);
+  await fs.promises.writeFile(p, bytes);
+  return p;
+}
+
+test('sniffUpload accepts a plain UTF-8 CSV', async () => {
+  const p = await writeTempFile(Buffer.from('hashedKocid\nabc123\ndef456\n', 'utf8'));
+  const v = await sniffUpload(p);
+  assert.equal(v.ok, true);
+  assert.equal(v.kind, 'csv');
+  await fs.promises.unlink(p);
+});
+
+test('sniffUpload accepts a UTF-8 BOM-prefixed CSV (Excel "CSV UTF-8")', async () => {
+  const p = await writeTempFile(Buffer.concat([Buffer.from([0xEF, 0xBB, 0xBF]), Buffer.from('hashedKocid\nabc\n', 'utf8')]));
+  const v = await sniffUpload(p);
+  assert.equal(v.ok, true);
+  await fs.promises.unlink(p);
+});
+
+test('sniffUpload rejects XLSX (ZIP archive) with a clear xlsx hint', async () => {
+  // ZIP local file header: PK\x03\x04
+  const p = await writeTempFile(Buffer.concat([Buffer.from([0x50, 0x4B, 0x03, 0x04]), Buffer.alloc(200, 0)]));
+  const v = await sniffUpload(p);
+  assert.equal(v.ok, false);
+  assert.equal(v.kind, 'zip');
+  assert.match(v.reason, /xlsx|ZIP/i);
+  await fs.promises.unlink(p);
+});
+
+test('sniffUpload rejects UTF-16 LE (Notepad "Unicode" save)', async () => {
+  const p = await writeTempFile(Buffer.concat([Buffer.from([0xFF, 0xFE]), Buffer.from('h\0a\0s\0h\0', 'binary')]));
+  const v = await sniffUpload(p);
+  assert.equal(v.ok, false);
+  assert.equal(v.kind, 'utf16');
+  assert.match(v.reason, /UTF-?16/i);
+  await fs.promises.unlink(p);
+});
+
+test('sniffUpload rejects mostly-binary files (MIP-encrypted / corrupt)', async () => {
+  // Random binary bytes — simulates an MIP-encrypted or corrupted payload.
+  const noisy = Buffer.alloc(1024);
+  for (let i = 0; i < noisy.length; i++) noisy[i] = (i * 7 + 3) & 0x1F; // lots of <32 bytes
+  const p = await writeTempFile(noisy);
+  const v = await sniffUpload(p);
+  assert.equal(v.ok, false);
+  assert.equal(v.kind, 'binary');
+  assert.match(v.reason, /non-printable|encrypted|MIP/i);
+  await fs.promises.unlink(p);
+});
+
+test('sniffUpload rejects empty files', async () => {
+  const p = await writeTempFile(Buffer.alloc(0));
+  const v = await sniffUpload(p);
+  assert.equal(v.ok, false);
+  assert.equal(v.kind, 'empty');
+  await fs.promises.unlink(p);
 });

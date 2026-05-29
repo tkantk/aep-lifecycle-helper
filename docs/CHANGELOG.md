@@ -9,6 +9,45 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-05-29 — Friendly errors for non-CSV uploads (MIP / XLSX / UTF-16)
+
+User uploaded a CSV from a new machine and got a 500 with a fast-csv
+stack trace: `Parse Error: expected: ',' OR new line got: 'q'. at
+' q4uN����'`. The `����` (Unicode replacement chars) and stray `q4uN`
+were the giveaway — the uploaded file wasn't actually plain-text CSV.
+Most likely it was a Microsoft Information Protection (MIP) /
+sensitivity-labelled file (common at Adobe for customer data), an
+.xlsx wearing a .csv extension, or a UTF-16-encoded export.
+
+### Backend (`src/utils/csv.js`, `src/routes/upload.js`)
+
+- **New `sniffUpload(filePath)` helper** — reads the first 4 KiB of an
+  upload and refuses obvious non-CSV payloads BEFORE fast-csv runs.
+  Each verdict carries an operator-actionable reason string. Detected:
+  - `kind: 'zip'`   — ZIP / XLSX magic (PK\\x03\\x04)
+  - `kind: 'ole'`   — OLE compound (legacy .xls, some MIP-protected files)
+  - `kind: 'pdf'`   — PDF magic
+  - `kind: 'utf16'` — UTF-16 LE / BE BOM
+  - `kind: 'binary'` — >5% non-printable bytes in the sniff window
+  - `kind: 'empty'` — zero-byte file
+  UTF-8 BOM is accepted (fast-csv handles it natively).
+- **Pre-flight wiring** in the `/api/upload` POST handler: sniff first,
+  return a clean 400 with `code = 'bad_upload_<kind>'` and the
+  human-readable `publicMessage` if the verdict isn't ok. Reject files
+  are unlinked from `data/uploads/` so they don't accumulate.
+- **`streamIds()`** now catches fast-csv `Parse Error` and rethrows as a
+  `csv_parse_error` 400 with the same friendly message. Belt-and-braces
+  for any binary content that slipped past the sniffer.
+
+### Tests (`test/security.test.js`)
+
+- 6 new sniffer tests cover: plain UTF-8 CSV (accept), UTF-8 BOM (accept),
+  ZIP/XLSX (reject with xlsx hint), UTF-16 LE (reject), high-binary
+  content (reject as MIP-encrypted / corrupt), empty file (reject).
+- 179 → 185 tests pass.
+
+---
+
 ## 2026-05-29 — UI button debounce + concurrency audit
 
 Follow-up to the statement-busy fix earlier today. The server side is now
