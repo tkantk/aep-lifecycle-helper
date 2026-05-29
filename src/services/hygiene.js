@@ -207,9 +207,23 @@ export async function submitWorkOrder({
   };
 }
 
-export async function getWorkOrder({ creds, sandboxName, workorderId }) {
+/**
+ * Look up a single work order's status.
+ * @param {object} p
+ * @param {object} p.creds
+ * @param {string} p.sandboxName
+ * @param {string} p.workorderId
+ * @param {number} [p.timeoutMs] Override the global request timeout for THIS call
+ *   only. The monitor's status-poll path passes a short value (~15s) because
+ *   the global 60s timeout is wildly too long for a status GET — Adobe should
+ *   respond in <2s, and when it's slow it's almost always because of
+ *   rate-limiting where the right move is to fail fast and retry the next
+ *   tick (not block one socket for a full minute).
+ */
+export async function getWorkOrder({ creds, sandboxName, workorderId, timeoutMs }) {
   const client = createAdobeClient(creds, sandboxName);
-  const { data } = await client.get(`${config.aep.gateway}${PATH}/${workorderId}`);
+  const opts = timeoutMs ? { timeout: timeoutMs } : undefined;
+  const { data } = await client.get(`${config.aep.gateway}${PATH}/${workorderId}`, opts);
   return data;
 }
 

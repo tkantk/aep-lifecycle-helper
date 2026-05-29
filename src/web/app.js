@@ -1860,14 +1860,44 @@ async function renderMonitor() {
   let sandboxFilter = '';   // '' means All sandboxes
   let searchDebounce = null;
 
-  const fetchAndRenderList = async () => {
+  // Visible-only-on-first-load loading indicator: on the initial render
+  // and any subsequent FULL refresh (not the silent 15s background poll),
+  // show a spinner inside the list area while /jobs/monitor is in flight.
+  // Without this the page just looked frozen during the 2026-05-29
+  // incident — the user couldn't tell whether the page was loading or
+  // truly empty while the backend was snowed under by overlapping ticks.
+  let firstFetch = true;
+  const fetchAndRenderList = async ({ silent = false } = {}) => {
+    if (!silent && firstFetch) {
+      listEl.innerHTML = `<div class="empty-state" style="padding:32px">
+        <div class="big-icon spin">↻</div>
+        <div>Loading work orders…</div>
+      </div>`;
+      dashboard.hidden = false;
+      empty.hidden = true;
+    }
     let payload = { rows: [], totals: { in_flight: 0, has_failed: 0, all_completed: 0, total: 0 }, sandboxes: [] };
+    let fetchError = null;
     try {
       const params = new URLSearchParams({ limit: String(MONITOR_LIST_LIMIT) });
       if (searchTerm)    params.set('search', searchTerm);
       if (sandboxFilter) params.set('sandbox', sandboxFilter);
       payload = await http('GET', `/jobs/monitor?${params.toString()}`);
-    } catch { /* treated as empty */ }
+    } catch (err) { fetchError = err; }
+    firstFetch = false;
+    // Surface a visible error instead of silently degrading to "empty".
+    // The original 'try { } catch { }' swallow made backend slowness look
+    // identical to an empty database.
+    if (fetchError) {
+      listEl.innerHTML = `<div class="alert error" style="margin:16px 0">
+        <div><div class="alert-title">Could not load monitor data</div>
+        ${escape(fetchError.message)}<br>
+        <small>The background status poller may be backed up — check the server logs for "monitor tick" entries.</small></div>
+      </div>`;
+      dashboard.hidden = false;
+      empty.hidden = true;
+      return;
+    }
     const { rows, totals, sandboxes } = payload;
     state.monitorList = rows;
 
@@ -2074,9 +2104,10 @@ async function renderMonitor() {
   await fetchAndRenderList();
   // Poll: refresh the list every 15s so an operator who leaves the tab open
   // sees Adobe activity (e.g. orders advancing from received → validated)
-  // without manual refresh. Detail panel polls more often via the same loop.
+  // without manual refresh. silent=true so the background refresh doesn't
+  // flash the spinner — we already have data from the first fetch.
   state.pollTimer = setInterval(async () => {
-    await fetchAndRenderList();
+    await fetchAndRenderList({ silent: true });
     if (state.job) await refreshDetail();
   }, 15000);
 }

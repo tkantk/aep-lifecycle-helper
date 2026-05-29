@@ -18,9 +18,25 @@ import { decryptCreds } from '../utils/crypto.js';
 
 const POLL_INTERVAL_MS = 60_000;
 const POLL_CONCURRENCY = 5;
+// Per-WO status GET timeout. Deliberately short. Adobe's GET /workorder/:id
+// should respond in <2 s; when it doesn't (rate limit, slow upstream), the
+// next tick will retry. Capping it short prevents the snowball scenario
+// where each tick's HTTP requests hang for the full 60 s axios timeout
+// while the next interval tick fires on top, hammering Adobe with
+// duplicate concurrent polls and locking up the event loop. Real
+// 2026-05-29 incident: the operator's Monitor tab showed a loading
+// spinner forever because half a dozen overlapping ticks each held
+// 60 s-timeout polls on the same 6 work orders.
+const POLL_PER_REQUEST_TIMEOUT_MS = 15_000;
 
 let _interval = null;
 let _startupTick = null;
+// Reentrancy guard: a tick is non-blocking from setInterval's perspective,
+// but the Adobe HTTP calls inside can take longer than POLL_INTERVAL_MS
+// when Adobe is slow. Without a guard, multiple ticks pile up running in
+// parallel — each fetches the SAME open WO list and hammers Adobe with
+// duplicate GETs. The guard makes overlapping ticks a no-op.
+let _running = false;
 
 export function startMonitor() {
   _interval = setInterval(tick, POLL_INTERVAL_MS);
@@ -40,6 +56,14 @@ export function stopMonitor() {
 }
 
 async function tick() {
+  if (_running) {
+    // Previous tick still in flight (Adobe slow / rate-limited). Skip
+    // this one entirely instead of stacking duplicate polls on top.
+    logger.info('monitor tick skipped — previous tick still running');
+    return;
+  }
+  _running = true;
+  const tickStart = Date.now();
   try {
     const open = q().listOpenWorkOrders.all();
     if (open.length === 0) return;
@@ -57,6 +81,7 @@ async function tick() {
       return p;
     };
 
+    let succeeded = 0, failed = 0;
     const limit = pLimit(POLL_CONCURRENCY);
     await Promise.all(open.map(wo => limit(async () => {
       try {
@@ -65,6 +90,7 @@ async function tick() {
           creds,
           sandboxName: wo.j_sandbox_name,
           workorderId: wo.adobe_workorder_id,
+          timeoutMs: POLL_PER_REQUEST_TIMEOUT_MS,
         });
 
         q().updateWorkOrderAdobeStatus.run(
@@ -75,11 +101,21 @@ async function tick() {
           adobe.status,
           wo.id
         );
+        succeeded++;
       } catch (err) {
+        failed++;
         logger.warn({ workOrderId: wo.id, err: err.message }, 'status poll failed - will retry');
       }
     })));
+    const elapsedMs = Date.now() - tickStart;
+    if (open.length > 0) {
+      logger.info({
+        polled: open.length, succeeded, failed, elapsedMs,
+      }, 'monitor tick complete');
+    }
   } catch (err) {
     logger.error({ err: err.message }, 'monitor tick error');
+  } finally {
+    _running = false;
   }
 }
