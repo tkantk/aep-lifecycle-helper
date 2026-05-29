@@ -123,6 +123,19 @@ const server = app.listen(config.port, config.host, () => {
   const url = `http://localhost:${config.port}`;
   logger.info(`AEP Lifecycle Helper running at ${url} (bound to ${config.host})`);
   logger.info(`State file: ${config.dbPath}`);
+
+  // Performance-knob banner. Makes "did I set SQLITE_CACHE_MB?" answerable
+  // by glancing at boot output. The defaults are conservative (512 MB / 10);
+  // operators with multi-million-row jobs on RAM-rich machines should bump
+  // these via .env (see README §Tuning for large jobs).
+  const tuned = config.sqliteCacheMb >= 1024 || config.identityConcurrency > 10;
+  logger.info(
+    `Perf knobs: SQLITE_CACHE_MB=${config.sqliteCacheMb}  ` +
+    `IDENTITY_CONCURRENCY=${config.identityConcurrency}  ` +
+    `IDENTITY_BATCH_SIZE=${config.identityBatchSize}  ` +
+    `WORK_ORDER_CONCURRENCY=${config.workOrderConcurrency}  ` +
+    `${tuned ? '✓ tuned' : '⚠ defaults (recommend SQLITE_CACHE_MB=8192 for large jobs on a 32 GB machine)'}`
+  );
   if (config.openBrowser) open(url).catch(() => {});
 });
 

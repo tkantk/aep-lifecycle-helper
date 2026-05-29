@@ -99,9 +99,30 @@ export async function runExpansion({
   let aborted = false;
   let skipped = 0;
 
+  // ─── Per-batch timing instrumentation ─────────────────────────────────
+  // Tracks rolling p50/p95 of `adobeMs` (Identity Graph round-trip) and
+  // `sqliteMs` (bulkInsertIdentities) over a 50-batch window so we can
+  // spot a slowdown the moment it starts. Every BATCHES_PER_SUMMARY
+  // batches the runner emits an aggregate log line — a flat
+  // sustained p95 means the bottleneck is environmental (Adobe rate
+  // limit / network / cache exhaustion); a climbing p95 on `sqliteMs`
+  // alone means the local cache is missing.
+  const BATCHES_PER_SUMMARY = 50;
+  const recent = { adobeMs: [], sqliteMs: [] };
+  let batchesSinceSummary = 0;
+  let totalAdobeMs = 0, totalSqliteMs = 0, totalBatches = 0;
+
+  const pushSample = (arr, v) => { arr.push(v); if (arr.length > BATCHES_PER_SUMMARY) arr.shift(); };
+  const pct = (arr, p) => {
+    if (arr.length === 0) return 0;
+    const sorted = [...arr].sort((a, b) => a - b);
+    return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))];
+  };
+
   const submitBatch = (batch) => limit(async () => {
     if (aborted) return;
     try {
+      const t0 = Date.now();
       const results = await expandBatch({
         creds, sandboxName,
         namespace: sourceNamespace,
@@ -109,14 +130,12 @@ export async function runExpansion({
         ids: batch,
         namespaceIndex,
       });
+      const adobeMs = Date.now() - t0;
 
       // Diagnostic: count total linked identities returned by Adobe for this batch.
       // If this is zero across every batch, either the namespace is wrong for this
       // sandbox or the IDs don't exist in any cluster.
       const linkedTotal = results.reduce((n, r) => n + r.linkedIdentities.length, 0);
-      logger.info({
-        jobId, batchSize: batch.length, clustersReturned: results.length, linkedTotal,
-      }, 'identity graph batch returned');
 
       // Flatten to row tuples for bulk insert.
       // Row shape: [job_id, ns_code, ns_id, identity_id, source_id]
@@ -133,11 +152,41 @@ export async function runExpansion({
         }
       }
 
+      const t1 = Date.now();
       const inserted = bulkInsertIdentities(rows);
       q().incrementJobCounters.run(batch.length, inserted, jobId);
+      const sqliteMs = Date.now() - t1;
 
       progress.processed += batch.length;
       progress.found += inserted;
+
+      // Per-batch line: keep it terse so the log doesn't drown the run.
+      logger.info({
+        jobId, batchSize: batch.length, clustersReturned: results.length, linkedTotal,
+        adobeMs, sqliteMs,
+      }, 'identity graph batch returned');
+
+      pushSample(recent.adobeMs, adobeMs);
+      pushSample(recent.sqliteMs, sqliteMs);
+      totalAdobeMs += adobeMs;
+      totalSqliteMs += sqliteMs;
+      totalBatches++;
+      batchesSinceSummary++;
+      if (batchesSinceSummary >= BATCHES_PER_SUMMARY) {
+        batchesSinceSummary = 0;
+        const pctDone = total ? Math.round(progress.processed / total * 100) : 0;
+        logger.info({
+          jobId,
+          progress: `${progress.processed.toLocaleString()}/${total.toLocaleString()} (${pctDone}%)`,
+          batchesDone: totalBatches,
+          adobeMs_p50: pct(recent.adobeMs, 0.50),
+          adobeMs_p95: pct(recent.adobeMs, 0.95),
+          adobeMs_avgAll: Math.round(totalAdobeMs / totalBatches),
+          sqliteMs_p50: pct(recent.sqliteMs, 0.50),
+          sqliteMs_p95: pct(recent.sqliteMs, 0.95),
+          sqliteMs_avgAll: Math.round(totalSqliteMs / totalBatches),
+        }, `── expansion summary @ ${pctDone}% ──`);
+      }
     } catch (err) {
       aborted = true;
       logger.error({ jobId, batchSize: batch.length, err: err.message }, 'expansion batch failed');
