@@ -894,8 +894,56 @@ async function startExpansion() {
   }
 }
 
+// ─── Helper: auto-load an active job after browser refresh ────────────
+// When the server restarts (or the user refreshes the tab), `state.job`
+// is null even though there may be an in-progress job in the DB —
+// `runStartupRecovery` resumes those automatically, but the UI used to
+// show "No job selected" with no way to view the resuming job. This
+// helper queries /api/jobs and picks the most-recently-active one
+// matching `preferredStatuses` (or any non-terminal status as fallback)
+// and loads it into `state.job`. Returns the job, or null if none match.
+const NON_TERMINAL_STATUSES = new Set([
+  'expanding', 'expanded', 'ready', 'planning',
+  'submitting', 'submitted', 'partial',
+]);
+
+async function ensureActiveJobLoaded(preferredStatuses = null) {
+  if (state.job) return state.job;
+  let jobs;
+  try {
+    jobs = await http('GET', '/jobs?limit=20');
+  } catch (err) {
+    console.warn('ensureActiveJobLoaded: /jobs fetch failed', err);
+    return null;
+  }
+  // Prefer jobs in the caller-suggested statuses; fall back to any
+  // non-terminal status; then to literally any job. Sorted by
+  // created_at DESC by the server, so first match is most recent.
+  const prefer = preferredStatuses ? new Set(preferredStatuses) : null;
+  const candidate =
+       (prefer && jobs.find(j => prefer.has(j.status)))
+    || jobs.find(j => NON_TERMINAL_STATUSES.has(j.status))
+    || null;
+  if (!candidate) return null;
+
+  try {
+    const detail = await http('GET', `/jobs/${candidate.id}`);
+    state.job = detail.job;
+    state.workOrders = []; // force re-fetch on next Plan/Submit render
+    return state.job;
+  } catch (err) {
+    console.warn('ensureActiveJobLoaded: /jobs/:id detail failed', err);
+    return null;
+  }
+}
+
 // ─── Expansion ────────────────────────────────────────────────────────
 async function renderExpand() {
+  // Auto-resume after a browser refresh / server restart: if there's no
+  // current job but one is mid-expansion in the DB, load it so the user
+  // sees the live progress instead of "Upload a CSV first".
+  await ensureActiveJobLoaded(['expanding', 'expanded', 'ready']);
+
   if (!state.job) {
     $('#expand-body').innerHTML = `<div class="empty-state">
       <div class="big-icon">!</div>
@@ -1039,7 +1087,10 @@ async function renderExpand() {
 
 // ─── Plan ─────────────────────────────────────────────────────────────
 async function renderPlan() {
-  if (!state.job) { $('#plan-body').innerHTML = 'No job.'; return; }
+  // Auto-resume after a browser refresh: a job in 'expanded' or 'ready'
+  // status (or further along) is what the Plan tab is built around.
+  await ensureActiveJobLoaded(['expanded', 'ready', 'planning']);
+  if (!state.job) { $('#plan-body').innerHTML = 'No job. Upload a CSV first.'; return; }
   $('#btn-goto-submit').addEventListener('click', () => goto('submit'));
 
   // Don't auto-plan on tab entry: re-planning a job whose orders have already
@@ -1257,6 +1308,14 @@ async function renderPlanResults(wos, container) {
 // ─── Submit ───────────────────────────────────────────────────────────
 let submitPollTimer = null;
 async function renderSubmit() {
+  // Auto-resume after a browser refresh: load the active job and its
+  // work orders if we don't have them in memory.
+  await ensureActiveJobLoaded(['ready', 'planning', 'submitting', 'partial']);
+  if (state.job && state.workOrders.length === 0) {
+    try {
+      state.workOrders = await http('GET', `/jobs/${state.job.id}/work-orders`);
+    } catch { /* server will be queried again by the render loop below */ }
+  }
   if (!state.workOrders.length) { $('#submit-body').innerHTML = 'No work orders. Plan first.'; return; }
   const totalDays = Math.max(...state.workOrders.map(w => w.day_index), 1);
 
