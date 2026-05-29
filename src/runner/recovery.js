@@ -179,6 +179,121 @@ async function findAdobeWorkOrderByDisplayNamePrefix({ creds, sandboxName, prefi
 
 export const __testInternal__ = { LOOKUP_INDETERMINATE };
 
+/**
+ * Per-job orphan reconciliation triggered by `POST /api/jobs/:id/reconcile`.
+ *
+ * Looks at every WO for `jobId` that has no `adobe_workorder_id` AND status
+ * in ('submitting', 'failed'), and for each one tries an Adobe-side lookup
+ * by `displayName`. Three outcomes per WO:
+ *
+ *   - MATCHED   → Adobe has the WO. Record the Adobe ID and flip status to
+ *                 'submitted'. If the WO was previously in 'failed' status,
+ *                 RE-reserve the quota the buggy old release() call gave
+ *                 back (via direct ledger upsert — bypasses the cap because
+ *                 Adobe already spent it; our ledger needs to mirror reality).
+ *
+ *   - ABSENT (submitting) → Adobe responded successfully and the WO is not
+ *                 there. Roll back to 'planned' and release the still-held
+ *                 quota — next submit run can retry.
+ *   - ABSENT (failed)     → Genuinely failed. Leave as-is.
+ *
+ *   - INDETERMINATE (Adobe rejected our lookup with 400) → leave as-is for
+ *                 both statuses; next reconcile retries.
+ *
+ * Use case: the 2026-05-29 production incident where 3 work orders timed
+ * out at the 60s axios timeout, got marked 'failed' (releasing their
+ * quota), but Adobe actually received and processed them — operator saw
+ * 10 WOs in Adobe's UI but only 7 in ours. This route lets the operator
+ * reconcile without restarting the server.
+ */
+export async function reconcileJobOrphans(jobId) {
+  const orphans = q().listReconcilableOrphansForJob.all(jobId);
+  if (orphans.length === 0) {
+    return { total: 0, matched: 0, rolledBack: 0, indeterminate: 0, stillFailed: 0, perWoError: 0 };
+  }
+
+  logger.info({ jobId, count: orphans.length }, 'reconcile: scanning orphans for job');
+
+  let matched = 0, rolledBack = 0, indeterminate = 0, stillFailed = 0, perWoError = 0;
+
+  for (const wo of orphans) {
+    try {
+      const creds = await decryptCreds(wo.j_creds_id);
+      const displayName = `Delete ${wo.j_name} - WO ${wo.id}`;
+      const found = await findAdobeWorkOrderByDisplayNamePrefix({
+        creds,
+        sandboxName: wo.j_sandbox_name,
+        prefix: displayName,
+      });
+
+      if (found === LOOKUP_INDETERMINATE) {
+        indeterminate++;
+        logger.warn({ localId: wo.id, prevStatus: wo.status },
+          'reconcile: lookup indeterminate (Adobe rejected list query); leaving as-is');
+        continue;
+      }
+
+      if (found) {
+        // Re-reserve quota for previously-'failed' WOs. The old buggy
+        // catch-all release() in submission.js gave back quota that Adobe
+        // had actually spent. Direct ledger upsert (bypasses the cap) is
+        // the right tool — we're correcting the ledger to match reality,
+        // not reserving fresh capacity.
+        if (wo.status === 'failed') {
+          const today = utcToday();
+          q().upsertQuota.run(creds.imsOrgId, today, wo.identifier_count);
+          if (wo.j_monthly_limit != null && wo.j_monthly_limit > 0) {
+            q().upsertMonthlyQuota.run(creds.imsOrgId, utcYearMonth(), wo.identifier_count);
+          }
+        }
+        q().updateWorkOrderSubmitted.run({
+          id: wo.id,
+          adobeWorkorderId: found.workorderId,
+          adobeStatus: found.status,
+          bundleId: found.bundleId,
+          submittedAt: found.createdAt,
+        });
+        matched++;
+        logger.info({ localId: wo.id, adobeId: found.workorderId, prevStatus: wo.status },
+          'reconcile: matched WO to existing Adobe work order');
+        continue;
+      }
+
+      // Not found in Adobe.
+      if (wo.status === 'submitting') {
+        // Safe to roll back — Adobe didn't get it. Release the still-held
+        // quota so the next submit run can retry cleanly.
+        release(creds.imsOrgId, wo.identifier_count, wo.j_monthly_limit);
+        q().rollbackWorkOrderToPlanned.run(
+          'reconcile: not found in Adobe — rolled back to planned', wo.id);
+        rolledBack++;
+        logger.info({ localId: wo.id }, 'reconcile: orphan rolled back to planned');
+      } else {
+        // status='failed' AND Adobe confirms absence → genuinely failed.
+        stillFailed++;
+        logger.info({ localId: wo.id }, 'reconcile: failed WO confirmed absent in Adobe; leaving as failed');
+      }
+    } catch (err) {
+      perWoError++;
+      logger.warn({ localId: wo.id, err: err.message },
+        'reconcile: per-WO failure; leaving as-is');
+    }
+  }
+
+  return { total: orphans.length, matched, rolledBack, indeterminate, stillFailed, perWoError };
+}
+
+// UTC helpers — kept private here to avoid pulling in the entire
+// quotaManager just for two one-line functions.
+function utcToday() {
+  const d = new Date();
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+}
+function utcYearMonth() {
+  const d = new Date();
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+}
+
 /** Top-level entrypoint called by src/index.js after the DB is ready. */
 export async function runStartupRecovery() {
   try {

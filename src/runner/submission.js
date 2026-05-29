@@ -361,10 +361,48 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
           localId: wo.id, adobeId: result.workorderId, count: result.operationCount,
         }, 'work order submitted');
       } catch (err) {
-        release(creds.imsOrgId, wo.identifier_count, liveMonthlyLimit);
-        q().updateWorkOrderStatus.run('failed', err.message, wo.id);
-        failed++;
-        logger.error({ localId: wo.id, err: err.message }, 'submission failed');
+        // CRITICAL: distinguish "Adobe rejected" from "Adobe MAY have
+        // processed but we never saw the response". The hygiene POST is
+        // non-idempotent (CLAUDE.md I11), which means a timeout or
+        // network drop can leave Adobe with the request in flight even
+        // though our axios call threw. If we mark such a WO 'failed' and
+        // release its quota, two bad things happen:
+        //   1. The deletion actually completes on Adobe's side without
+        //      us knowing — we lose the Adobe work-order ID and the
+        //      operator can't reconcile from the UI.
+        //   2. Our local quota ledger under-counts what Adobe spent;
+        //      the next submit run can over-shoot the daily/monthly cap.
+        //
+        // Decision rule:
+        //   • err.response.status in [400, 500)  → Adobe definitively
+        //     rejected the payload (validation error / auth / etc.).
+        //     Mark 'failed' + release quota.
+        //   • Anything else (5xx, timeout, ECONNRESET, ECONNREFUSED,
+        //     no .response at all) → UNCERTAIN. Leave the WO in
+        //     'submitting' (already set at the top of this try block)
+        //     with the error stored in last_error. The startup orphan
+        //     recovery (or the upcoming POST /reconcile route) will look
+        //     these up by displayName-prefix on Adobe and either record
+        //     the real Adobe ID or confirm absence. Do NOT release
+        //     quota — Adobe may have spent it.
+        const status = err.response?.status;
+        const isAdobeRejection = status != null && status >= 400 && status < 500;
+
+        if (isAdobeRejection) {
+          release(creds.imsOrgId, wo.identifier_count, liveMonthlyLimit);
+          q().updateWorkOrderStatus.run('failed', err.message, wo.id);
+          failed++;
+          logger.error({ localId: wo.id, status, err: err.message },
+            'submission failed (Adobe rejected — 4xx)');
+        } else {
+          // Keep status='submitting' so listSubmittingOrphanOrders picks
+          // it up on next startup. Persist last_error so the operator can
+          // see what happened in the UI without grepping logs.
+          q().updateWorkOrderStatus.run('submitting', err.message, wo.id);
+          failed++;
+          logger.warn({ localId: wo.id, status: status ?? '(no response)', err: err.message },
+            'submission UNCERTAIN (timeout/network/5xx) — Adobe may have processed it. Left in submitting status; orphan-reconcile will check Adobe via displayName on next startup or via POST /api/jobs/:id/reconcile.');
+        }
       }
     }));
 

@@ -558,6 +558,24 @@ function prepared() {
         FROM work_orders w JOIN jobs j ON j.id = w.job_id
        WHERE w.status = 'submitting' AND w.adobe_workorder_id IS NULL
     `),
+    // Per-job reconcilable orphans — includes both 'submitting' (uncertain
+    // submit) and 'failed' (e.g. previous-buggy-behaviour where a timeout
+    // marked the WO failed and released quota even though Adobe processed
+    // it). For 'failed' rows the caller needs to re-reserve quota if it
+    // finds the WO in Adobe; for 'submitting' rows the quota was never
+    // released, so no re-reservation is needed.
+    listReconcilableOrphansForJob: db.prepare(`
+      SELECT w.*,
+             j.creds_id      AS j_creds_id,
+             j.sandbox_name  AS j_sandbox_name,
+             j.name          AS j_name,
+             j.monthly_limit AS j_monthly_limit,
+             j.daily_limit   AS j_daily_limit
+        FROM work_orders w JOIN jobs j ON j.id = w.job_id
+       WHERE w.job_id = ?
+         AND w.adobe_workorder_id IS NULL
+         AND w.status IN ('submitting', 'failed')
+    `),
     rollbackWorkOrderToPlanned: db.prepare(`
       UPDATE work_orders SET status = 'planned', last_error = ?, updated_at = datetime('now')
        WHERE id = ?

@@ -1552,6 +1552,45 @@ async function renderSubmit() {
 
     renderActiveJobHeader('submit-body');
 
+    // Reconciliation banner: when there are work orders that are 'failed' or
+    // 'submitting' WITHOUT an adobe_workorder_id, the operator might be in
+    // the "Adobe processed but our local record doesn't know" state (real
+    // 2026-05-29 incident: 10 WOs in Adobe's UI but only 7 in ours after a
+    // 60s axios timeout marked 3 as failed). One click hits the new
+    // POST /api/jobs/:id/reconcile route which looks each one up in Adobe
+    // by displayName and corrects the local record.
+    const reconcilable = wos.filter(w =>
+      !w.adobe_workorder_id && (w.status === 'failed' || w.status === 'submitting'));
+    if (reconcilable.length > 0) {
+      const banner = document.createElement('div');
+      banner.style.cssText = 'margin: 14px 0; padding: 12px 14px; background: rgba(255,193,7,0.08); border: 1px solid rgba(255,193,7,0.4); border-radius: 6px; display: flex; gap: 12px; align-items: center; justify-content: space-between';
+      banner.innerHTML = `
+        <div style="font-size: 13px; line-height: 1.5">
+          <b>${reconcilable.length} work order(s) are unreconciled.</b><br>
+          They may show as <b>Failed</b> here but actually exist in Adobe's Data Lifecycle UI (60-second submit timeouts can leave Adobe processing the request after we give up). Click <b>Reconcile</b> to look them up by displayName and correct the local records.
+        </div>
+        <button class="btn btn-secondary" id="btn-reconcile" style="white-space: nowrap">↻ Reconcile</button>
+      `;
+      $('#submit-body').insertBefore(banner, $('#submit-body').querySelector('.progress-head'));
+      onClickGuarded(banner.querySelector('#btn-reconcile'), async () => {
+        try {
+          const r = await http('POST', `/jobs/${state.job.id}/reconcile`);
+          const parts = [];
+          if (r.matched > 0)        parts.push(`${r.matched} matched in Adobe`);
+          if (r.rolledBack > 0)     parts.push(`${r.rolledBack} rolled back to planned`);
+          if (r.stillFailed > 0)    parts.push(`${r.stillFailed} confirmed failed`);
+          if (r.indeterminate > 0)  parts.push(`${r.indeterminate} indeterminate (retry later)`);
+          if (r.perWoError > 0)     parts.push(`${r.perWoError} errored`);
+          showToast(parts.length ? `Reconcile: ${parts.join(', ')}.` : 'Nothing to reconcile.', { kind: 'success' });
+          // Re-fetch WOs and re-render.
+          state.workOrders = await http('GET', `/jobs/${state.job.id}/work-orders`);
+          await refresh();
+        } catch (err) {
+          showToast(`Reconcile failed: ${err.message}`, { kind: 'error' });
+        }
+      }, { loadingText: 'Reconciling…' });
+    }
+
     // Day is "done" only when no work order is still planned OR deferred.
     // Deferred orders are quota-blocked but NOT shipped — re-submitting after
     // UTC midnight (daily) or month rollover (monthly) is the documented path,

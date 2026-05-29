@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { q, prepareStreamIdentitiesBySource } from '../db.js';
 import { planWorkOrders, runSubmission } from '../runner/submission.js';
+import { reconcileJobOrphans } from '../runner/recovery.js';
 import { peek as peekQuota } from '../services/quotaManager.js';
 import { getOrgQuota } from '../services/quotaApi.js';
 import { decryptCreds } from '../utils/crypto.js';
@@ -207,6 +208,37 @@ router.post('/:id/approve-month', (req, res, next) => {
 
     logger.info({ jobId: job.id, monthIndex, approved: result.changes }, 'month approved for submission');
     res.json({ ok: true, approved: result.changes, monthIndex });
+  } catch (err) { next(err); }
+});
+
+/** Reconcile every work order on the job that has no `adobe_workorder_id`
+ *  AND status in ('submitting', 'failed') against Adobe by displayName.
+ *
+ *  Critical use case: a 60s axios timeout on submit can leave the WO marked
+ *  `failed` locally even though Adobe processed the request — operator sees
+ *  fewer WOs in our UI than in Adobe's Data Lifecycle UI. This route looks
+ *  each one up and corrects the local record (recording the Adobe WO ID
+ *  and re-reserving the quota that the previous `failed` path released).
+ *
+ *  Response: { matched, rolledBack, indeterminate, stillFailed, perWoError, total }
+ *
+ *  - matched        → found in Adobe, status now 'submitted', Adobe ID recorded
+ *  - rolledBack     → 'submitting' WO confirmed absent in Adobe → 'planned'
+ *  - stillFailed    → 'failed' WO confirmed absent in Adobe → left as 'failed'
+ *  - indeterminate  → Adobe rejected the lookup query (400); retry later
+ *  - perWoError     → other failures (credentials missing, network) — left as-is
+ */
+router.post('/:id/reconcile', async (req, res, next) => {
+  try {
+    const job = q().getJob.get(req.params.id);
+    if (!job) {
+      const err = new Error('job not found');
+      err.status = 404; err.code = 'not_found'; err.publicMessage = 'job not found';
+      return next(err);
+    }
+    const result = await reconcileJobOrphans(job.id);
+    logger.info({ jobId: job.id, ...result }, 'reconcile complete');
+    res.json({ ok: true, ...result });
   } catch (err) { next(err); }
 });
 
