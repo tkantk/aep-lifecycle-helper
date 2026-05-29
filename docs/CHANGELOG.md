@@ -35,6 +35,19 @@ Second-pass review of the day's perf fixes. Two further wins applied:
   connection while an iterator is active, so any `insertWorkOrder.run()`
   during the iterate() loop would throw "connection busy".
 
+### Backend — schema (`src/db.js`)
+
+- **Dropped redundant `idx_ei_job_ns(job_id, ns_code)` index** — verified
+  with `EXPLAIN QUERY PLAN` that every reader (`countIdentitiesByNamespace`,
+  `streamIdentitiesBySource`, `countDistinctIdentities`) falls back to the
+  still-existing `idx_ei_job_source(job_id, source_id)` with an **identical
+  plan structure** (same job_id-leading `SEARCH` + same `TEMP B-TREE FOR
+  GROUP BY`). Both indexes serve `WHERE job_id = ?` equally well; neither
+  was covering for these queries, so the secondary index was pure dead
+  weight. Removed from schema and dropped via `DROP INDEX IF EXISTS` on
+  existing DBs. Frees one B-tree per insert (~5-10% expansion speedup on
+  multi-million-row jobs) and ~144 MB disk on a 6M-row table.
+
 ### Docs (`docs/DESIGN_DOC.md`, `docs/DESIGN_DOC.docx`)
 
 - **Architecture diagram** — rebuilt at uniform 78-char width. Fixes a 1-col
