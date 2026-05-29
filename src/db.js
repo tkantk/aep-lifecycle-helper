@@ -399,19 +399,13 @@ function prepared() {
        GROUP BY COALESCE(ns_code, 'nsid:' || ns_id)
        ORDER BY count DESC
     `),
-    // Iterate identities ordered by (source_id, ns_code) so cluster members
-    // arrive contiguously; this lets the planner pack them together.
-    // GROUP BY on (ns_code, ns_id, identity_id) — same dedup key as the old
-    // unique index — ensures each identity appears at most once regardless of
-    // how many source_ids linked to it. MIN(source_id) picks the earliest
-    // cluster as the identity's home for packing purposes.
-    streamIdentitiesBySource: db.prepare(`
-      SELECT ns_code, ns_id, identity_id, MIN(source_id) AS source_id
-        FROM expanded_identities
-       WHERE job_id = ?
-       GROUP BY COALESCE(ns_code, ''), COALESCE(ns_id, 0), identity_id
-       ORDER BY MIN(source_id), ns_code
-    `),
+    // NOTE: this query is NOT cached in `q().streamIdentitiesBySource` because
+    // better-sqlite3 allows only one active iterator per Statement object.
+    // The planner (sync) and the /export route (async, holds the iterator
+    // across event-loop yields) would collide on a shared cached statement
+    // and throw "This statement is busy executing a query". Each caller
+    // must `prepareStreamIdentitiesBySource()` to get its own Statement.
+    // See the exported factory below.
     // Count of globally distinct (ns, identity) pairs — used after expansion
     // completes to overwrite the running found_count with the true deduplicated
     // total (matching the old unique-index semantics).
@@ -585,10 +579,40 @@ function prepared() {
 }
 
 /**
+ * Build a FRESH prepared Statement for iterating deduplicated identities by
+ * source. Deliberately NOT cached — better-sqlite3 allows only one active
+ * iterator per Statement, and we have two simultaneous-iterator scenarios:
+ *
+ *   • Planner (sync, completes in one pass — fine on its own)
+ *   • CSV export route (async; .iterate() is held while writeCsv yields
+ *     between rows). Two concurrent export requests, or one export + one
+ *     plan, would collide on a shared cached Statement and throw
+ *     "This statement is busy executing a query".
+ *
+ * Calling .prepare() is cheap (~ms); calling it per request eliminates the
+ * collision entirely.
+ *
+ * Rows yielded: { ns_code, ns_id, identity_id, source_id }
+ *   - Deduplicated on (COALESCE(ns_code,''), COALESCE(ns_id,0), identity_id)
+ *     — same key the old unique index used.
+ *   - source_id is the MIN over the dedup group — picks the earliest cluster
+ *     as the identity's "home" for cluster-aware planner packing.
+ */
+export function prepareStreamIdentitiesBySource() {
+  return db.prepare(`
+    SELECT ns_code, ns_id, identity_id, MIN(source_id) AS source_id
+      FROM expanded_identities
+     WHERE job_id = ?
+     GROUP BY COALESCE(ns_code, ''), COALESCE(ns_id, 0), identity_id
+     ORDER BY MIN(source_id), ns_code
+  `);
+}
+
+/**
  * Insert a batch of identities atomically.
  * Rows: Array<[job_id, ns_code, ns_id, identity_id, source_id]>
  * Returns the number of rows inserted (= rows.length; dedup is deferred to
- * planning time — see streamIdentitiesBySource and countDistinctIdentities).
+ * planning time — see prepareStreamIdentitiesBySource and countDistinctIdentities).
  */
 export function bulkInsertIdentities(rows) {
   const p = prepared();

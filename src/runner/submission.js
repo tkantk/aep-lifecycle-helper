@@ -4,7 +4,7 @@ import { submitWorkOrder } from '../services/hygiene.js';
 import { reserve, release } from '../services/quotaManager.js';
 import { getOrgQuota } from '../services/quotaApi.js';
 import { redistributeUnshippedOrders } from './redistributor.js';
-import { q, db } from '../db.js';
+import { q, db, prepareStreamIdentitiesBySource } from '../db.js';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { decryptCreds } from '../utils/crypto.js';
@@ -163,7 +163,11 @@ export function planWorkOrders({ jobId, datasetIds, dailyLimit, targetServices, 
   // connection while an iterator is active, so any insertWorkOrder.run()
   // call inside the iterate() loop would throw "This database connection
   // is busy executing a query".
-  for (const row of q().streamIdentitiesBySource.iterate(jobId)) {
+  //
+  // Use a fresh Statement (not the cached one) so a concurrent export
+  // request can't collide with us, and vice versa. See the rationale on
+  // prepareStreamIdentitiesBySource in db.js.
+  for (const row of prepareStreamIdentitiesBySource().iterate(jobId)) {
     if (row.source_id !== bundleSourceId) {
       commitBundle();
       bundleSourceId = row.source_id;

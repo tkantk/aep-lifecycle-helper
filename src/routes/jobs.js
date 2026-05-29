@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { q } from '../db.js';
+import { q, prepareStreamIdentitiesBySource } from '../db.js';
 import { planWorkOrders, runSubmission } from '../runner/submission.js';
 import { peek as peekQuota } from '../services/quotaManager.js';
 import { getOrgQuota } from '../services/quotaApi.js';
@@ -209,12 +209,16 @@ router.post('/:id/approve-month', (req, res, next) => {
   } catch (err) { next(err); }
 });
 
-/** Export all expanded identities as CSV. */
+/** Export all expanded identities as CSV.
+ *  Uses a FRESH prepared Statement (not q().streamIdentitiesBySource) so two
+ *  overlapping export requests — or one export overlapping the planner —
+ *  can't collide on the shared cached Statement's single-iterator-per-stmt
+ *  rule in better-sqlite3 ("This statement is busy executing a query"). */
 router.get('/:id/export', async (req, res, next) => {
   try {
     const jobId = req.params.id;
     const outPath = path.join(config.outputDir, `job_${jobId}_identities.csv`);
-    const rows = q().streamIdentitiesBySource.iterate(jobId);
+    const rows = prepareStreamIdentitiesBySource().iterate(jobId);
     function* iter() {
       for (const r of rows) {
         yield {

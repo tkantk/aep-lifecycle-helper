@@ -9,6 +9,54 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-05-29 — Fix "statement busy" crash on /export (and now planner-during-export)
+
+Root cause traced from a 2026-05-28 production log:
+
+```
+23:44:31 INFO  expansion complete jobId=fa71... processed=1,569,174 found=1,607,384
+00:27:55 ERROR request error err=This statement is busy executing a query
+        at src/routes/jobs.js:217:47   <-- the cached streamIdentitiesBySource
+```
+
+Both the planner (`src/runner/submission.js`) and the CSV export route
+(`src/routes/jobs.js`) called `.iterate()` on the SAME cached prepared
+Statement `q().streamIdentitiesBySource`. better-sqlite3 allows only one
+active iterator per Statement object. The /export route holds its
+iterator across `await writeCsv(...)` yields — for a 1.6M-row export
+that's tens of seconds. Any concurrent request that touches the same
+cached Statement during that window throws `"This statement is busy
+executing a query"` → HTTP 500.
+
+Collisions that the bug enabled:
+  - Export-vs-Export — a double-clicked or UI-auto-retried export
+    (this is what hit the user; four 500s in 3 seconds).
+  - Export-vs-Plan — yesterday's two-phase planner refactor made the
+    planner also call `.iterate()` on the cached Statement, so Plan
+    clicked DURING a long export would have collided too.
+
+### Backend — db.js / submission.js / routes/jobs.js
+
+- **`prepareStreamIdentitiesBySource()` factory.** New exported helper
+  in `src/db.js` that returns a FRESH `db.prepare(...)` each call.
+  Removed the cached `q().streamIdentitiesBySource` entirely. Both
+  call sites (planner, export route) now build their own Statement.
+  Prepare cost is ~ms; query cost is seconds-to-minutes — per-request
+  prepare is negligible overhead and eliminates the collision entirely.
+- **No public-API impact.** Callers are internal modules only.
+
+### Tests (`test/planWorkOrders.test.js`)
+
+- **New regression test** `prepareStreamIdentitiesBySource: concurrent
+  iterators do not collide` opens two iterators against the same job
+  and interleaves `.next()` calls. With the old cached Statement this
+  threw "statement busy"; with the factory it produces identical row
+  sets. Locks the fix against future regressions.
+
+179 tests pass (was 178).
+
+---
+
 ## 2026-05-28 — Follow-up perf review (Opus 4.7)
 
 Second-pass review of the day's perf fixes. Two further wins applied:

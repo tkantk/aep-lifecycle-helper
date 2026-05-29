@@ -17,7 +17,7 @@ process.env.DB_PATH = dbPath;
 process.env.UPLOAD_DIR = os.tmpdir();
 process.env.OUTPUT_DIR = os.tmpdir();
 
-const { initDb, bulkInsertIdentities, q } = await import('../src/db.js');
+const { initDb, bulkInsertIdentities, prepareStreamIdentitiesBySource, q } = await import('../src/db.js');
 const { planWorkOrders } = await import('../src/runner/submission.js');
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -352,4 +352,47 @@ test('planWorkOrders: identifier_count column matches actual ids in payload', ()
   const [wo] = getWorkOrders(jobId);
   assert.equal(wo.identifier_count, totalIdsInOrder(wo));
   assert.equal(wo.identifier_count, 3);
+});
+
+// Regression: prior to the 2026-05-29 fix, both the planner and the
+// /export route used q().streamIdentitiesBySource — a single cached
+// prepared Statement. better-sqlite3 only allows one active iterator
+// per Statement, so two overlapping exports (or planner-during-export)
+// threw "This statement is busy executing a query" (see jobs.js:217
+// error logs from the 1.6M-row run). The fix exposes a factory that
+// returns a fresh Statement per caller. This test locks that in.
+test('prepareStreamIdentitiesBySource: concurrent iterators do not collide', () => {
+  const jobId = insertJob();
+  seedIdentities(jobId, [
+    { sourceId: 'src1', members: [
+      { ns_code: 'email', ns_id: 6, identity_id: 'a@x.com' },
+      { ns_code: 'phone', ns_id: 7, identity_id: '+15551234' },
+    ]},
+    { sourceId: 'src2', members: [
+      { ns_code: 'email', ns_id: 6, identity_id: 'b@x.com' },
+    ]},
+  ]);
+
+  // Two FRESH Statements iterated in interleaved fashion. If they shared
+  // any internal state (which is exactly the bug we are guarding against),
+  // the second .iterate() or the first .next() after the second iterator
+  // opened would throw "This statement is busy executing a query".
+  const it1 = prepareStreamIdentitiesBySource().iterate(jobId);
+  const it2 = prepareStreamIdentitiesBySource().iterate(jobId);
+
+  const rows1 = [];
+  const rows2 = [];
+  let r1 = it1.next();
+  let r2 = it2.next();
+  while (!r1.done || !r2.done) {
+    if (!r1.done) { rows1.push(r1.value); r1 = it1.next(); }
+    if (!r2.done) { rows2.push(r2.value); r2 = it2.next(); }
+  }
+
+  assert.equal(rows1.length, 3);
+  assert.equal(rows2.length, 3);
+  assert.deepEqual(
+    rows1.map(r => r.identity_id).sort(),
+    rows2.map(r => r.identity_id).sort()
+  );
 });
