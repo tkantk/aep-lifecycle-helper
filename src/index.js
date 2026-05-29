@@ -17,7 +17,7 @@ dotenv.config({ path: path.join(__dirname, '..', '.env') });
 const { config, detectCloudSyncPath } = await import('./config.js');
 const { logger } = await import('./utils/logger.js');
 const { initDb, db } = await import('./db.js');
-const { startMonitor } = await import('./runner/monitor.js');
+const { startMonitor, stopMonitor } = await import('./runner/monitor.js');
 const { runStartupRecovery } = await import('./runner/recovery.js');
 const { startScheduler, stopScheduler } = await import('./runner/scheduler.js');
 const { hostHeaderGuard, originRefererGuard, makeErrorHandler } =
@@ -139,32 +139,66 @@ const server = app.listen(config.port, config.host, () => {
   if (config.openBrowser) open(url).catch(() => {});
 });
 
-// Graceful shutdown: stop accepting new connections, give in-flight requests
-// up to 10s to finish, checkpoint and close SQLite so the WAL doesn't grow
-// across restarts, then exit. A hard `process.exit` on SIGINT was leaving the
-// WAL un-checkpointed and forcing extra recovery work on next boot.
+// Graceful shutdown. Multi-step because several things keep the event loop
+// alive even after `server.close()`:
+//   - Monitor's setInterval (60 s polling) — explicitly stop it.
+//   - Scheduler's setInterval (60 s tick)  — explicitly stop it.
+//   - HTTP keep-alive sockets that `server.close()` only drains, doesn't force
+//     close — call `server.closeAllConnections()` (Node 18.2+) to drop them.
+//   - Outbound axios requests from the expansion runner mid-batch — those keep
+//     TLS sockets open. We can't cancel them cleanly without an AbortController
+//     rewrite, so we rely on the force-exit timer + SIGKILL fallback.
+//   - better-sqlite3 native bindings — process.exit can stall here for a few
+//     seconds while the native side cleans up. SIGKILL is the nuclear backstop.
+//
+// The previous version's "shutdown timeout exceeded, exiting" WARN was real:
+// the event loop wasn't draining because the monitor's setInterval kept ticking
+// and keep-alive sockets weren't being force-closed. Even after process.exit,
+// the native bindings could hang for ~5 s. This handler now stops every known
+// loop-keeping source, force-closes connections, and SIGKILLs itself if a
+// graceful exit takes too long.
 let shuttingDown = false;
 function shutdown(sig) {
   if (shuttingDown) return;
   shuttingDown = true;
   logger.info(`${sig} received, shutting down gracefully`);
 
-  const forceExitMs = 10_000;
-  const timer = setTimeout(() => {
-    logger.warn('shutdown timeout exceeded, exiting');
-    process.exit(1);
-  }, forceExitMs).unref();
-
-  // Stop the scheduler first so its setInterval doesn't keep the event loop
-  // alive (and doesn't spawn a fresh tick mid-shutdown). The monitor's
-  // setInterval is implicitly stopped by process.exit at the bottom.
+  // (1) Stop the recurring timers — without these the setIntervals keep the
+  // loop alive indefinitely and shutdown can never converge naturally.
   try { stopScheduler(); } catch (e) { logger.warn({ err: e.message }, 'stopScheduler failed'); }
+  try { stopMonitor();   } catch (e) { logger.warn({ err: e.message }, 'stopMonitor failed'); }
 
+  // (2) Force-exit timer. NOT .unref() — we want this to fire even if other
+  // things keep the loop alive. If it does fire, schedule a SIGKILL as the
+  // final fallback in case process.exit itself hangs (better-sqlite3 native
+  // bindings have been observed to stall process.exit for several seconds).
+  const forceExitMs = 8_000;
+  const timer = setTimeout(() => {
+    logger.warn('shutdown timeout exceeded — forcing exit. Any in-flight expansion batches will be retried by startup recovery on the next boot.');
+    setTimeout(() => {
+      logger.error('process.exit hung — sending SIGKILL to self');
+      try { process.kill(process.pid, 'SIGKILL'); } catch { /* */ }
+    }, 3_000).unref();
+    process.exit(1);
+  }, forceExitMs);
+
+  // (3) Force-close keep-alive sockets after a short grace period so
+  // `server.close()` callback can actually fire. Without this, an idle
+  // keep-alive connection holds the server open until its 5-minute timeout.
+  if (typeof server.closeAllConnections === 'function') {
+    setTimeout(() => {
+      try { server.closeAllConnections(); } catch { /* */ }
+    }, 2_000).unref();
+  }
+
+  // (4) Stop accepting new connections, await drain of existing ones, then
+  // checkpoint SQLite and exit cleanly.
   server.close(err => {
     if (err) logger.error({ err: err.message }, 'server close error');
     try { db.pragma('wal_checkpoint(TRUNCATE)'); } catch (e) { logger.warn({ err: e.message }, 'wal_checkpoint failed'); }
     try { db.close(); } catch (e) { logger.warn({ err: e.message }, 'db close failed'); }
     clearTimeout(timer);
+    logger.info('shutdown complete');
     process.exit(0);
   });
 }

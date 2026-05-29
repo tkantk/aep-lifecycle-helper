@@ -19,11 +19,24 @@ import { decryptCreds } from '../utils/crypto.js';
 const POLL_INTERVAL_MS = 60_000;
 const POLL_CONCURRENCY = 5;
 
+let _interval = null;
+let _startupTick = null;
+
 export function startMonitor() {
-  setInterval(tick, POLL_INTERVAL_MS);
+  _interval = setInterval(tick, POLL_INTERVAL_MS);
   // Run once on startup so we don't wait a full minute for first update
-  setTimeout(tick, 5_000);
+  _startupTick = setTimeout(tick, 5_000);
   logger.info('status monitor started (poll every 60s)');
+}
+
+/**
+ * Stop the polling intervals so the event loop can drain on shutdown.
+ * Without this the setInterval keeps the process alive until the 10s
+ * force-exit timer fires — meaning Ctrl+C feels broken to the operator.
+ */
+export function stopMonitor() {
+  if (_interval)    { clearInterval(_interval);    _interval = null; }
+  if (_startupTick) { clearTimeout(_startupTick);  _startupTick = null; }
 }
 
 async function tick() {
