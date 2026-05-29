@@ -206,11 +206,43 @@ export async function runExpansion({
 
   // Drain the current wave: await all in-flight tasks, then clear so GC can
   // reclaim the batch arrays and Adobe response objects from completed tasks.
+  //
+  // CRITICAL: use Promise.allSettled, NOT Promise.all. A network event like
+  // ECONNRESET (which happens when Adobe's load balancer kills a stalled
+  // keep-alive socket pool — e.g., after multiple 60s Retry-After waits)
+  // takes down ALL in-flight requests sharing that socket pool at once.
+  // Promise.all would propagate the first rejection and leave the OTHER
+  // (N - 1) rejected promises dangling — Node ≥ v17 promotes those to
+  // uncaughtException and the whole process crashes (real production
+  // crash at 96% on 2026-05-29 from exactly this failure mode).
+  // allSettled awaits every promise, so none can be unhandled; we then
+  // surface the first rejection ourselves so the upstream error path is
+  // unchanged.
   const drainWave = async () => {
     if (wave.length === 0) return;
     const current = wave;
     wave = [];
-    await Promise.all(current); // propagates the first rejection if any task failed
+    const results = await Promise.allSettled(current);
+    const rejection = results.find(r => r.status === 'rejected');
+    if (rejection) throw rejection.reason;
+  };
+
+  // Push helper: also attaches a no-op .catch() to silence V8's
+  // "unhandled rejection" detection in the WINDOW between push and the
+  // next drainWave. That window can be up to WAVE_SIZE batches wide
+  // (~30 at IDENTITY_CONCURRENCY=15), and a batch that rejects in
+  // that window — e.g. an ECONNRESET on a stalled keep-alive socket —
+  // would otherwise fire unhandledRejection BEFORE drainWave gets a
+  // chance to attach handlers via Promise.allSettled. Node ≥17 then
+  // promotes that to uncaughtException and crashes the process (real
+  // 2026-05-29 production crash at 96%). The .catch handler is a
+  // no-op — drainWave will still see the rejection via allSettled and
+  // surface it as the thrown error, so the upstream error path is
+  // unchanged.
+  const pushBatch = (batch) => {
+    const task = submitBatch(batch);
+    task.catch(() => { /* drainWave will surface this — silence V8 */ });
+    wave.push(task);
   };
 
   // onRow is async so that csv.js's `await onRow(...)` provides natural
@@ -223,7 +255,7 @@ export async function runExpansion({
       if (skipSourceIds?.has(value)) { skipped++; return; }
       buffer.push(value);
       if (buffer.length >= config.identityBatchSize) {
-        wave.push(submitBatch(buffer));
+        pushBatch(buffer);
         buffer = [];
         if (wave.length >= WAVE_SIZE) {
           await drainWave(); // blocks CSV stream until this wave clears
@@ -237,7 +269,7 @@ export async function runExpansion({
   }
 
   // Flush any remaining partial buffer and the last partial wave.
-  if (buffer.length > 0) wave.push(submitBatch(buffer));
+  if (buffer.length > 0) pushBatch(buffer);
 
   try {
     await drainWave();

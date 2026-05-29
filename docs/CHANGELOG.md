@@ -9,6 +9,77 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-05-29 — Fix runExpansion process crash on simultaneous batch failures
+
+Production crash at 96% of a 1 M-row run:
+
+```
+13:50:51 ERROR expansion batch failed err=read ECONNRESET
+node:internal/process/promises:391
+    triggerUncaughtException(err, true / *fromPromise* / );  ← crashes process
+```
+
+Root cause is the wave-scheduling pattern in `runner/expansion.js`. It
+pushes up to WAVE_SIZE (concurrency × 2, so ~30 at IDENTITY_CONCURRENCY=15)
+async tasks into a `wave[]` array before the next `drainWave()` runs. In
+that window NO handler is attached to those pushed promises. If one
+rejects in that window — real-world cause: ECONNRESET on a stalled
+keep-alive TLS socket after several minutes of 60 s Retry-After waits
+from Adobe rate-limiting — Node ≥ v17 flags it as an unhandled rejection
+at the end of the microtask and promotes it to uncaughtException,
+crashing the whole process.
+
+(Promise.all itself does NOT leak — it attaches handlers when called.
+The leak window is BEFORE drainWave runs. allSettled vs all in drainWave
+also matters as a defence-in-depth for late rejections that arrive
+after drainWave has already settled, but the primary crash was the
+pre-drain window.)
+
+### Backend (`src/runner/expansion.js`)
+
+- **`pushBatch(batch)` helper** wraps `submitBatch(batch)` and attaches a
+  no-op `.catch(() => {})` INLINE before pushing into `wave[]`. The
+  no-op silences V8's unhandled-rejection detection during the pre-drain
+  window; drainWave still sees the rejection via Promise.allSettled and
+  surfaces it as the thrown error, so the upstream error path is
+  unchanged. Both wave-fill pushes and the final partial-buffer flush
+  go through the helper.
+- **`drainWave()` switched from `Promise.all` to `Promise.allSettled`**
+  with manual surfacing of the first rejection. Defence-in-depth: even
+  if multiple batches reject AFTER drainWave starts (e.g., wave-wide
+  ECONNRESET), every rejection is awaited, none can become unhandled,
+  and the first error is still re-thrown for the upstream catch.
+
+### Tests (`test/expansionDrainWave.test.js`, new file)
+
+3 tests covering the production failure shape:
+  - Async-rejecting task pushed to wave, multiple event-loop turns
+    elapse, then drained → first rejection surfaces, ZERO unhandled
+    rejections fire.
+  - drainWave with allSettled: first reject (by array order) wins; no
+    leaks even when all reject.
+  - All-resolved wave: clean completion, no leaks.
+
+(A counter-example test demonstrating the unfixed bug was
+intentionally omitted — `node:test`'s runner correctly detects
+unhandled rejections and treats them as run-wide failures, so a
+test that deliberately leaks one is indistinguishable from a real
+regression. The fix in expansion.js + the positive tests above are
+sufficient protection.)
+
+194 → 197 tests pass.
+
+### Operator action
+
+The crashed job's status stays `expanding` (the crash happened before
+the final try/catch that flips status to failed). After `git pull` +
+restart, `runStartupRecovery` will resume the job from the last
+committed source_id and apply the (lower, please!) IDENTITY_CONCURRENCY
+from `.env`. Recommended: **`IDENTITY_CONCURRENCY=5`** or even 3 —
+your org's Identity Graph entitlement clearly can't sustain 15.
+
+---
+
 ## 2026-05-29 — DELETE /api/jobs/:id + UI Delete Job button
 
 Operator-driven cleanup path for jobs the user no longer wants —
