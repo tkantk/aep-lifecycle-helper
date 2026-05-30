@@ -31,10 +31,18 @@
 11. [Known Limitations & Extension Points](#11-known-limitations--extension-points)
 12. [Appendix — File Map](#12-appendix--file-map)
 
-> All diagrams in this document are rendered from Mermaid source files
-> in `docs/diagrams/*.mmd` using Mermaid CLI. GitHub renders the
-> sources natively; the rendered PNGs are committed alongside so the
-> Word export (`DESIGN_DOC.docx`) embeds them too.
+> **Diagrams** in this document are available in three forms:
+>
+> 1. **Inline PNG renders** (embedded below each section) — produced by
+>    Mermaid CLI from the `.mmd` sources in `docs/diagrams/`. Show in
+>    GitHub markdown view and in `DESIGN_DOC.docx`.
+> 2. **Live editable FigJam** — every diagram below is also available
+>    as a FigJam board you can pan, zoom, comment, and edit:
+>    **[Open in FigJam](https://www.figma.com/board/j6ATXKYO19VSEk4vx4IU7a)**.
+>    This is the canonical view for client presentations and live
+>    review sessions.
+> 3. **Mermaid source** — `docs/diagrams/*.mmd`, version-controlled so
+>    every diagram can be regenerated identically.
 
 ---
 
