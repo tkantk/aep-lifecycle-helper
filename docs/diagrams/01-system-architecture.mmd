@@ -1,0 +1,75 @@
+%%{init: {
+  'theme':'base',
+  'themeVariables': {
+    'primaryColor':'#E8F2FF',
+    'primaryTextColor':'#1A1A1A',
+    'primaryBorderColor':'#1473E6',
+    'lineColor':'#525252',
+    'fontFamily':'Inter, Segoe UI, Helvetica, Arial, sans-serif',
+    'fontSize':'14px'
+  },
+  'flowchart': { 'curve':'basis' }
+}}%%
+flowchart LR
+
+  Browser["<b>Web Browser</b><br/>http://127.0.0.1:3000<br/><br/>Config · Upload · Expand<br/>Plan · Submit · Monitor"]
+
+  subgraph Process["<b>Node.js Process</b> · src/index.js (single host, loopback)"]
+    direction TB
+
+    subgraph TopRow["&nbsp;"]
+      direction LR
+      Routes["<b>REST Routes</b><br/>/api/config · /api/upload<br/>/api/jobs (plan · submit ·<br/>reconcile · delete · export)<br/>/api/adobe · /api/settings"]
+      Security["<b>Security middleware</b><br/>Host-header guard<br/>Origin / Referer CSRF guard<br/>Helmet CSP · COOP · CORP"]
+    end
+
+    subgraph MidRow["&nbsp;"]
+      direction LR
+      Runners["<b>Background runners</b><br/>expansion · submission<br/>redistributor · monitor<br/>recovery · scheduler"]
+      Services["<b>Adobe service layer</b><br/>imsAuth · adobeClient<br/>identityGraph · hygiene<br/>quotaApi · quotaManager<br/>sandboxes · datasets · namespaces"]
+    end
+
+    DB[("<b>SQLite (WAL)</b><br/>data/state.db<br/>credentials · jobs · WOs<br/>expanded_identities · quotas")]
+    Disk[/"<b>data/</b><br/>.key (AES-256 GCM)<br/>uploads/ · output/"/]
+
+    Security -.-> Routes
+    Routes --> Runners
+    Routes --> Services
+    Routes --> DB
+    Runners --> Services
+    Runners --> DB
+    Services --> Disk
+  end
+
+  subgraph Adobe["<b>Adobe Experience Platform</b>"]
+    direction TB
+    IMS["<b>IMS Auth</b><br/>ims-na1.adobelogin.com<br/>POST /ims/token/v3"]
+    IS["<b>Identity Service</b> (region-sharded)<br/>platform-{region}.adobe.io<br/>POST /clusters/members<br/>GET /idnamespace/identities"]
+    PS["<b>Platform Services</b><br/>platform.adobe.io<br/>GET /sandbox-management/<br/>GET /catalog/dataSets"]
+    DH["<b>Data Hygiene API</b> ⚠ destructive<br/>platform.adobe.io<br/>POST /workorder<br/>GET /workorder/{id}<br/>GET /quota"]
+  end
+
+  Browser -->|HTTP| Routes
+  Services ==>|HTTPS · TLS 1.2+| IMS
+  Services ==>|HTTPS · TLS 1.2+| IS
+  Services ==>|HTTPS · TLS 1.2+| PS
+  Services ==>|HTTPS · TLS 1.2+| DH
+
+  classDef proc      fill:#FAFAFA,stroke:#1A1A1A,stroke-width:1.5px,color:#1A1A1A
+  classDef component fill:#E8F2FF,stroke:#1473E6,stroke-width:1.5px,color:#1A1A1A
+  classDef storage   fill:#FFF4D6,stroke:#F29423,stroke-width:1.5px,color:#1A1A1A
+  classDef sec       fill:#E8F8EE,stroke:#2D9D78,stroke-width:1.5px,color:#1A1A1A
+  classDef adobe     fill:#FFEDED,stroke:#FA0F00,stroke-width:1.5px,color:#1A1A1A
+  classDef danger    fill:#FFE1E1,stroke:#E34850,stroke-width:2px,color:#1A1A1A
+  classDef browser   fill:#F5F5F5,stroke:#6E6E6E,stroke-width:1.5px,color:#1A1A1A
+
+  class Browser browser
+  class Process proc
+  class Routes,Runners,Services component
+  class DB,Disk storage
+  class Security sec
+  class Adobe,IMS,IS,PS adobe
+  class DH danger
+
+  style TopRow fill:transparent,stroke:transparent
+  style MidRow fill:transparent,stroke:transparent

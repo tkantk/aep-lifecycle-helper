@@ -1,0 +1,70 @@
+%%{init: {
+  'theme':'base',
+  'themeVariables': {
+    'primaryColor':'#E8F2FF',
+    'primaryTextColor':'#1A1A1A',
+    'primaryBorderColor':'#1473E6',
+    'lineColor':'#525252',
+    'fontFamily':'Inter, Segoe UI, Helvetica, Arial, sans-serif',
+    'fontSize':'13px'
+  }
+}}%%
+flowchart TB
+  Start(["<b>operator clicks Submit Day N</b>"])
+
+  Quota["Live /quota refresh + redistributor<br/>(re-bucket unshipped WOs against current Adobe usage)"]
+
+  Pick["Pick planned WOs for<br/>(month_index, day_index)"]
+
+  Reserve{"<b>quotaManager.reserve()</b><br/>atomic SQLite tx:<br/>daily + monthly check"}
+
+  Submit["<b>POST /workorder</b><br/>idempotent: false<br/>(no auto-retry on 5xx/network)<br/>axios timeout: 60s"]
+
+  Outcome{"<b>response?</b>"}
+
+  Submitted["<b>SUBMITTED</b><br/>Adobe WO ID recorded"]
+  Deferred["<b>DEFERRED</b><br/>retries after UTC rollover"]
+  Failed["<b>FAILED</b> (terminal)<br/>4xx → quota released"]
+  Uncertain["<b>SUBMITTING</b> (uncertain)<br/>5xx/timeout/network<br/>quota NOT released"]
+
+  Start --> Quota --> Pick --> Reserve
+  Reserve -->|granted| Submit
+  Reserve -->|"denied: quota cap"| Deferred
+  Submit --> Outcome
+  Outcome -->|"2xx · Adobe WO ID"| Submitted
+  Outcome -->|"4xx · Adobe rejected"| Failed
+  Outcome -->|"5xx · timeout · ECONNRESET"| Uncertain
+
+  subgraph Recovery["<b>Recovery paths</b>"]
+    direction TB
+    Boot["<b>startup recovery</b><br/>reconcileOrphanWorkOrders()<br/>scans status='submitting'<br/>+ adobe_workorder_id IS NULL"]
+    Manual["<b>POST /api/jobs/:id/reconcile</b><br/>(operator-triggered button)<br/>scans status IN ('submitting','failed')<br/>+ adobe_workorder_id IS NULL"]
+    Lookup{"<b>lookup by displayName</b><br/>GET /workorder?displayName=...<br/>(exact full UUID match)"}
+
+    Boot --> Lookup
+    Manual --> Lookup
+
+    Lookup -->|"found in Adobe"| FixIt["record Adobe WO ID<br/>flip to <b>SUBMITTED</b><br/>(re-reserve quota if was failed)"]
+    Lookup -->|"absent + was submitting"| Rollback["<b>roll back to PLANNED</b><br/>release quota<br/>(next submit retries cleanly)"]
+    Lookup -->|"absent + was failed"| Stay["leave as failed<br/>(confirmed)"]
+    Lookup -->|"Adobe 400 / network"| Leave["leave as-is<br/>(retry on next boot)"]
+  end
+
+  Uncertain -.->|"next boot"| Boot
+  Failed -.->|"operator clicks<br/>↻ Reconcile banner"| Manual
+  Submitted -->|"monitor.js 60s tick<br/>pLimit(5) · 15s timeout"| Monitor["polling for terminal status"]
+  Monitor -.-> Done["<b>COMPLETED / FAILED</b>"]
+
+  classDef start fill:#FFF4D6,stroke:#F29423,stroke-width:2px,color:#1A1A1A
+  classDef gate  fill:#FFF4D6,stroke:#F29423,stroke-width:2px,color:#1A1A1A
+  classDef ok    fill:#E8F8EE,stroke:#2D9D78,stroke-width:2px,color:#1A1A1A
+  classDef warn  fill:#FFF4D6,stroke:#F29423,stroke-width:1.5px,color:#1A1A1A
+  classDef bad   fill:#FFE1E1,stroke:#E34850,stroke-width:2px,color:#1A1A1A
+  classDef proc  fill:#E8F2FF,stroke:#1473E6,stroke-width:2px,color:#1A1A1A
+
+  class Start start
+  class Reserve,Outcome,Lookup gate
+  class Submitted,FixIt,Done ok
+  class Deferred,Uncertain warn
+  class Failed,Stay bad
+  class Quota,Pick,Submit,Boot,Manual,Rollback,Leave,Monitor proc

@@ -9,6 +9,61 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-05-30 — Rendered diagrams + auto-load tightening + docs refresh
+
+### Docs (`docs/diagrams/`, `docs/DESIGN_DOC.{md,docx}`)
+
+- **Mermaid-rendered PNG diagrams**, replacing the ASCII art that
+  prior sessions had been criticised for ("the design diagrams are
+  broken"). Eight diagrams shipped: system architecture, operator
+  journey, work-order state machine, multi-month planning, region
+  architecture, defense-in-depth, expansion data flow, submit/reconcile
+  flow. Sources in `docs/diagrams/*.mmd`; PNGs rendered at 1800 px via
+  `@mermaid-js/mermaid-cli` (added as a devDependency). Each diagram
+  is shown twice in `DESIGN_DOC.md` — once as the rendered PNG (so
+  pandoc embeds it in the Word export), and the source `.mmd` is
+  committed alongside so it stays version-controlled and editable.
+- **Researched MCP options for diagram generation** (Figma MCP Feb 2026
+  / FigJam, Lucid). Concluded Mermaid is the practical choice today:
+  no MCP setup or auth needed, renders identically in GitHub and Word,
+  source is portable to Figma later if the team wants. Tracked as
+  extension point in §11.3.
+- **DESIGN_DOC.md** restructured around the new diagrams:
+  - §3 now has a dedicated 3.2 "Expansion data flow" subsection (new
+    diagram #7) describing the sniffer → wave → p-limit pipeline.
+  - §4 now has 4.2 "Crash & uncertain-submit recovery" + 4.3 status
+    reference (with the 'submitting can mean uncertain' note made
+    explicit) + 4.4 "Submit → reconcile flow" (new diagram #8).
+  - §6.2 region architecture and §7.1 defense-in-depth use the new
+    rendered diagrams with explanatory captions.
+  - §11.2 "Recently resolved" table added — lets future readers see
+    what used to be a limitation and how it was fixed.
+  - §12 file map includes `docs/diagrams/`.
+  - Test count updated to 197.
+
+### Frontend (`src/web/app.js`) — `ensureActiveJobLoaded` tightening
+
+- **Auto-load is now narrow** to truly in-progress jobs (`expanding` /
+  `submitting`). For 'expanded' / 'ready' / 'completed' / 'failed', the
+  jobs picker shows so the operator chooses explicitly. The previous
+  broad rule ("any non-terminal job, preferring tab-specific status
+  lists") silently loaded the wrong job when an operator visited a
+  different tab — e.g., real 2026-05-30 report: delete job on Expand
+  tab → click Plan → Plan auto-loaded a DIFFERENT job → click Expand
+  → that other job rendered there too.
+- **Auto-load suppression flag** (`sessionStorage['aep-suppress-auto-load']`)
+  set in the Delete Job handler (both regular and force-delete paths),
+  cleared in `switchToJob` when the operator explicitly picks a job
+  and in `startExpansion` when they upload a new CSV. Survives a
+  browser refresh within the tab.
+
+### Infra
+
+- `@mermaid-js/mermaid-cli@11` added as a devDependency. New scripts /
+  pre-rendered PNGs only — no runtime impact.
+
+---
+
 ## 2026-05-29 — Fix runExpansion process crash on simultaneous batch failures
 
 Production crash at 96% of a 1 M-row run:

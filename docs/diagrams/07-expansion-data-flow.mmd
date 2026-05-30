@@ -1,0 +1,60 @@
+%%{init: {
+  'theme':'base',
+  'themeVariables': {
+    'primaryColor':'#E8F2FF',
+    'primaryTextColor':'#1A1A1A',
+    'primaryBorderColor':'#1473E6',
+    'lineColor':'#525252',
+    'fontFamily':'Inter, Segoe UI, Helvetica, Arial, sans-serif',
+    'fontSize':'13px'
+  }
+}}%%
+flowchart LR
+  CSV[/"<b>uploaded CSV</b><br/>(streamed from disk;<br/>never fully in memory)"/]
+
+  Sniff{"<b>sniffUpload()</b><br/>reject:<br/>· ZIP/XLSX (PK\\x03\\x04)<br/>· UTF-16 BOM<br/>· OLE / MIP container<br/>· PDF · empty<br/>· >5% non-printable"}
+
+  Stream["<b>fast-csv stream</b><br/>row-by-row<br/>· skipEmptyLines · trim<br/>· header auto-detect"]
+
+  Buffer["<b>buffer</b><br/>fill to IDENTITY_BATCH_SIZE<br/>(1000 source IDs — Adobe hard cap)"]
+
+  Wave{"<b>wave scheduler</b><br/>WAVE_SIZE = concurrency × 2<br/>(default 10 × 2 = 20)"}
+
+  Limit["<b>p-limit(IDENTITY_CONCURRENCY)</b><br/>default 5 (was 10) after<br/>2026-05-29 rate-limit incident"]
+
+  Adobe[("<b>Adobe Identity Service</b><br/>POST /clusters/members<br/>15-30s p95<br/>429 → axios-retry + Retry-After")]
+
+  Canonical["<b>canonicalize</b><br/>resolve ns_code ↔ ns_id<br/>from registry"]
+
+  Insert["<b>bulkInsertIdentities()</b><br/>db.transaction() prepared stmt<br/>plain INSERT (no UNIQUE)<br/>~100k rows/sec"]
+
+  SQLite[("<b>expanded_identities</b><br/>SQLite WAL<br/>(deferred dedup at plan time<br/>via GROUP BY)")]
+
+  Progress["<b>progress + 429 counter</b><br/>per-batch: adobeMs · sqliteMs<br/>every 50 batches:<br/>p50/p95 + rateLimitHits"]
+
+  CSV --> Sniff
+  Sniff -->|accept| Stream
+  Sniff -.->|reject<br/>HTTP 400| Reject[/"clear operator message<br/>'looks like XLSX',<br/>'looks like MIP-encrypted', etc."/]
+  Stream --> Buffer
+  Buffer -->|every 1000 rows| Wave
+  Wave -->|.catch handler<br/>before push| Limit
+  Limit --> Adobe
+  Adobe --> Canonical
+  Canonical --> Insert
+  Insert --> SQLite
+  Insert -.-> Progress
+
+  Note["<b>2026-05-29 fix</b><br/>each pushed batch is given<br/>.catch(()=>{}) BEFORE drainWave,<br/>so an ECONNRESET inside the wave<br/>can't become an unhandled rejection<br/>that crashes the process at 96%."]
+
+  classDef src   fill:#FFF4D6,stroke:#F29423,stroke-width:2px,color:#1A1A1A
+  classDef proc  fill:#E8F2FF,stroke:#1473E6,stroke-width:2px,color:#1A1A1A
+  classDef store fill:#E8F8EE,stroke:#2D9D78,stroke-width:2px,color:#1A1A1A
+  classDef adobe fill:#FFE1E1,stroke:#FA0F00,stroke-width:2px,color:#1A1A1A
+  classDef bad   fill:#FFE1E1,stroke:#E34850,stroke-width:1.5px,color:#1A1A1A
+  classDef note  fill:#F5F5F5,stroke:#6E6E6E,stroke-width:1.5px,stroke-dasharray:5 5,color:#1A1A1A
+
+  class CSV,Reject src
+  class Sniff,Stream,Buffer,Wave,Limit,Canonical,Insert,Progress proc
+  class SQLite store
+  class Adobe adobe
+  class Note note

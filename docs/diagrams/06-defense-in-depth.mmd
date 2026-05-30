@@ -1,0 +1,32 @@
+%%{init: {
+  'theme':'base',
+  'themeVariables': {
+    'primaryColor':'#E8F2FF',
+    'primaryTextColor':'#1A1A1A',
+    'primaryBorderColor':'#1473E6',
+    'lineColor':'#525252',
+    'fontFamily':'Inter, Segoe UI, Helvetica, Arial, sans-serif',
+    'fontSize':'13px'
+  }
+}}%%
+graph TB
+  Threat["<b>Threat model</b>:<br/>· Local web UI has no authentication<br/>· Tool submits IRREVERSIBLE deletes<br/>· A malicious tab on the operator's machine<br/>  must NOT be able to drive the UI"]
+
+  L1["<b>L1 · Network isolation</b><br/>app.listen binds 127.0.0.1 by default<br/>HOST=0.0.0.0 is an explicit opt-out for SSH-tunnel demos only<br/>UI never reachable from the LAN"]
+
+  L2["<b>L2 · HTTP request guards</b><br/>① Host-header guard — rejects Host ≠ localhost/127.0.0.1/[::1]<br/>     (defeats DNS rebinding via attacker.com → 127.0.0.1)<br/>② Origin/Referer guard — POST/PATCH/PUT/DELETE require matching origin<br/>     (defeats simple-form CSRF from any open tab)<br/>③ Helmet — CSP script-src 'self', frame-ancestors 'none', COOP/CORP same-origin"]
+
+  L3["<b>L3 · Server-side allowlists</b><br/>region ∈ {va7, nld2, aus5, can2}<br/>environment ∈ {Production, Stage, Development}<br/>String length + CR/LF/null rejection on every credential field<br/>(prevents SSRF via host injection, header smuggling)"]
+
+  L4["<b>L4 · Credential storage</b><br/>Client secrets: AES-256-GCM at rest<br/>· 12-byte random IV per row · 16-byte auth tag<br/>· key at data/.key (chmod 600, O_EXCL on create, never synced)<br/>IMS tokens: memory only, thundering-herd guard, never persisted"]
+
+  L5["<b>L5 · Static asset isolation</b><br/>All fonts, icons, scripts, styles self-hosted under src/web/<br/>Zero CDN loads · zero analytics · zero telemetry<br/>(an admin tool for destructive ops cannot leak operator IP to third parties)"]
+
+  L6["<b>L6 · Destructive-API safety</b><br/>POST /workorder: never auto-retried on 5xx/network/timeout<br/>4xx → fail-fast + release quota<br/>5xx/timeout → leave in submitting (uncertain) + orphan recovery<br/>ReplanForbiddenError blocks duplicate emission after submit<br/>Per-month approval gate for Month 2+<br/>UI debounce on every destructive button"]
+
+  Threat --> L1 --> L2 --> L3 --> L4 --> L5 --> L6
+
+  classDef threat fill:#FFE1E1,stroke:#E34850,stroke-width:2px,color:#1A1A1A
+  classDef layer  fill:#E8F2FF,stroke:#1473E6,stroke-width:2px,color:#1A1A1A
+  class Threat threat
+  class L1,L2,L3,L4,L5,L6 layer

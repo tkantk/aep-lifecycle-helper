@@ -536,9 +536,11 @@ Origin or Referer), and registerUuidParamGuards on `:id` / `:credsId`.
 | GET  | `/api/jobs/:id/progress` | Live expansion progress (fast path) |
 | POST | `/api/jobs/:id/plan` | Build work-order plan. Server-side fetches `/quota` first; planner emits initial day-bucketed WOs then redistributor re-buckets into month×day. Returns `{ planned, days, months, perMonthCounts, totalIdentifiers, shiftedFromPrevious, previousMonths, quota }`. 503 with `quota_unavailable` if Adobe is unreachable + no recent cache |
 | POST | `/api/jobs/:id/approve-month` | Flip `awaiting_approval` → `planned` for `{ monthIndex }` (≥ 2). 400 for monthIndex=1/non-integer; 404 if no awaiting WOs |
-| POST | `/api/jobs/:id/submit` | Kick off submission. Body: `{ dayIndex?, monthIndex? }`. Server runs redistributor against fresh `/quota` before picking work |
+| POST | `/api/jobs/:id/submit` | Kick off submission. Body: `{ dayIndex?, monthIndex? }`. Server runs redistributor against fresh `/quota` before picking work. Submit's failure handling differentiates Adobe-4xx (mark `failed` + release quota) from 5xx/timeout/network (keep `submitting`, hold quota — reconcile later) |
+| POST | `/api/jobs/:id/reconcile` | Per-job orphan reconciliation. Scans every WO with `adobe_workorder_id IS NULL` AND `status IN ('submitting','failed')`. For each, looks up Adobe by `displayName`. Outcomes: `matched` (record Adobe ID, flip to submitted, re-reserve quota if was failed), `rolledBack` (submitting + confirmed absent → planned + release), `stillFailed` (failed + confirmed absent → leave), `indeterminate` (Adobe 4xx on lookup → leave), `perWoError` (per-WO failures). Returns counts |
 | GET  | `/api/jobs/:id/work-orders` | All work orders (month_index + day_index + per-service status from product_status_details) |
-| GET  | `/api/jobs/:id/export` | Download expanded identities CSV (formula-injection sanitised) |
+| GET  | `/api/jobs/:id/export` | Download expanded identities CSV (formula-injection sanitised). Uses `prepareStreamIdentitiesBySource()` for a FRESH prepared statement per request — overlapping exports cannot collide on a single Statement's one-iterator-per-stmt rule (2026-05-29 'statement busy' fix) |
+| DELETE | `/api/jobs/:id` | Hard-delete a job + cascade through `expanded_identities` and `work_orders`. 409 with `{error:'in_flight'}` when any WO is `submitting`/`submitted`/`received`/`validated`/`ingested`. `?force=true` bypasses; Adobe-side deletes continue but local tracking is dropped. Best-effort unlinks upload + exported CSV |
 
 ### Settings (Phase 3)
 
@@ -914,7 +916,15 @@ Documented in `CLAUDE.md` but critical for review:
 
 ## 10. Test coverage and gaps
 
-**178 tests** as of the current codebase (`npm test`).
+**197 tests** as of the current codebase (`npm test`). Recent additions
+(late-May 2026 hardening pass) extended coverage to: per-job orphan
+reconciliation, the `DELETE /api/jobs/:id` route with the in-flight
+guard, the `prepareStreamIdentitiesBySource()` Statement-per-call
+isolation (the fix for the `statement busy` 500 on /export), the wave-
+drain regression that prevents unhandled-rejection crashes when many
+batches reject simultaneously (ECONNRESET-on-keep-alive scenario), and
+the CSV pre-flight sniffer that rejects XLSX/UTF-16/MIP/binary uploads
+before fast-csv runs.
 
 ### What IS covered (`test/*.test.js`)
 
@@ -1004,12 +1014,17 @@ Documented in `CLAUDE.md` but critical for review:
   between `startScheduler` and the jobs table is untested end-to-end.
 - **`quotaApi` + route integration**: the `GET /api/adobe/:credsId/quota`
   route has no dedicated test; the Phase 1 tests cover the service directly.
-- **`failed` WO orphan recovery gap** (Q12): `listSubmittingOrphanOrders`
-  only selects `status='submitting'`. A WO that timed out and was marked
-  `failed` (quota released) won't be reconciled at startup. If Adobe
-  actually processed that POST, the operator seeing a `failed` WO and
-  re-submitting could create a duplicate delete. Low probability (requires
-  a network timeout exactly at the POST boundary) but worth adding a test.
+- **~~`failed` WO orphan recovery gap (Q12)~~** — **RESOLVED 2026-05-29**.
+  Two changes: (a) the submission catch block no longer marks
+  timeout/5xx/network errors as `failed` — they stay in `submitting`
+  with quota held, so the existing startup `reconcileOrphanWorkOrders`
+  catches them. (b) For pre-existing legacy `failed` rows (with no
+  Adobe ID, from before the fix), the new
+  `POST /api/jobs/:id/reconcile` route + `reconcileJobOrphans(jobId)`
+  helper scan BOTH `submitting` and `failed` statuses, re-reserving
+  quota for matches that turn out to have been processed by Adobe.
+  Operator-triggered via the yellow "↻ Reconcile" banner on the
+  Submit tab.
 
 ---
 

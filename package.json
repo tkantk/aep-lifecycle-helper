@@ -23,6 +23,7 @@
     "uuid": "^9.0.1"
   },
   "devDependencies": {
+    "@mermaid-js/mermaid-cli": "^11.15.0",
     "nock": "^13.5.4"
   },
   "engines": {

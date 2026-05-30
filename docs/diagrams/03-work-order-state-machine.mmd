@@ -1,0 +1,66 @@
+%%{init: {
+  'theme':'base',
+  'themeVariables': {
+    'primaryColor':'#E8F2FF',
+    'primaryTextColor':'#1A1A1A',
+    'primaryBorderColor':'#1473E6',
+    'lineColor':'#525252',
+    'fontFamily':'Inter, Segoe UI, Helvetica, Arial, sans-serif',
+    'fontSize':'14px'
+  },
+  'flowchart':{ 'curve':'basis' }
+}}%%
+flowchart TB
+  Start(["<b>POST /api/jobs/:id/plan</b>"])
+
+  P["<b>PLANNED</b><br/>Month 1 WOs"]
+  AA["<b>AWAITING_APPROVAL</b><br/>Month 2+ WOs<br/>(gated per month)"]
+
+  Reserve{"runSubmission<br/>quota reserve"}
+  D["<b>DEFERRED</b><br/>(quota cap hit;<br/>retries on UTC rollover)"]
+
+  SUBing["<b>SUBMITTING</b><br/>(POST in flight, or<br/>uncertain after 5xx/timeout —<br/>quota held)"]
+
+  SUBed["<b>SUBMITTED</b><br/>(Adobe WO ID recorded)"]
+  F["<b>FAILED</b> (terminal)<br/>4xx → quota released"]
+
+  MonPoll{"monitor.js<br/>60s poll"}
+
+  C["<b>COMPLETED</b><br/>(terminal)"]
+  Ffinal["<b>FAILED</b> (terminal)<br/>Adobe completion failed"]
+
+  Start --> P
+  Start --> AA
+  AA -->|"POST /approve-month"| P
+
+  P --> Reserve
+  Reserve -->|granted| SUBing
+  Reserve -->|"denied (cap)"| D
+  D -->|"UTC rollover<br/>(daily or monthly)"| P
+
+  SUBing -->|"Adobe 2xx"| SUBed
+  SUBing -->|"Adobe 4xx<br/>(definitively rejected)"| F
+  SUBing -->|"5xx / timeout / ECONNRESET<br/>(stay in SUBMITTING,<br/>quota NOT released)"| SUBing
+
+  SUBed --> MonPoll
+  MonPoll -->|"status = completed"| C
+  MonPoll -->|"status = failed"| Ffinal
+
+  SUBing -->|"startup recovery<br/>or POST /reconcile<br/>(found by displayName)"| SUBed
+  F -->|"POST /reconcile<br/>(found in Adobe;<br/>re-reserves quota)"| SUBed
+  SUBing -->|"reconcile:<br/>confirmed absent"| P
+
+  classDef start  fill:#FFF4D6,stroke:#F29423,stroke-width:2px,color:#1A1A1A
+  classDef gate   fill:#FFF4D6,stroke:#F29423,stroke-width:2px,color:#1A1A1A
+  classDef state  fill:#E8F2FF,stroke:#1473E6,stroke-width:2px,color:#1A1A1A
+  classDef warn   fill:#FFF4D6,stroke:#F29423,stroke-width:2px,color:#1A1A1A
+  classDef bad    fill:#FFE1E1,stroke:#E34850,stroke-width:2px,color:#1A1A1A
+  classDef good   fill:#E8F8EE,stroke:#2D9D78,stroke-width:2px,color:#1A1A1A
+
+  class Start start
+  class P,AA,SUBing state
+  class D warn
+  class SUBed good
+  class F,Ffinal bad
+  class C good
+  class Reserve,MonPoll gate

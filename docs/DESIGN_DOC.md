@@ -5,11 +5,12 @@
 
 | Field        | Value                                           |
 |--------------|-------------------------------------------------|
-| Version      | 2.0.0                                           |
-| Date         | 2026-05-28                                      |
+| Version      | 3.0.0                                           |
+| Date         | 2026-05-30                                      |
 | Status       | Production-ready                                |
 | Author       | Tushar Kant Kar (Adobe)                         |
 | Audience     | Client teams, platform architects, reviewers    |
+| Diagrams     | Rendered via Mermaid CLI (sources in `docs/diagrams/*.mmd`, PNGs in `docs/diagrams/*.png`) |
 
 ---
 
@@ -18,7 +19,9 @@
 1. [Executive Summary](#1-executive-summary)
 2. [System Architecture](#2-system-architecture)
 3. [End-to-End Data Flow](#3-end-to-end-data-flow)
+   - 3.1 Operator Journey · 3.2 Expansion data flow · 3.3 Step-by-step detail
 4. [Work Order Lifecycle](#4-work-order-lifecycle)
+   - 4.1 State Machine · 4.2 Crash & uncertain-submit recovery · 4.3 Status reference · 4.4 Submit → reconcile flow
 5. [Multi-Month Quota Planning](#5-multi-month-quota-planning)
 6. [Adobe API Integration](#6-adobe-api-integration)
 7. [Security Architecture](#7-security-architecture)
@@ -27,6 +30,11 @@
 10. [Design Decisions](#10-design-decisions)
 11. [Known Limitations & Extension Points](#11-known-limitations--extension-points)
 12. [Appendix — File Map](#12-appendix--file-map)
+
+> All diagrams in this document are rendered from Mermaid source files
+> in `docs/diagrams/*.mmd` using Mermaid CLI. GitHub renders the
+> sources natively; the rendered PNGs are committed alongside so the
+> Word export (`DESIGN_DOC.docx`) embeds them too.
 
 ---
 
@@ -96,65 +104,13 @@ There is no cloud infrastructure — all data, state, and secrets live
 locally. The only outbound traffic is HTTPS calls to Adobe's documented
 APIs.
 
-```
-┌────────────────────────────────────────────────────────────────────────────┐
-│                          OPERATOR'S MACHINE                                │
-├────────────────────────────────────────────────────────────────────────────┤
-│                                                                            │
-│  Browser  ──HTTP──►  Express server  (src/index.js, 127.0.0.1:3000)        │
-│                                                                            │
-│  REST API Routes                  Background Runners                       │
-│  ─────────────────                ──────────────────────                   │
-│  /api/config/*                    expansion.js   CSV → Identity Graph      │
-│  /api/adobe/*                     submission.js  Plan + quota-gated POST   │
-│  /api/upload                      redistributor  Re-bucket vs live quota   │
-│  /api/jobs/*                      monitor.js     60s WO status polling     │
-│  /api/settings/*                  recovery.js    Boot-time reconciliation  │
-│                                   scheduler.js   Auto-resume (opt-in)      │
-│                                                                            │
-│  Adobe Service Layer              Security Middleware                      │
-│  ─────────────────────            ──────────────────────                  │
-│  imsAuth      adobeClient         Host-header guard (DNS rebinding)        │
-│  sandboxes    datasets            Origin / Referer guard (CSRF)            │
-│  namespaces   identityGraph       Helmet (CSP, COOP, CORP)                 │
-│  hygiene      quotaApi            AES-256-GCM credential encryption        │
-│  quotaManager                                                              │
-│                                                                            │
-│  Persistence  (data/ directory — never committed, never cloud-synced):     │
-│    state.db     SQLite (WAL mode) — every table lives here                 │
-│    .key         AES-256 encryption key (chmod 600, never synced)           │
-│    uploads/     Streamed CSV uploads                                       │
-│    output/      Exported result CSVs                                       │
-│                                                                            │
-│  SQLite tables: credentials · sandbox_configs · jobs · work_orders         │
-│                 expanded_identities · quota_usage · quota_usage_monthly    │
-│                 app_settings                                               │
-│                                                                            │
-└─────────────────────────────────────┬──────────────────────────────────────┘
-                                      │  HTTPS  (TLS 1.2+)
-                                      ▼
-┌────────────────────────────────────────────────────────────────────────────┐
-│                       ADOBE EXPERIENCE PLATFORM                            │
-├────────────────────────────────────────────────────────────────────────────┤
-│                                                                            │
-│  IMS Authentication       POST /ims/token/v3                               │
-│                           Host: ims-na1.adobelogin.com                     │
-│                                                                            │
-│  Identity Service         POST /data/core/identity/clusters/members        │
-│  (region-sharded)         GET  /data/core/idnamespace/identities           │
-│                           Host: platform-{region}.adobe.io                 │
-│                                                                            │
-│  Platform Services        GET  /data/foundation/sandbox-management/        │
-│                           GET  /data/foundation/catalog/dataSets           │
-│                           Host: platform.adobe.io                          │
-│                                                                            │
-│  Data Hygiene API         POST /data/core/hygiene/workorder    (DESTRUCTIVE│
-│  (the destructive one)    GET  /data/core/hygiene/workorder/{id}  — never  │
-│                           GET  /data/core/hygiene/quota         auto-retried)│
-│                           Host: platform.adobe.io                          │
-│                                                                            │
-└────────────────────────────────────────────────────────────────────────────┘
-```
+![System Architecture](diagrams/01-system-architecture.png)
+
+*Browser ↔ loopback HTTP ↔ Node.js Express process (Routes + Background
+Runners + Adobe Service Layer + Security middleware) ↔ HTTPS to Adobe
+Experience Platform (IMS Auth, Identity Service, Platform Services,
+Data Hygiene API). All persistence in `data/state.db` (SQLite WAL).
+Source: `docs/diagrams/01-system-architecture.mmd`.*
 
 ### 2.2 Component Summary
 
@@ -198,32 +154,36 @@ APIs.
 
 ### 3.1 Operator Journey Overview
 
-```
-  CONFIGURE        UPLOAD           EXPAND           PLAN
-  ─────────────────────────────────────────────────────────
-      │                │                │               │
-      ▼                ▼                ▼               ▼
-  Enter IMS        Drop CSV         Fetch all       Pack into
-  credentials   ──► to disk      ──► linked      ──► work orders
-  Pick sandbox     Create job       identities       Assign day
-  Test connect     row (DB)         via Identity     + month index
-  Fetch quota                       Graph (AEP)
-      │                │                │               │
-      └────────────────┴────────────────┴───────────────┘
-                            ▼
-  APPROVE          SUBMIT           MONITOR         EXPORT
-  ─────────────────────────────────────────────────────────
-      │                │                │               │
-      ▼                ▼                ▼               ▼
-  Month 2+        Reserve         Poll Adobe      Download CSV
-  WOs need     ──► quota        ──► every 60s  ──► with status
-  explicit        POST to          Track all        per source
-  operator        Adobe            status           identifier
-  approval        Hygiene          transitions
-                  API
-```
+![Operator Journey](diagrams/02-operator-journey.png)
 
-### 3.2 Step-by-Step Detail
+*Seven steps left-to-right: **Configure → Upload → Expand → Plan →
+Approve → Submit → Monitor**. Approve is a per-month gate (Month 1 ships
+immediately; Month 2+ requires `POST /api/jobs/:id/approve-month`).
+Submit's uncertain failure path (5xx / timeout / network) leaves the
+WO in `submitting` for **Reconcile** to recover — the local DB is
+brought back in sync with Adobe by displayName lookup. Source:
+`docs/diagrams/02-operator-journey.mmd`.*
+
+### 3.2 Expansion Data Flow
+
+The expansion pipeline turns a streamed CSV into deduplicated rows in
+`expanded_identities`, calling Adobe Identity Graph in bounded waves
+along the way. Every step is rate-limit-aware and crash-safe.
+
+![Expansion data flow](diagrams/07-expansion-data-flow.png)
+
+*Upload → `sniffUpload()` rejects non-CSV payloads (ZIP/XLSX, UTF-16,
+MIP-encrypted, etc.) before fast-csv runs → row-by-row stream → buffer
+fills to `IDENTITY_BATCH_SIZE=1000` → **wave scheduler** caps in-flight
+batches at `IDENTITY_CONCURRENCY × 2` (default 5 × 2 = 10) → `p-limit`
+sends each batch through `POST /clusters/members` (axios-retry honours
+`Retry-After` on 429) → canonicalize ns_code ↔ ns_id from the registry
+→ `bulkInsertIdentities` writes inside `db.transaction()` (one fsync
+per batch). Plain INSERT — dedup is deferred to plan time. Per-batch
+log line carries `adobeMs`, `sqliteMs`, every 50 batches a summary with
+`p50` / `p95` / `rateLimitHits`. Source: `docs/diagrams/07-expansion-data-flow.mmd`.*
+
+### 3.3 Step-by-Step Detail
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -390,99 +350,69 @@ APIs.
 
 ### 4.1 State Machine
 
-The work-order lifecycle is a strict state machine. Every state transition
-is logged. Terminal states (`completed`, `failed`) never move backward.
+The work-order lifecycle is a strict state machine. Every state
+transition is logged. Terminal states (`completed`, `failed`) never
+move backward.
 
-```
-ENTRY — from POST /api/jobs/:id/plan
-─────────────────────────────────────────────────────────────────────────────
+![Work-order state machine](diagrams/03-work-order-state-machine.png)
 
-        ┌──────────────────┐              ┌─────────────────────────┐
-        │     PLANNED      │              │   AWAITING_APPROVAL     │
-        │   Month 1 WOs    │              │   Month 2+ WOs          │
-        └────────┬─────────┘              └────────────┬────────────┘
-                 │                                     │
-                 │              Operator clicks "Approve Month N":
-                 │              POST /api/jobs/:id/approve-month
-                 │                                     │
-                 │   ┌─────────────────────────────────┘
-                 │   │  (Month N flips to planned)
-                 ▼   ▼
-        ┌──────────────────────────┐
-        │  runSubmission picks up  │ ◄────── DEFERRED rows retry here
-        └────────────┬─────────────┘         after UTC rollover (daily
-                     │                       or monthly)
-                     ▼                                          ▲
-          ┌──────────────────────┐                              │
-          │  Reserve quota       │                              │
-          │  (atomic SQLite tx:  │                              │
-          │   daily + monthly)   │                              │
-          └────┬────────────┬────┘                              │
-        GRANTED            DENIED                               │
-               │              │                                 │
-               ▼              ▼                                 │
-        ┌─────────────┐  ┌──────────────┐                       │
-        │ SUBMITTING  │  │   DEFERRED   │───────────────────────┘
-        │             │  │              │
-        │ POST Adobe  │  │ Quota cap    │
-        │ /workorder  │  │ hit; waits   │
-        └──┬───────┬──┘  │ for rollover │
-       2xx │       │     └──────────────┘
-           │       │ 4xx / 5xx / network
-           │       │ (quota released; never auto-retried)
-           ▼       ▼
-   ┌─────────────┐  ┌──────────────┐
-   │  SUBMITTED  │  │    FAILED    │
-   │  Adobe ACK  │  │  (terminal)  │
-   └──────┬──────┘  └──────────────┘
-          │
-          │  monitor.js polls GET /workorder/{id} every 60 seconds
-          ▼
-  ┌────────────────────────────────────────────────┐
-  │  Adobe-side status progression:                │
-  │    received → validated → submitted →          │
-  │    ingested → COMPLETED   OR   FAILED          │
-  └────────────────┬──────────────────────┬────────┘
-                   ▼                      ▼
-            ┌──────────────┐       ┌──────────────┐
-            │  COMPLETED   │       │    FAILED    │
-            │  (terminal)  │       │  (terminal)  │
-            └──────────────┘       └──────────────┘
-```
+*Entry from `POST /api/jobs/:id/plan` produces **PLANNED** (Month 1)
+or **AWAITING_APPROVAL** (Month 2+). The per-month approval gate flips
+awaiting → planned via `POST /approve-month`. `runSubmission` reserves
+quota → either advances to **SUBMITTING** (POST in flight) or marks
+**DEFERRED** (cap hit; retries on UTC rollover). Adobe 2xx →
+**SUBMITTED**; Adobe 4xx → **FAILED** with quota released; 5xx /
+timeout / network → stay in **SUBMITTING**, quota held, awaiting
+reconcile. Monitor polls submitted WOs to terminal **COMPLETED** /
+**FAILED**. Source: `docs/diagrams/03-work-order-state-machine.mmd`.*
 
-**Crash recovery (boot-time, in `runner/recovery.js`):**
+### 4.2 Crash & uncertain-submit recovery
 
-When the process crashes between quota reservation and Adobe's POST
-acknowledgment, work orders are left as orphans (`status='submitting'`
-with `adobe_workorder_id IS NULL`). On next startup, recovery looks each
-one up in Adobe by `displayName` prefix and applies the appropriate
-resolution:
+When a submit times out (the Hygiene POST is non-idempotent — see
+§10.4), the WO is left in `submitting` with no `adobe_workorder_id`.
+The startup orphan-recovery routine *and* the operator-triggered
+`POST /api/jobs/:id/reconcile` route both look the WO up in Adobe by
+its `displayName` prefix and apply one of four outcomes:
 
-```
- ┌─ Match found in Adobe (displayName-prefix list lookup returns the WO)
- │     → record adobe_workorder_id; status → SUBMITTED  (monitor takes over)
- │
- ├─ Confirmed absent (Adobe returned 200 OK, our prefix not in the list)
- │     → release quota; status → PLANNED  (next submit run retries safely)
- │
- └─ Lookup indeterminate (Adobe returned 4xx / 5xx / network error)
-       → leave as SUBMITTING; retry reconciliation on the NEXT boot
-         Never roll back when the answer is ambiguous, because rolling
-         back could create a duplicate Adobe work order if the original
-         POST had actually been processed.
-```
+| Outcome | Action |
+|---|---|
+| **Match found** — Adobe has the WO under our `displayName` | Record `adobe_workorder_id` → flip to `submitted`. If the WO had previously been mis-marked `failed`, also re-reserve the quota that the old buggy catch-block released. |
+| **Confirmed absent** — Adobe returned 200, our `displayName` is not in the list | If status was `submitting`, roll back to `planned` and release quota (next submit retries cleanly). If status was `failed`, leave it as failed (confirmed). |
+| **Indeterminate** — Adobe rejected the lookup with 4xx | Leave the WO alone; the next reconcile attempt retries. Never roll back on ambiguity (would risk duplicate destructive submits if the original POST had actually been processed). |
+| **Transient lookup error** — network failure during reconcile | Leave the WO alone; retry on next boot or next manual reconcile click. |
 
-### 4.2 Status Reference
+The UI shows a yellow banner on the Submit tab whenever any WO is in
+`submitting`/`failed` without an `adobe_workorder_id`, with a
+**↻ Reconcile** button that fires `POST /api/jobs/:id/reconcile`. No
+restart required.
+
+### 4.3 Status Reference
 
 | Status                | Description                                                    | Next action           |
 |-----------------------|----------------------------------------------------------------|-----------------------|
 | `planned`             | Work order created locally; ready to submit to Adobe           | runSubmission picks up |
 | `awaiting_approval`   | Month 2+ gate; operator must approve before submission         | Click "Approve Month N" |
-| `deferred`            | Quota exhausted for today; will retry after UTC midnight       | Auto-resumes next day  |
-| `submitting`          | POST to Adobe in-flight (crash window)                         | Recovery reconciles    |
-| `submitted`           | Adobe has acknowledged; monitoring in progress                 | Monitor polls 60s      |
+| `deferred`            | Quota exhausted for today / this month; will retry after UTC rollover | Auto-resumes next day  |
+| `submitting`          | Two meanings: (a) POST to Adobe in flight, (b) UNCERTAIN — POST timed out / network reset / 5xx; Adobe may have processed it, quota still reserved | Recovery / reconcile by `displayName` |
+| `submitted`           | Adobe ACK'd with a work-order ID; monitoring in progress       | Monitor polls 60s      |
 | `completed`           | Adobe confirms deletion complete (terminal)                    | Export results         |
-| `failed`              | Adobe returned error or POST failed (terminal)                 | Review error message   |
+| `failed`              | Adobe returned 4xx (definitive rejection) and quota was released (terminal) | Review error message; optionally reconcile if you suspect Adobe processed it anyway |
+
+### 4.4 Submit → reconcile flow
+
+End-to-end view of a single submit, including how an uncertain failure
+gets resolved either by startup recovery or by the operator-triggered
+reconcile button — without losing data or double-spending Adobe quota.
+
+![Submit and reconcile flow](diagrams/08-submit-reconcile-flow.png)
+
+*Quota reserve gates the POST; the four post-POST outcomes
+(**SUBMITTED** / **DEFERRED** / **FAILED** / **SUBMITTING-uncertain**)
+each have a precise recovery path. SUBMITTING-uncertain WOs come back
+to life via the orphan-recovery path (boot-time or
+`POST /api/jobs/:id/reconcile`); previously-FAILED WOs can also be
+reconciled if found in Adobe (re-reserves the quota the old buggy
+catch released). Source: `docs/diagrams/08-submit-reconcile-flow.mmd`.*
 
 ---
 
@@ -502,60 +432,38 @@ see the full timeline before any work is submitted.
 
 ### 5.2 Planning Diagram
 
-```
-  INPUT:  2,500,000 expanded identifiers
-  QUOTA:  Daily cap = 1,000,000  ·  Monthly cap = 3,000,000
+For a job of 2,500,000 expanded identifiers against the typical Adobe
+caps (1,000,000/day, 3,000,000/month), the planner produces:
 
-  ┌─────────────────────────────────────────────────────────────────────┐
-  │  MONTH 1  (ships immediately on first Submit click)                 │
-  │                                                                     │
-  │  Running              Identifiers          Work Orders              │
-  │  daily total          in bucket            created                  │
-  │  ──────────           ──────────           ──────────               │
-  │  Day 1   1,000,000   ████████████████████  10 × 100k WOs           │
-  │  Day 2   1,000,000   ████████████████████  10 × 100k WOs           │
-  │  Day 3     500,000   ██████████             5 × 100k WOs           │
-  │            ───────                                                  │
-  │  Month 1 total: 2,500,000  ✓ Within monthly cap (3,000,000)        │
-  │  Remaining: 500,000 carry to Month 2                                │
-  └─────────────────────────────────────────────────────────────────────┘
+![Multi-month planning](diagrams/04-multi-month-planning.png)
 
-  ─── Operator reviews Month 2 plan ─── Clicks "Approve Month 2" ─────►
-
-  ┌─────────────────────────────────────────────────────────────────────┐
-  │  MONTH 2  (status: awaiting_approval → planned after approval)      │
-  │                                                                     │
-  │  Day 1     500,000   ██████████             5 × 100k WOs           │
-  │            ───────                                                  │
-  │  Month 2 total: 500,000  ✓ Within monthly cap                       │
-  └─────────────────────────────────────────────────────────────────────┘
-
-  TOTAL JOB: 2,500,000 identifiers across 2 months, 4 days, 25 WOs
-```
+*Month 1 (blue) ships immediately when the operator clicks Submit on
+Day 1. Month 2 (orange) stays in `awaiting_approval` until the
+operator clicks **Approve Month 2** — a per-month sign-off gate so
+nobody accidentally lets a multi-month deletion run unattended.
+**Total job: 2,500,000 identifiers, 4 days across 2 months, 25 WOs**.
+The **live redistributor** (green) runs before every plan and submit,
+so day/month bucketing always reflects the current Adobe `/quota`
+numbers, not what they were when the plan was first built. Source:
+`docs/diagrams/04-multi-month-planning.mmd`.*
 
 ### 5.3 Live Quota Redistribution
 
-Before **every** plan and every submit run, the tool fetches live quota
-from Adobe's `GET /quota` endpoint. The **redistributor** then re-assigns
-`(day_index, month_index)` to all unshipped work orders to reflect the
-current quota remaining.
+The redistributor (`src/runner/redistributor.js`) fires:
 
-```
-  EXAMPLE: 300,000 identifiers consumed from today's quota by another source
+- After `planWorkOrders` builds the initial plan
+- At the top of every `runSubmission` call
+- (optionally) on every scheduler tick
 
-  Before redistribution:                 After redistribution:
-  ──────────────────────                 ─────────────────────
-  Day 1: 1,000,000 capacity              Day 1: 700,000 remaining
-    WO-001: 100,000 ─ planned              WO-001: 100,000 ─ planned
-    WO-002: 100,000 ─ planned              WO-002: 100,000 ─ planned
-    WO-003: 100,000 ─ planned              WO-003: 100,000 ─ planned
-    ...                                    WO-004 → Day 2 (overflow)
-    WO-010: 100,000 ─ planned
-
-  The redistributor moves work orders across day/month buckets as needed.
-  Only unshipped WOs are ever re-bucketed. Already-shipped WOs are immutable.
-  The identity content (namespacesIdentities) never changes.
-```
+It walks unshipped WOs in `rowid` order, fits each into the current
+day's remaining capacity, advances day / month indices when caps would
+overflow, and persists the new `(day_index, month_index)` in a single
+transaction. **Shipped WOs are immutable** — the redistributor only
+touches WOs in `planned`, `deferred`, or `awaiting_approval` status.
+The identity content (`namespaces_identities` JSON) of any existing WO
+**never changes** — only the bucket labels do. This is the "if someone
+else's app consumed 300 k of your daily quota since you planned, push
+our remaining work to a later window" behaviour the operator can rely on.
 
 ---
 
@@ -576,28 +484,23 @@ current quota remaining.
 
 ### 6.2 Region Architecture
 
-Identity Service APIs are regionally sharded. Using the wrong region returns
-HTTP 200 with empty cluster data — a silent partial delete.
+Identity Service APIs are regionally sharded. A wrong-region call to
+`/clusters/members` returns HTTP 200 with **empty** cluster data — the
+operator would see "no linked identities" and proceed to delete only
+the source `hashedKocid`, leaving the linked email / phone / CRMID
+alive. This is the single worst failure mode in the system, so the
+region routing is a per-credential field validated by a server-side
+allowlist.
 
-```
-  ┌─────────────────────────────────────────────────────────────────────┐
-  │  Identity Service regions                                           │
-  │                                                                     │
-  │  Credential row → region field                                      │
-  │                          │                                          │
-  │                          ▼                                          │
-  │  ┌────────┐  ┌────────┐  ┌────────┐  ┌────────┐                    │
-  │  │  va7   │  │  nld2  │  │  aus5  │  │  can2  │                    │
-  │  │ VA     │  │ NL     │  │ AU     │  │ CA     │                    │
-  │  │ (US)   │  │(Europe)│  │(APAC)  │  │(Canada)│                    │
-  │  └────────┘  └────────┘  └────────┘  └────────┘                    │
-  │                                                                     │
-  │  URL pattern: https://platform-{region}.adobe.io                   │
-  │                                                                     │
-  │  Server-side allowlist prevents SSRF: only the four known regions   │
-  │  can be stored on a credential row.                                  │
-  └─────────────────────────────────────────────────────────────────────┘
-```
+![Region architecture](diagrams/05-region-architecture.png)
+
+*Each credential row carries its own `region`. The URL builder
+templates `https://platform-${region}.adobe.io` from that field — never
+from a global default. Three layers of defence-in-depth allowlist
+(`routes/config.js`, `namespaces.js`, `identityGraph.js`) refuse to
+build an Identity host with any value outside `{va7, nld2, aus5, can2}`,
+even if a tampered DB row holds something exotic — preventing SSRF
+via host injection. Source: `docs/diagrams/05-region-architecture.mmd`.*
 
 ### 6.3 Work-Order Payload
 
@@ -647,90 +550,59 @@ endpoint is unreachable and no cache exists.
 
 ### 7.1 Defense-in-Depth Model
 
-```
-  ┌─────────────────────────────────────────────────────────────────────┐
-  │  LAYER 1 — Network Isolation                                        │
-  │                                                                     │
-  │  Server binds to 127.0.0.1 (loopback) by default.                  │
-  │  The unauthenticated API is not reachable from the LAN.             │
-  │  Setting HOST=0.0.0.0 opts out of this protection entirely —        │
-  │  only do so for SSH-tunneled demos, never for production.           │
-  └─────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-  ┌─────────────────────────────────────────────────────────────────────┐
-  │  LAYER 2 — HTTP Request Guards  (src/middleware/security.js)        │
-  │                                                                     │
-  │  ① Host-Header Guard                                                │
-  │     Rejects requests where Host ≠ localhost / 127.0.0.1 / [::1]   │
-  │     Purpose: blocks DNS rebinding attacks                           │
-  │     (attacker resolves attacker.com → 127.0.0.1, serves malicious  │
-  │      JS; guard rejects because Host header is still attacker.com)  │
-  │                                                                     │
-  │  ② Origin / Referer Guard                                           │
-  │     POST / PUT / PATCH / DELETE must carry matching Origin header   │
-  │     Purpose: blocks cross-site request forgery (CSRF)               │
-  │     (a malicious page posting to localhost would have the wrong     │
-  │      Origin and be rejected before any state changes)               │
-  │                                                                     │
-  │  ③ Helmet Middleware (CSP + security headers)                       │
-  │     Content-Security-Policy: script-src 'self'  (no CDN scripts)   │
-  │     Content-Security-Policy: frame-ancestors 'none'  (no iframes)  │
-  │     Content-Security-Policy: object-src 'none'                     │
-  │     Cross-Origin-Opener-Policy: same-origin                        │
-  │     Cross-Origin-Resource-Policy: same-origin                      │
-  └─────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-  ┌─────────────────────────────────────────────────────────────────────┐
-  │  LAYER 3 — Server-Side Allowlists                                   │
-  │                                                                     │
-  │  region       ∈ { va7, nld2, aus5, can2 }                           │
-  │  environment  ∈ { Production, Stage, Development }                  │
-  │                                                                     │
-  │  Purpose: prevents SSRF via region injection.                       │
-  │  Without this, a tampered credential row could cause the server     │
-  │  to inject bearer tokens into a host controlled by an attacker.     │
-  │                                                                     │
-  │  All credential fields validated for length + control characters    │
-  │  (CR/LF/null) — these flow into outbound HTTP headers.              │
-  └─────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-  ┌─────────────────────────────────────────────────────────────────────┐
-  │  LAYER 4 — Credential Encryption                                    │
-  │                                                                     │
-  │  Raw client secret                                                  │
-  │       │                                                             │
-  │       ▼                                                             │
-  │  AES-256-GCM encryption                                             │
-  │    Key: data/.key (auto-generated, chmod 600) or ENCRYPTION_KEY env │
-  │    IV:  12 random bytes per row                                      │
-  │    Tag: 16-byte authentication tag (detects tampering)              │
-  │       │                                                             │
-  │       ▼                                                             │
-  │  Ciphertext stored in data/state.db                                 │
-  │                                                                     │
-  │  IMS bearer tokens:                                                 │
-  │    Cached in-memory only — never written to disk                    │
-  │    Auto-refreshed 120 seconds before expiry                         │
-  │    Thundering-herd guard: concurrent callers share one in-flight    │
-  │    promise (no duplicate refresh races)                             │
-  └─────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-  ┌─────────────────────────────────────────────────────────────────────┐
-  │  LAYER 5 — Static Asset Isolation                                   │
-  │                                                                     │
-  │  All UI assets (fonts, icons, scripts, styles) are self-hosted.     │
-  │  Zero CDN loads from the browser — no google-fonts.com, no          │
-  │  cloudflare, no analytics pixels.                                   │
-  │                                                                     │
-  │  Rationale: this is an admin tool for destructive operations. Any   │
-  │  third-party origin receives the operator's IP, user-agent, and     │
-  │  timing data — unacceptable for an offline-capable security tool.   │
-  └─────────────────────────────────────────────────────────────────────┘
-```
+The threat model: the local web UI has **no authentication**, the tool
+submits **irreversible** deletes, and a malicious browser tab the
+operator already has open must not be able to drive that API. Six
+layers protect against it.
+
+![Defense-in-depth](diagrams/06-defense-in-depth.png)
+
+*Layers 1-5 are network → HTTP → allowlist → credential → asset
+isolation. Layer 6 covers the destructive-API specific safety
+(non-idempotent retry policy, replan-forbidden guard, per-month
+approval gate, UI-level debounce on every destructive button). Source:
+`docs/diagrams/06-defense-in-depth.mmd`.*
+
+**Per-layer notes:**
+
+- **L1 · Network isolation** — `app.listen(port, '127.0.0.1', …)` binds
+  loopback by default. `HOST=0.0.0.0` is an explicit opt-out (intended
+  for SSH-tunneled demos only, never production).
+- **L2 · HTTP request guards** in `src/middleware/security.js`:
+  - **Host-header guard** rejects `Host: anything-other-than-localhost`
+    — the only defense against DNS rebinding (a malicious page resolves
+    `attacker.com → 127.0.0.1`, the browser then talks to localhost
+    thinking it's still same-origin with the attacker; the Host header
+    however still says `attacker.com`, and the guard refuses).
+  - **Origin / Referer guard** on every state-changing method
+    (POST/PUT/PATCH/DELETE).
+  - **Helmet CSP** `script-src 'self'`, `frame-ancestors 'none'`,
+    `object-src 'none'`, COOP/CORP `same-origin`.
+- **L3 · Allowlists** — `region ∈ {va7, nld2, aus5, can2}` and
+  `environment ∈ {Production, Stage, Development}` are enforced both
+  at the route layer (PATCH/POST `/credentials`) and at the service
+  layer (`namespaces.js`, `identityGraph.js`), so even a tampered DB
+  row can't make us build a host outside the allowlist. Every
+  credential field is length-bounded and rejects CR/LF/null (header
+  smuggling defence).
+- **L4 · Credential storage** — client secrets are AES-256-GCM at rest
+  with a 12-byte random IV per row and a 16-byte auth tag. The key
+  file `data/.key` is created with `O_EXCL` (no race on first run),
+  `chmod 600` on POSIX. IMS tokens stay in memory only, refreshed
+  120s before expiry, with a thundering-herd guard so concurrent
+  callers share a single in-flight refresh.
+- **L5 · Static asset isolation** — every font, icon, script and
+  stylesheet is self-hosted under `src/web/`. Zero CDN loads. Zero
+  analytics. An admin tool for destructive operations cannot leak the
+  operator's IP / user-agent / timing to a third-party origin.
+- **L6 · Destructive-API safety** — the hygiene POST is deliberately
+  non-idempotent (`{idempotent: false}` in axios-retry), so a 5xx /
+  timeout / network error never triggers an auto-retry that could
+  duplicate an irreversible delete. ReplanForbiddenError (HTTP 409)
+  blocks re-emission of work orders for already-shipped identities.
+  The per-month approval gate forces explicit operator sign-off for
+  Month 2+. Every destructive UI button is debounced via
+  `onClickGuarded`.
 
 ### 7.2 Submission Safety
 
@@ -933,18 +805,23 @@ npm start            # starts server, opens browser at http://localhost:3000
 node --test test
 ```
 
-All 178 tests should pass. The suite covers:
+All **197 tests** should pass. The suite covers:
 - Work-order payload validators (27 tests)
 - Namespace canonicalization (11 tests)
 - IMS token cache (7 tests)
 - Quota manager — daily, monthly, null-monthly release gating (12 tests)
-- Planner — cluster packing, replan guard, deferred tolerance (12 tests)
+- Planner — cluster packing, replan guard, deferred tolerance, factory statement (13 tests)
 - Startup recovery — orphan reconciliation, 400-indeterminate handling (6 tests)
 - Adobe client — error enrichment, idempotency-aware retries (11 tests)
 - Per-credential region routing (3 tests)
 - Credentials routes — PATCH non-secret safety, DELETE 409 (7 tests)
 - Monitor feed — sorting, filters, aggregates, sandbox filter (11 tests)
 - Approve-month gate (9 tests)
+- Jobs routes — DELETE, force-delete, cascade, in-flight guard (9 tests)
+- Wave-drain regression — concurrent rejections without unhandled rejection (3 tests)
+- CSV sniffer — accept UTF-8, reject XLSX / UTF-16 / binary / empty (6 tests)
+- Security middleware — host guard, Origin guard, allowlists, CSV formula sanitiser (15 tests)
+- Quota API live snapshot, redistributor, scheduler (rest)
 - End-to-end integration with fully-mocked Adobe (3 tests)
 
 ### 9.4 Recovering From a Crash
@@ -1071,15 +948,32 @@ regardless of file size.
 | Limitation                   | Detail                                                                                       |
 |------------------------------|----------------------------------------------------------------------------------------------|
 | Single-process only          | Running two instances against the same `data/state.db` will corrupt the WAL. No advisory lock. |
-| No multi-user auth           | The local web UI has no authentication. Whoever can reach `127.0.0.1:3000` has full access. |
+| No multi-user auth           | The local web UI has no authentication. Whoever can reach `127.0.0.1:3000` has full access. The Host-header + Origin guards in §7 prevent a malicious browser tab from driving it, but a co-resident process on the loopback interface can. |
 | Single source namespace      | All rows in the CSV are treated as one namespace. For mixed-namespace sources, run separate jobs per namespace. |
 | One CSV per job              | No batch/folder upload. Each deletion batch requires a separate job.                         |
 | No credential export         | Each machine encrypts with its own `data/.key`. Moving credentials to a new machine requires re-entering them. |
-| Monitor polls 60s            | Adobe doesn't emit webhooks for work-order status. 60-second polling is the only option.    |
+| Monitor polls 60s            | Adobe doesn't emit webhooks for work-order status. 60-second polling is the only option (with a 15s per-WO timeout cap and a reentrancy guard since 2026-05-29). |
 | UTC midnight quota rollover  | A job submitted at 11:59 PM local time that Adobe processes after 00:00 UTC counts against the next day's quota. |
 | OneDrive path warning        | SQLite WAL files inside a cloud-synced path can trigger `SQLITE_BUSY` errors. Set `DATA_DIR` outside the sync folder. |
+| Identity Graph rate limits   | Adobe Identity Service rate-limits aggressively against any individual org. The tool surfaces 429 counts in the per-batch summary; the operator's job is to keep `IDENTITY_CONCURRENCY` low enough that 429s stay at 0. The default was lowered from 10 to 5 on 2026-05-29 after a real-world incident where 15 caused Adobe to return 60-second `Retry-After` waits. |
 
-### 11.2 Extension Points
+### 11.2 Recently resolved (was a limitation before — no longer)
+
+These were genuine limitations earlier in 2026 and were fixed during
+the late-May hardening pass:
+
+| Was a problem                | Fix shipped (commit)                                                                          |
+|------------------------------|-----------------------------------------------------------------------------------------------|
+| 60s submit timeout marked WO `failed` even when Adobe processed it | Submission catch-block distinguishes 4xx (definitive reject, mark failed + release quota) from 5xx/timeout/network (uncertain, keep `submitting`, hold quota). Plus a per-job `POST /api/jobs/:id/reconcile` route + UI banner that looks up uncertain WOs by `displayName` and corrects the local record (re-reserving quota where needed). |
+| `Statement is busy` 500 on /export | Each `.iterate()` call now gets a fresh prepared statement via `prepareStreamIdentitiesBySource()`. |
+| Process crashed at 96% on ECONNRESET (unhandled rejection) | Each wave-pushed batch is given an inline `.catch(() => {})` BEFORE drainWave, so a network-level rejection in the pre-drain window can't crash the process. drainWave uses `Promise.allSettled` instead of `Promise.all`. |
+| UI showed "No job selected" after server restart even when a job was actively expanding | `ensureActiveJobLoaded()` auto-loads truly in-progress jobs (`expanding` / `submitting`). For everything else, the picker shows so the operator chooses. |
+| Auto-load surprised the operator after Delete Job | `sessionStorage` suppression flag set on delete, cleared on next explicit pick or new upload. |
+| Cascading monitor timeouts | Monitor tick is now non-reentrant; per-request timeout dropped from 60s to 15s. |
+| Mid-expansion shutdown didn't actually exit | `stopMonitor()` + `closeAllConnections()` + SIGKILL fallback after 11s. |
+| Cryptic 500 on uploaded `.xlsx` / MIP-encrypted / UTF-16 CSV | `sniffUpload()` pre-flight rejects non-CSV bytes with an actionable operator message. |
+
+### 11.3 Extension Points
 
 These features are not currently implemented but are architecturally
 straightforward to add:
@@ -1091,6 +985,7 @@ straightforward to add:
 | Operator audit log           | Wire `adobeClient.js` to insert one row per Adobe call into the existing `api_audit` table stub |
 | Batch CSV upload             | Add a folder-drop endpoint that creates one job per CSV file                                  |
 | Schema-aware dataset filter  | Pre-check each dataset's XDM primary identity via the Schema Registry API; warn if the deletion namespace isn't the primary |
+| Figma MCP integration        | Replace pre-rendered PNGs with auto-generated FigJam diagrams from the same `.mmd` source for designers who prefer editing in Figma. |
 
 ---
 
@@ -1168,9 +1063,19 @@ aep-lifecycle-helper/
 │
 ├── docs/
 │   ├── DESIGN_DOC.md               This document
+│   ├── DESIGN_DOC.docx             Word export, regenerated via pandoc from DESIGN_DOC.md
 │   ├── ARCHITECTURE.md             Living system overview (internal reference)
 │   ├── CHANGELOG.md                Append-only session log (internal reference)
-│   └── REVIEW.md                   Full review brief + Adobe API contracts (internal)
+│   ├── REVIEW.md                   Full review brief + Adobe API contracts (internal)
+│   └── diagrams/                   Mermaid source + rendered PNGs for every diagram
+│       ├── 01-system-architecture.{mmd,png}
+│       ├── 02-operator-journey.{mmd,png}
+│       ├── 03-work-order-state-machine.{mmd,png}
+│       ├── 04-multi-month-planning.{mmd,png}
+│       ├── 05-region-architecture.{mmd,png}
+│       ├── 06-defense-in-depth.{mmd,png}
+│       ├── 07-expansion-data-flow.{mmd,png}
+│       └── 08-submit-reconcile-flow.{mmd,png}
 │
 ├── CLAUDE.md                       AI assistant guidelines + invariants (internal)
 ├── README.md                       Quick-start guide

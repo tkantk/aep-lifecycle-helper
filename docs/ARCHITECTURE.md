@@ -106,23 +106,46 @@ demo — never for production. See CLAUDE.md I12.
                      See CLAUDE.md I15.
 
   2. UPLOAD          User picks source namespace from dropdown (populated from
-     │               the sandbox's namespace registry). CSV streamed to
-     ▼               data/uploads/. Row count passed as totalSourceIds.
-                     Job row inserted, status='expanding'.
+     │               the sandbox's namespace registry). CSV first passes through
+     ▼               sniffUpload() (utils/csv.js) which reads the first 4 KiB and
+                     rejects obvious non-CSV uploads BEFORE fast-csv runs —
+                     ZIP/XLSX (PK\x03\x04), OLE compound (legacy .xls / some
+                     MIP-protected files), UTF-16 BOM, PDF, empty, or >5%
+                     non-printable bytes (binary / MIP-encrypted). Each rejection
+                     carries an operator-actionable reason ('looks like .xlsx',
+                     'looks like UTF-16', 'looks like MIP-encrypted') and the
+                     route returns a clean 400 with the message in publicMessage.
+                     Accepted CSV is streamed to data/uploads/. Row count passed
+                     as totalSourceIds. Job row inserted, status='expanding'.
 
-  3. EXPAND          CSV stream → 1000-ID batches → p-limit(10) workers POST
-     │               /identity/clusters/members. Response parsed from
-     ▼               {clusters:[{compositeXid, members}]}. Each member canonicalized
+  3. EXPAND          CSV stream → 1000-ID batches → p-limit(IDENTITY_CONCURRENCY)
+     │               workers POST /identity/clusters/members. Default
+     ▼               concurrency is 5 (lowered from 10 on 2026-05-29 after a
+                     real-world Adobe rate-limit incident; safe ceiling for
+                     most orgs). Response parsed from
+                     {clusters:[{compositeXid, members}]}. Each member canonicalized
                      via namespace registry index → {code, id}. Plain INSERT into
                      expanded_identities (no unique index — dedup is deferred to
                      planning time via GROUP BY in streamIdentitiesBySource).
-                     Wave-based scheduling: WAVE_SIZE = concurrency × 2 tasks run
-                     in parallel; onRow is async so the CSV stream pauses when the
-                     wave fills, capping peak heap at O(concurrency × batchSize)
-                     regardless of job size. After all waves drain, a single
-                     COUNT DISTINCT query computes the true deduplicated found_count
-                     and writes it via setFoundCount. Live progress map in memory
-                     for the UI poll path.
+                     Wave-based scheduling: WAVE_SIZE = concurrency × 2 tasks
+                     run in parallel; onRow is async so the CSV stream pauses
+                     when the wave fills, capping peak heap at O(concurrency ×
+                     batchSize) regardless of job size. CRITICAL: each pushed
+                     task is given an inline .catch(() => {}) BEFORE drainWave
+                     attaches its handlers — without this, a network-level
+                     rejection (ECONNRESET on stalled keep-alive) in the
+                     pre-drain window becomes an unhandled rejection and Node
+                     ≥ 17 crashes the process (real 2026-05-29 96% crash).
+                     drainWave uses Promise.allSettled (not Promise.all) for
+                     belt-and-braces protection of late rejections too.
+                     Per-batch log line: adobeMs, sqliteMs, clustersReturned,
+                     linkedTotal. Every 50 batches a summary fires with
+                     {progress, p50, p95, rateLimitHits} for the window —
+                     non-zero rateLimitHits is the signal to lower
+                     IDENTITY_CONCURRENCY. After all waves drain, a single
+                     COUNT DISTINCT query computes the true deduplicated
+                     found_count and writes it via setFoundCount. Live
+                     progress map in memory for the UI poll path.
 
   4. PLAN            Iterate expanded_identities ORDER BY source_id, ns_code.
      │               Bundle identities by cluster. Pack bundles into work orders
@@ -177,21 +200,61 @@ demo — never for production. See CLAUDE.md I12.
                                  submit run (after UTC daily/monthly rollover)
                                  picks up these rows alongside any new 'planned'
                                  ones.
-                            iv.  on failure: release(count, monthlyLimit), mark
-                                 'failed'. monthlyLimit gating prevents leakage
-                                 into other jobs.
+                            iv.  on failure: DISTINGUISH the error class —
+                                   • 4xx response (Adobe definitively rejected,
+                                     e.g. validation error / auth / forbidden):
+                                     release(count, monthlyLimit), mark 'failed'.
+                                     monthlyLimit gating prevents leakage into
+                                     other jobs.
+                                   • 5xx / timeout / network / no response
+                                     (UNCERTAIN — Adobe may have processed it
+                                     after our axios call gave up): KEEP status
+                                     as 'submitting', persist err.message in
+                                     last_error, DO NOT release quota. The
+                                     startup recovery routine (or the operator-
+                                     triggered POST /api/jobs/:id/reconcile)
+                                     will look the WO up by displayName and
+                                     either record the real Adobe ID or roll
+                                     back. This is the fix for the 2026-05-29
+                                     "10 in Adobe, 7 in our UI" incident.
                      Guarded against concurrent runs via in-process inFlight Set.
+
+  5b. RECONCILE      Operator-triggered. POST /api/jobs/:id/reconcile (also
+      (on demand)    surfaced as the yellow "↻ Reconcile" banner on the Submit
+                     tab whenever any WO is in submitting/failed without an
+                     adobe_workorder_id). reconcileJobOrphans(jobId) walks
+                     every such WO, looks each up via Adobe's list endpoint
+                     filtered by the WO's displayName, and applies:
+                       • match found → record Adobe ID + flip to 'submitted'
+                         (if was 'failed', also re-reserve quota via direct
+                         upsertQuota/upsertMonthlyQuota bypassing the cap —
+                         Adobe already spent it, our ledger must mirror reality)
+                       • absent + was submitting → roll back to 'planned' +
+                         release quota
+                       • absent + was failed     → leave as 'failed' (confirmed)
+                       • Adobe 400 / network    → leave as-is, retry next time
+                     No restart required; runs in-process against the same
+                     adobeClient as the rest of the tool.
 
   6. MONITOR         setInterval(60s). Query up to 100 open work orders where
      │               adobe_workorder_id IS NOT NULL AND status NOT terminal.
-     ▼               pLimit(5) concurrent GET /hygiene/workorder/{id} calls
-                     (was serial). Persist status transitions through received
-                     → validated → submitted → ingested → completed.
-                     productStatusDetails surfaced per-work-order in the
-                     Monitor tab (Identity Service / Profile Service / Journey
-                     Orchestrator / Data Management rows). Transient errors
-                     retry on the next tick. At 1,500+ open WOs the full poll
-                     cycle completes in ~15 min instead of the old ~52 min.
+     ▼               REENTRANCY GUARD: a module-level _running flag prevents
+                     a new tick from starting while the previous one is still
+                     in flight (real 2026-05-29 cascading-poll incident: when
+                     Adobe was slow, multiple ticks piled up running in
+                     parallel, each hammering Adobe with duplicate concurrent
+                     polls and snowballing rate limits). Per-WO status GET
+                     uses a 15-second timeout via getWorkOrder({...timeoutMs:
+                     15_000}) — much shorter than the 60s global default,
+                     because Adobe's GET /workorder/:id should respond in
+                     <2s; failing fast and retrying next tick is better than
+                     locking up a socket for a full minute. pLimit(5)
+                     concurrent calls. Persist status transitions through
+                     received → validated → submitted → ingested → completed.
+                     Per-tick log line: monitor tick complete polled=N
+                     succeeded=X failed=Y elapsedMs=Z. Per-tick credential
+                     cache (Promise-keyed by creds_id) so we don't decrypt
+                     the same secret 100x on a single tick.
 
   7. AUTO-RESUME     setInterval(60s). Reads operator-configured settings
      (Phase 3)       (enabled, localTime HH:MM, days). When shouldFireNow()
@@ -266,13 +329,28 @@ src/
 │   │                       the true deduped found_count and persists it.
 │   │                       Resolves source nsid from the registry when the UI
 │   │                       didn't send one. Logs linkedTotal per batch.
-│   ├── submission.js       Planner + quota-gated submission. All insertWorkOrder
-│   │                       calls are wrapped in a single db.transaction() — one
-│   │                       fsync for 1,500+ work orders instead of one per WO
-│   │                       (cuts planning from minutes to seconds on Windows).
-│   │                       Uses .all() (not .iterate()) so SQLite connection
-│   │                       isn't held during mid-flow inserts. inFlight Set
-│   │                       guards re-entry.
+│   ├── submission.js       Planner + quota-gated submission. Two-phase
+│   │                       planner (2026-05-29 refactor): Phase 1 uses
+│   │                       streaming .iterate() via prepareStreamIdentitiesBy
+│   │                       Source() to read identities WITHOUT holding the
+│   │                       SQLite connection (no mid-flow writes during the
+│   │                       iterator) — builds the plan into a pendingOrders[]
+│   │                       array. Phase 2 bulk-inserts every WO in a single
+│   │                       db.transaction() so 1,500+ rows hit WAL in one
+│   │                       fsync (cuts planning from minutes to seconds on
+│   │                       Windows). prepareStreamIdentitiesBySource() returns
+│   │                       a FRESH Statement per call — the cached one in q()
+│   │                       was retired because better-sqlite3 only allows ONE
+│   │                       active iterator per Statement, and the export
+│   │                       route holds the iterator across writeCsv yields
+│   │                       (real 2026-05-29 'statement busy' bug).
+│   │                       The submission catch block DISTINGUISHES error
+│   │                       classes: 4xx → mark 'failed' + release quota;
+│   │                       5xx/timeout/network → KEEP 'submitting' + persist
+│   │                       err.message in last_error + DON'T release quota
+│   │                       (uncertain failures must be reconciled, not
+│   │                       buried — see CLAUDE.md I17). inFlight Set guards
+│   │                       re-entry.
 │   │                       Planner exports ReplanForbiddenError and refuses
 │   │                       to re-emit work orders if any are in a state past
 │   │                       'planned'/'deferred'/'awaiting_approval'. After
@@ -281,10 +359,18 @@ src/
 │   │                       selects both 'planned' and 'deferred'; 'awaiting_
 │   │                       approval' WOs are invisible to the submitter until
 │   │                       explicitly approved via the /approve-month route.
-│   ├── monitor.js          setInterval(60s). pLimit(5) concurrent status GETs;
-│   │                       polls up to 100 open WOs per tick (was serial / 30).
-│   │                       Picks up from wo.j_creds_id / wo.j_sandbox_name
-│   │                       (joined alias columns).
+│   ├── monitor.js          setInterval(60s). REENTRANT-GUARDED via _running
+│   │                       flag — tick #N+1 fires no-op if tick #N still in
+│   │                       flight (2026-05-29 fix for the cascading-poll
+│   │                       snowball). pLimit(5) concurrent status GETs;
+│   │                       polls up to 100 open WOs per tick. Per-WO timeout
+│   │                       passed as 15_000 ms via getWorkOrder({...timeoutMs})
+│   │                       — not the 60s axios global — so a slow Adobe
+│   │                       can't trap the tick. Per-tick credential cache
+│   │                       (Promise-keyed) prevents N decrypts of the same
+│   │                       secret. Per-tick log: 'monitor tick complete
+│   │                       polled=N succeeded=X failed=Y elapsedMs=Z'.
+│   │                       stopMonitor() exposed for graceful shutdown.
 │   ├── scheduler.js        Configurable auto-resume scheduler (Phase 3,
 │   │                       2026-05-15). setInterval(60s) tick that fires
 │   │                       when shouldFireNow() agrees with the operator's
@@ -298,13 +384,27 @@ src/
 │   │                       (month_index, day_index) from live Adobe quota
 │   │                       remaining + fresh future-period caps. Atomic
 │   │                       SQLite transaction. Shipped WOs are immutable.
-│   └── recovery.js         Startup reconciliation: resumes jobs stuck in
-│                           'expanding' (with skipSourceIds), and reconciles
-│                           'submitting' work orders with no adobe_workorder_id
-│                           via Adobe's list-by-displayName endpoint. On 400
-│                           (filter not supported / indeterminate) the orphan
-│                           is LEFT in 'submitting' so the next startup retries
-│                           — never rolled back, because rollback risks duplicate
+│   └── recovery.js         Startup reconciliation AND per-job operator-
+│                           triggered reconciliation. Exports:
+│                             • resumeExpandingJobs() — resumes 'expanding'
+│                               jobs with skipSourceIds set from
+│                               expanded_identities (no re-doing Adobe calls
+│                               for rows already processed).
+│                             • reconcileOrphanWorkOrders() — startup path,
+│                               scans status='submitting' AND
+│                               adobe_workorder_id IS NULL across all jobs.
+│                             • reconcileJobOrphans(jobId) — per-job route
+│                               POST /api/jobs/:id/reconcile. Scans status
+│                               IN ('submitting','failed') AND no Adobe ID.
+│                               For previously-'failed' matches, re-reserves
+│                               quota via direct upsertQuota / upsertMonthly
+│                               (bypasses cap — Adobe spent it, ledger must
+│                               mirror reality).
+│                           All paths share findAdobeWorkOrderByDisplayName
+│                           Prefix. On 400 (filter not supported / indeterminate)
+│                           the orphan is LEFT in 'submitting' so the next call
+│                           retries — never rolled back, because rollback risks
+│                           duplicate
 │                           submission if Adobe actually had received the POST.
 │
 ├── routes/
@@ -325,6 +425,26 @@ src/
 │                             monthIndex (≥ 2). Returns 400 for monthIndex=1
 │                             (auto-submitted, no approval needed) or invalid
 │                             values; 404 when no awaiting WOs exist.
+│                           - DELETE /api/jobs/:id — hard-delete the job and
+│                             cascade through expanded_identities + work_orders.
+│                             409 with {error:'in_flight'} when any WO is
+│                             mid-flight to Adobe (status ∈ submitting /
+│                             submitted / received / validated / ingested).
+│                             ?force=true bypasses the in-flight guard;
+│                             Adobe-side deletions continue but local
+│                             tracking is dropped. Best-effort unlinks
+│                             upload + exported CSV.
+│                           - POST /api/jobs/:id/reconcile — per-job orphan
+│                             reconciliation. Calls reconcileJobOrphans(id);
+│                             scans WOs with adobe_workorder_id IS NULL AND
+│                             status ∈ submitting/failed; looks each up in
+│                             Adobe by displayName; matched → record ID +
+│                             flip to 'submitted' (re-reserve quota if was
+│                             failed); absent → roll back submitting to
+│                             planned (release quota) OR leave failed as-is;
+│                             indeterminate → leave alone. Returns
+│                             { matched, rolledBack, stillFailed,
+│                             indeterminate, perWoError, total }.
 │                           Two list endpoints:
 │                           - GET /api/jobs           — flat list, every status
 │                           - GET /api/jobs/monitor   — active-submissions feed:
@@ -429,7 +549,9 @@ data/                       Runtime state; in .gitignore.
 **Work order** `POST platform.adobe.io/data/core/hygiene/workorder`
 - See CLAUDE.md I1 for the exact payload contract. Key rules: `action: "delete_identity"`, `datasetId` ∈ `ALL` | single | comma list, `targetServices` iff `datasetId === "ALL"`, total ids ≤ 100k, each namespace group identified by `code` OR `id` OR both.
 
-**Work order status** `GET platform.adobe.io/data/core/hygiene/workorder/{id}` — terminal states are `completed` and `failed`.
+**Work order status** `GET platform.adobe.io/data/core/hygiene/workorder/{id}` — terminal states are `completed` and `failed`. Called from `monitor.js` with a per-request 15s timeout (not the 60s global default).
+
+**Work order lookup by displayName** `GET platform.adobe.io/data/core/hygiene/workorder?displayName={prefix}` — used by both the startup `reconcileOrphanWorkOrders` path and the operator-triggered `POST /api/jobs/:id/reconcile` route to find WOs that Adobe processed but our local DB never recorded the ID for. Match is by EXACT displayName (the full UUID is embedded in the displayName since F-009). 400 response is treated as "indeterminate — leave the WO alone, don't roll back" because we cannot conclude absence from a rejected query.
 
 **Quota** `GET platform.adobe.io/data/core/hygiene/quota`
 - Org-wide (no `x-sandbox-name`); read-only — consumes no quota.
@@ -452,7 +574,7 @@ data/                       Runtime state; in .gitignore.
 | `credentials` | AES-GCM encrypted secrets | UNIQUE(environment, ims_org_id, client_id) |
 | `sandbox_configs` | Cached sandbox metadata + datasets + namespaces | PK(creds_id, sandbox_name) |
 | `jobs` | One per upload. Status: created → expanding → expanded → ready → submitting → submitted/partial/failed. `projected_months` (Phase 2) tracks the redistributor's max month_index for shift detection. | FK creds_id |
-| `expanded_identities` | One row per (cluster member, source). No unique index — dedup deferred to planning via `GROUP BY` in `streamIdentitiesBySource`. idx_ei_job_source and idx_ei_job_ns remain for fast WHERE lookups. | FK job_id |
+| `expanded_identities` | One row per (cluster member, source). No unique index — dedup deferred to planning via `GROUP BY` in `streamIdentitiesBySource`. Only `idx_ei_job_source(job_id, source_id)` remains; `idx_ei_job_ns` was dropped 2026-05-29 (proven via EXPLAIN QUERY PLAN to be redundant — every reader falls back to `idx_ei_job_source` with an identical plan). | FK job_id |
 | `work_orders` | One per Adobe work order. Statuses: planned → submitting → submitted → completed/failed/deferred. `month_index` (Phase 2) + `day_index` form the bucket label assigned by the redistributor on un-shipped WOs only. | FK job_id, ordered by rowid |
 | `quota_usage` | Daily local ledger: (ims_org_id, utc_date) → used | PK |
 | `quota_usage_monthly` | Monthly local ledger: (ims_org_id, utc_year_month) → used | PK |
@@ -484,6 +606,29 @@ runtime source of truth (CLAUDE.md I15).
 14. Region and environment are allowlisted server-side (not just in the UI) — a stale or attacker-set `region` would template into the Identity API host and exfiltrate the bearer token.
 15. Live Adobe `/quota` is the source of truth for daily + monthly caps. Refreshed before every plan + every submit; 1h cache; 24h hard floor falls back to `quota_unavailable` 503 rather than ship blind.
 16. Configurable auto-resume scheduler is opt-in (defaults disabled) and routes every action through `runSubmission`, inheriting the live-quota refresh, the non-idempotent retry guard, and the orphan-recovery path.
+17. `status='submitting' AND adobe_workorder_id IS NULL` has TWO MEANINGS:
+    (a) POST genuinely in flight, OR (b) UNCERTAIN — POST timed out / 5xx /
+    network-reset BUT Adobe may have processed it. The hygiene POST is
+    non-idempotent so we can't tell which without asking Adobe. Quota stays
+    reserved. Resolution comes via displayName lookup — either the startup
+    `reconcileOrphanWorkOrders` path or the operator-triggered
+    `POST /api/jobs/:id/reconcile` route + UI banner. The route also
+    handles legacy `failed` rows (mis-marked by the pre-2026-05-29 catch-all
+    `release+failed` code) and re-reserves their quota when found in Adobe.
+18. Wave-pushed expansion tasks MUST be given an inline `.catch(()=>{})`
+    BEFORE drainWave runs. Without this, a network-level rejection in the
+    pre-drain window becomes an unhandled rejection and Node ≥17 crashes the
+    process (real 2026-05-29 96% crash). drainWave itself uses
+    Promise.allSettled (not Promise.all) for defence-in-depth against late
+    rejections.
+19. Monitor tick is NON-REENTRANT — guarded by a module-level `_running`
+    flag. Per-WO status GET uses `timeoutMs: 15_000` (not the 60s global)
+    so a slow Adobe doesn't allow tick N+1 to start on top of tick N.
+20. UI auto-load (`ensureActiveJobLoaded`) is narrow — only loads jobs in
+    `expanding` or `submitting` status (truly-in-progress, where auto-resume
+    is the right call). For every other status the jobs picker shows so the
+    operator explicitly chooses. Set-once-per-delete suppression flag in
+    sessionStorage prevents surprise loads after an explicit Delete Job.
 
 ---
 

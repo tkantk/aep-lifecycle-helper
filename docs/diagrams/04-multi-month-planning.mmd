@@ -1,0 +1,46 @@
+%%{init: {
+  'theme':'base',
+  'themeVariables': {
+    'primaryColor':'#E8F2FF',
+    'primaryTextColor':'#1A1A1A',
+    'primaryBorderColor':'#1473E6',
+    'lineColor':'#525252',
+    'fontFamily':'Inter, Segoe UI, Helvetica, Arial, sans-serif',
+    'fontSize':'13px'
+  }
+}}%%
+flowchart TB
+  Input["<b>Input</b>: 2,500,000 expanded identifiers<br/><b>Adobe quota</b>: 1,000,000/day · 3,000,000/month<br/>(fetched live from GET /quota before every plan)"]
+
+  Input --> Plan{"<b>Planner</b><br/>pack into ≤100k WOs<br/>respect daily + monthly caps"}
+
+  Plan --> M1
+  Plan --> M2
+
+  subgraph M1["<b>Month 1</b> — ships immediately on Submit"]
+    direction TB
+    M1D1["Day 1: 1,000,000 ids · <b>10 WOs</b>"]
+    M1D2["Day 2: 1,000,000 ids · <b>10 WOs</b>"]
+    M1D3["Day 3: 500,000 ids · <b>5 WOs</b>"]
+    M1Total["<b>Month 1 total: 2,500,000</b><br/>(within 3M monthly cap)<br/>500,000 carry over"]
+    M1D1 --> M1D2 --> M1D3 --> M1Total
+  end
+
+  subgraph M2["<b>Month 2</b> — awaiting_approval until operator clicks"]
+    direction TB
+    M2D1["Day 1: 500,000 ids · <b>5 WOs</b>"]
+    M2Total["<b>Month 2 total: 500,000</b>"]
+    M2D1 --> M2Total
+  end
+
+  M1 -.->|"operator clicks<br/>Approve Month 2<br/>(per-month gate)"| M2
+
+  Live["<b>Live redistributor</b><br/>runs before EVERY plan and submit.<br/>Re-buckets unshipped WOs against<br/>current Adobe /quota numbers.<br/>Shipped WOs are immutable."]
+  Live -.-> Plan
+
+  classDef month   fill:#E8F2FF,stroke:#1473E6,stroke-width:2px,color:#1A1A1A
+  classDef month2  fill:#FFF4D6,stroke:#F29423,stroke-width:2px,color:#1A1A1A
+  classDef live    fill:#E8F8EE,stroke:#2D9D78,stroke-width:2px,color:#1A1A1A
+  class M1 month
+  class M2 month2
+  class Live live

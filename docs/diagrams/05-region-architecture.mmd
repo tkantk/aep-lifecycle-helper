@@ -1,0 +1,43 @@
+%%{init: {
+  'theme':'base',
+  'themeVariables': {
+    'primaryColor':'#E8F2FF',
+    'primaryTextColor':'#1A1A1A',
+    'primaryBorderColor':'#1473E6',
+    'lineColor':'#525252',
+    'fontFamily':'Inter, Segoe UI, Helvetica, Arial, sans-serif',
+    'fontSize':'13px'
+  }
+}}%%
+graph TB
+  Cred[("<b>credential row</b><br/>environment · ims_org_id<br/>client_id · region<br/>region ∈ {va7, nld2, aus5, can2}")]
+
+  Cred -->|"creds.region<br/>(per-credential, NOT global)"| URL["<b>URL builder</b><br/>https://platform-${region}.adobe.io"]
+
+  URL -->|"region = va7"| VA7["<b>VA7</b> · platform-va7.adobe.io<br/>US East (default)"]
+  URL -->|"region = nld2"| NLD2["<b>NLD2</b> · platform-nld2.adobe.io<br/>Europe (Netherlands)"]
+  URL -->|"region = aus5"| AUS5["<b>AUS5</b> · platform-aus5.adobe.io<br/>APAC (Australia)"]
+  URL -->|"region = can2"| CAN2["<b>CAN2</b> · platform-can2.adobe.io<br/>Canada"]
+
+  VA7  -->|POST /clusters/members| Identity[("<b>Adobe Identity Service</b><br/>regional shard")]
+  NLD2 -->|POST /clusters/members| Identity
+  AUS5 -->|POST /clusters/members| Identity
+  CAN2 -->|POST /clusters/members| Identity
+
+  Guard["<b>Defence-in-depth allowlist</b><br/>routes/config.js · namespaces.js<br/>identityGraph.js<br/><br/>Refuses any region not in the<br/>known set, even if the DB row<br/>somehow held a tampered value.<br/>Prevents SSRF via host injection."]
+  Cred -.-> Guard
+  Guard -.-> URL
+
+  Warning["<b>⚠ Wrong-region cost</b><br/>A va7-credential job pointed at<br/>an nld2 sandbox returns HTTP 200<br/>with EMPTY clusters — silent<br/>partial deletes. The allowlist is<br/>the safety net."]
+
+  classDef cred    fill:#FFF4D6,stroke:#F29423,stroke-width:2px,color:#1A1A1A
+  classDef region  fill:#E8F2FF,stroke:#1473E6,stroke-width:2px,color:#1A1A1A
+  classDef adobe   fill:#FFE1E1,stroke:#FA0F00,stroke-width:2px,color:#1A1A1A
+  classDef guard   fill:#E8F8EE,stroke:#2D9D78,stroke-width:2px,color:#1A1A1A
+  classDef warn    fill:#FFE1E1,stroke:#E34850,stroke-width:1.5px,color:#1A1A1A
+
+  class Cred cred
+  class VA7,NLD2,AUS5,CAN2 region
+  class Identity adobe
+  class Guard guard
+  class Warning warn

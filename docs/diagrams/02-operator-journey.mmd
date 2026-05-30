@@ -1,0 +1,34 @@
+%%{init: {
+  'theme':'base',
+  'themeVariables': {
+    'primaryColor':'#E8F2FF',
+    'primaryTextColor':'#1A1A1A',
+    'primaryBorderColor':'#1473E6',
+    'lineColor':'#525252',
+    'fontFamily':'Inter, Segoe UI, Helvetica, Arial, sans-serif',
+    'fontSize':'13px'
+  }
+}}%%
+flowchart LR
+  S1["<b>1. CONFIGURE</b><br/>IMS credentials · sandbox<br/>Test Connection<br/>(fetches live /quota)"]
+  S2["<b>2. UPLOAD</b><br/>CSV streamed to disk<br/>Pre-flight sniffer<br/>(reject XLSX / UTF-16 / MIP)"]
+  S3["<b>3. EXPAND</b><br/>CSV → 1k-ID batches<br/>p-limit(5) Identity Graph<br/>SQLite INSERT (deferred dedup)"]
+  S4["<b>4. PLAN</b><br/>Live /quota refresh<br/>Pack into ≤100k WOs<br/>Month 1 → planned<br/>Month 2+ → awaiting_approval"]
+  S5{"<b>5. APPROVE</b><br/>Month N+1 gated?"}
+  S6["<b>6. SUBMIT</b><br/>Atomic quota reserve<br/>POST /workorder<br/>4xx → failed (release)<br/>5xx/timeout → uncertain<br/>(left in submitting)"]
+  S7["<b>7. MONITOR</b><br/>60s tick · pLimit(5)<br/>15s per-WO timeout<br/>received → validated →<br/>submitted → ingested →<br/><b>COMPLETED</b> / FAILED"]
+  RC["<b>↻ RECONCILE</b><br/>Look up by displayName<br/>Re-record Adobe WO IDs<br/>Re-reserve quota"]
+
+  S1 --> S2 --> S3 --> S4 --> S5
+  S5 -->|"Month 1 only<br/>or operator clicks<br/>Approve Month N"| S6
+  S5 -.->|"future-month WOs<br/>wait for approval"| S5
+  S6 --> S7
+  S6 -.->|"uncertain failures<br/>orphan recovery"| RC
+  RC -.->|"reconciled WOs<br/>resume monitoring"| S7
+
+  classDef step    fill:#E8F2FF,stroke:#1473E6,stroke-width:2px,color:#1A1A1A
+  classDef gate    fill:#FFF4D6,stroke:#F29423,stroke-width:2px,color:#1A1A1A
+  classDef recover fill:#FFE1E1,stroke:#E34850,stroke-width:2px,color:#1A1A1A
+  class S1,S2,S3,S4,S6,S7 step
+  class S5 gate
+  class RC recover
