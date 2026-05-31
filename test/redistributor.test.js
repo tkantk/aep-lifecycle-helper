@@ -193,20 +193,20 @@ test('redistribute: shipped WOs keep their stored (month_index, day_index)', () 
 
 // ─── No monthly cap → single-month ────────────────────────────────────────
 
-test('redistribute: monthly cap disabled → all unshipped in month 1', () => {
+test('redistribute: monthly is ALWAYS tracked — falls back to config cap (review R4 #4)', () => {
+  // Even with monthly_limit 0 (the removed "disable" value) and no Adobe
+  // monthly in the snapshot, the redistributor falls back to the config monthly
+  // cap (3M) and splits the 5M of work across months — monthly is never
+  // "disabled".
   const jobId = seedJob({ monthlyLimit: 0 });
   seedWorkOrders(jobId, Array(50).fill(100_000));   // 5M
 
   const quota = {
     daily:   { remaining: 1_000_000, quota: 1_000_000 },
-    monthly: null,   // explicit "no monthly cap reported"
+    monthly: null,   // Adobe didn't report monthly → fall back to the 3M config cap
   };
   const result = redistributeUnshippedOrders(jobId, quota);
-  assert.equal(result.months, 1);
-  // 5 days of 1M each.
-  const rows = q().getAllOrdersForJob.all(jobId);
-  const days = new Set(rows.map(r => r.day_index));
-  assert.deepEqual([...days].sort((a, b) => a - b), [1, 2, 3, 4, 5]);
+  assert.ok(result.months >= 2, `5M against a 3M fallback monthly cap must span ≥2 months, got ${result.months}`);
 });
 
 // ─── Job state ───────────────────────────────────────────────────────────

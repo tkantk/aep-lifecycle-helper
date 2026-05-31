@@ -1,7 +1,8 @@
 /**
- * Tests for services/quotaManager.js — reserve / release / peek across both
- * daily and monthly ledgers. Uses a temp SQLite file so state is isolated
- * per test run.
+ * Tests for services/quotaManager.js — the per-work-order reservation model
+ * (review R4 #1). effective_used(period) = adobe_floor(period)
+ *   + Σ active reservations(period). Reservations are keyed by work-order id so
+ * release/complete are exact and period-correct. Uses a temp SQLite file.
  */
 
 import { test, before, after } from 'node:test';
@@ -13,194 +14,135 @@ import fs from 'node:fs';
 const dbPath = path.join(os.tmpdir(), `aep-test-quota-${Date.now()}.db`);
 process.env.DB_PATH = dbPath;
 
-const { initDb } = await import('../src/db.js');
-const { reserve, release, peek, seedFloor } = await import('../src/services/quotaManager.js');
+const { initDb, q } = await import('../src/db.js');
+const { reserve, release, reactivate, complete, peek, seedFloor } =
+  await import('../src/services/quotaManager.js');
 
-const ORG = 'test-org@AcmeOrg';
 const DAILY = 1_000_000;
 const MONTHLY = 3_000_000;
 
+let n = 0;
+const org = () => `org-${++n}@AcmeOrg`;          // unique org per test (shared DB)
+const R = (o, wo, count, daily = DAILY, monthly = MONTHLY) =>
+  reserve({ workOrderId: wo, imsOrgId: o, count, dailyLimit: daily, monthlyLimit: monthly });
+
 before(() => { initDb(); });
-
 after(() => {
-  for (const ext of ['', '-wal', '-shm']) {
-    try { fs.unlinkSync(dbPath + ext); } catch { /* */ }
-  }
+  for (const ext of ['', '-wal', '-shm']) { try { fs.unlinkSync(dbPath + ext); } catch { /* */ } }
 });
 
-// ─── seedFloor vs release (review #3) ──────────────────────────────────────────
+// ─── basic grant / deny ─────────────────────────────────────────────────────
 
-test('release after seedFloor cannot drop the ledger below Adobe\'s observed floor', () => {
-  // Review #3: Adobe reports 900k consumed. A delayed orphan release must NOT
-  // pull `used` below 900k, or a later reserve would over-ship past the cap.
-  const org = 'r3-seedfloor-org@AcmeOrg';
-  seedFloor(org, 900_000, null);                 // adobe_floor = used = 900k
-  assert.equal(peek(org, DAILY, null).daily.used, 900_000);
-
-  // A delayed release (e.g. orphan rollback of a prior 100k reservation).
-  release(org, 100_000, null);
-  assert.equal(peek(org, DAILY, null).daily.used, 900_000,
-    'release must clamp at the Adobe floor (900k), not drop to 800k');
-
-  // A fresh 200k reservation must now be DENIED (900k + 200k > 1M).
-  const r = reserve(org, 200_000, DAILY, null);
-  assert.equal(r.granted, false, 'reserve past Adobe remaining must be denied (no over-ship)');
-});
-
-test('release still frees OUR reservations that sit above the floor', () => {
-  const org = 'r3-seedfloor-org2@AcmeOrg';
-  seedFloor(org, 500_000, null);                 // floor 500k
-  assert.equal(reserve(org, 100_000, DAILY, null).granted, true);  // used 600k
-  assert.equal(peek(org, DAILY, null).daily.used, 600_000);
-  release(org, 100_000, null);                    // undo our 100k
-  assert.equal(peek(org, DAILY, null).daily.used, 500_000, 'back down to the floor, not below');
-});
-
-// ─── peek ─────────────────────────────────────────────────────────────────────
-
-test('peek: fresh org returns zero used on both daily and monthly', () => {
-  const r = peek('fresh-org@AcmeOrg', DAILY, MONTHLY);
-  assert.equal(r.daily.used, 0);
-  assert.equal(r.daily.remaining, DAILY);
-  assert.equal(r.monthly.used, 0);
-  assert.equal(r.monthly.remaining, MONTHLY);
-});
-
-test('peek: monthly=null means monthly dimension is disabled', () => {
-  const r = peek('noml-org@AcmeOrg', DAILY, null);
-  assert.equal(r.daily.used, 0);
-  assert.equal(r.monthly, null);
-});
-
-test('peek: back-compat fields (used/remaining/limit) still return daily', () => {
-  const r = peek('bc-org@AcmeOrg', DAILY, MONTHLY);
-  assert.equal(r.used, 0);
-  assert.equal(r.remaining, DAILY);
-  assert.equal(r.limit, DAILY);
-});
-
-// ─── reserve (daily only, monthly=null) ───────────────────────────────────────
-
-test('reserve: monthly=null keeps behaviour identical to daily-only mode', () => {
-  const org = 'single-dim-org@AcmeOrg';
-  const r1 = reserve(org, 400, 1000, null);
-  assert.equal(r1.granted, true);
-  assert.equal(r1.used, 400);
-
-  const r2 = reserve(org, 700, 1000, null);
-  assert.equal(r2.granted, false);
-  assert.equal(r2.reason, 'daily');
-});
-
-// ─── reserve (both dimensions) ────────────────────────────────────────────────
-
-test('reserve: grants when both daily and monthly have room', () => {
-  const r = reserve(ORG, 500_000, DAILY, MONTHLY);
+test('reserve grants within caps and records a per-WO reservation', () => {
+  const o = org();
+  const r = R(o, 'wo1', 400_000);
   assert.equal(r.granted, true);
-  assert.equal(r.used, 500_000);
-  assert.equal(r.monthlyUsed, 500_000);
-  assert.equal(r.remaining, DAILY - 500_000);
-  assert.equal(r.monthlyRemaining, MONTHLY - 500_000);
+  assert.equal(peek(o, DAILY, MONTHLY).daily.used, 400_000);
 });
 
-test('reserve: rejects with reason="daily" when daily would overflow', () => {
-  const org = 'daily-tight-org@AcmeOrg';
-  reserve(org, 800_000, DAILY, MONTHLY);
-  const r = reserve(org, 250_000, DAILY, MONTHLY);
+test('reserve denies on daily overflow without recording', () => {
+  const o = org();
+  assert.equal(R(o, 'wo1', 700_000).granted, true);
+  const r = R(o, 'wo2', 400_000);   // 1.1M > 1M
   assert.equal(r.granted, false);
   assert.equal(r.reason, 'daily');
+  assert.equal(peek(o, DAILY, MONTHLY).daily.used, 700_000, 'denied reserve must not be recorded');
 });
 
-test('reserve: rejects with reason="monthly" when monthly would overflow even though daily is fine', () => {
-  const org = 'monthly-tight-org@AcmeOrg';
-  const tightMonthly = 100_000;
-  reserve(org, 90_000, DAILY, tightMonthly);
-  const r = reserve(org, 20_000, DAILY, tightMonthly);
+test('reserve denies on monthly overflow', () => {
+  const o = org();
+  // 11 orders of 300k against a 3M monthly cap → 12th (would be 3.3M, but daily
+  // caps at 1M/day so use a high daily) is denied monthly.
+  for (let i = 0; i < 10; i++) assert.equal(R(o, `wo${i}`, 300_000, 5_000_000, MONTHLY).granted, true);
+  const r = R(o, 'woX', 300_000, 5_000_000, MONTHLY);   // 3.3M > 3M
   assert.equal(r.granted, false);
   assert.equal(r.reason, 'monthly');
-  assert.equal(r.monthlyUsed, 90_000);
 });
 
-test('reserve: denial does not increment either ledger', () => {
-  const org = 'deny-noop-org@AcmeOrg';
-  reserve(org, 50, 100, 1000);
-  const r = reserve(org, 60, 100, 1000);  // daily would overflow
-  assert.equal(r.granted, false);
-  const p = peek(org, 100, 1000);
-  assert.equal(p.daily.used, 50);    // unchanged
-  assert.equal(p.monthly.used, 50);
+// ─── release / complete / reactivate ────────────────────────────────────────
+
+test('release deactivates the WO reservation and frees the quota', () => {
+  const o = org();
+  R(o, 'wo1', 600_000);
+  assert.equal(peek(o, DAILY, MONTHLY).daily.used, 600_000);
+  release('wo1');
+  assert.equal(peek(o, DAILY, MONTHLY).daily.used, 0, 'released reservation frees quota');
 });
 
-// ─── release ──────────────────────────────────────────────────────────────────
-
-test('release: decrements both daily and monthly ledgers when monthlyLimit passed', () => {
-  const org = 'release-both-org@AcmeOrg';
-  reserve(org, 200, 1000, 5000);
-  const before = peek(org, 1000, 5000);
-  assert.equal(before.daily.used, 200);
-  assert.equal(before.monthly.used, 200);
-
-  release(org, 200, 5000);
-  const after = peek(org, 1000, 5000);
-  assert.equal(after.daily.used, 0);
-  assert.equal(after.monthly.used, 0);
+test('reactivate restores a released reservation', () => {
+  const o = org();
+  R(o, 'wo1', 500_000);
+  release('wo1');
+  assert.equal(peek(o, DAILY, MONTHLY).daily.used, 0);
+  reactivate('wo1');
+  assert.equal(peek(o, DAILY, MONTHLY).daily.used, 500_000);
 });
 
-test('release: with monthlyLimit=null, monthly ledger is NOT touched', () => {
-  // This is the regression: a job with monthly tracking disabled (null)
-  // must not decrement monthly counters from other jobs on the same org.
-  const org = 'mixed-org@AcmeOrg';
-
-  // Job A reserves monthly (tracking ON): monthly = 500
-  reserve(org, 500, 10_000, 50_000);
-  assert.equal(peek(org, 10_000, 50_000).monthly.used, 500);
-
-  // Job B reserves daily-only (monthly tracking OFF): daily += 200, monthly unchanged
-  reserve(org, 200, 10_000, null);
-  assert.equal(peek(org, 10_000, 50_000).daily.used, 700);
-  assert.equal(peek(org, 10_000, 50_000).monthly.used, 500);
-
-  // Job B fails and releases — must NOT decrement monthly (which still
-  // belongs to Job A).
-  release(org, 200, null);
-  const after = peek(org, 10_000, 50_000);
-  assert.equal(after.daily.used, 500, 'daily must drop by 200');
-  assert.equal(after.monthly.used, 500, 'monthly must remain at Job A reservation');
+test('complete moves a reservation into adobe_floor with effective unchanged', () => {
+  const o = org();
+  R(o, 'wo1', 400_000);
+  const before = peek(o, DAILY, MONTHLY).daily.used;
+  complete('wo1');
+  const after = peek(o, DAILY, MONTHLY).daily.used;
+  assert.equal(after, before, 'effective used unchanged (active → floor)');
+  // The reservation is now inactive; the floor carries it.
+  assert.equal(q().getReservation.get('wo1').active, 0);
+  const today = new Date().toISOString().slice(0, 10);   // YYYY-MM-DD (UTC)
+  assert.equal(q().getDailyFloor.get(o, today)?.adobe_floor, 400_000);
 });
 
-test('release: floor at zero (can\'t go negative)', () => {
-  const org = 'floor-org@AcmeOrg';
-  reserve(org, 10, 1000, 5000);
-  release(org, 999, 5000);
-  const p = peek(org, 1000, 5000);
-  assert.equal(p.daily.used, 0);
-  assert.equal(p.monthly.used, 0);
+// ─── review #1: same-day delayed release must not lose ownership ─────────────
+
+test('R4 #1: seedFloor does not absorb our reservations; delayed release frees only ours', () => {
+  const o = org();
+  R(o, 'orphan', 100_000);                 // our reservation, not yet in Adobe's number
+  seedFloor(o, 900_000, null);             // others consumed 900k
+  assert.equal(peek(o, DAILY, null).daily.used, 1_000_000, 'floor(900k) + our orphan(100k)');
+
+  // A new order would exceed the cap → DENIED (no room; true usage already 1M).
+  assert.equal(R(o, 'A', 100_000, DAILY, null).granted, false,
+    'no room: 900k others + 100k orphan = cap');
+
+  // The orphan is rolled back (Adobe never processed it) — frees ONLY its 100k.
+  release('orphan');
+  assert.equal(peek(o, DAILY, null).daily.used, 900_000, 'back to Adobe floor, not below');
+
+  // Now a new order fits exactly.
+  assert.equal(R(o, 'B', 100_000, DAILY, null).granted, true);
+  assert.equal(peek(o, DAILY, null).daily.used, 1_000_000);
 });
 
-// ─── Sequential, atomic behaviour ─────────────────────────────────────────────
+// ─── cross-day: release uses the reservation's OWN period ───────────────────
 
-test('reserve: sequential calls cannot over-allocate in either dimension', () => {
-  const org = 'seq-org@AcmeOrg';
-  const dayLimit = 100;
-  const monthLimit = 350;
+test('R4 #1: releasing a prior-day reservation does not touch today\'s usage', () => {
+  const o = org();
+  // Directly seed a reservation dated "yesterday" (a different utc_date).
+  q().upsertReservation.run({ workOrderId: 'ywo', imsOrgId: o, utcDate: '2000-01-01', utcMonth: '2000-01', count: 100_000 });
+  R(o, 'todaywo', 200_000);
+  const todayBefore = peek(o, DAILY, MONTHLY).daily.used;
+  assert.equal(todayBefore, 200_000, 'yesterday reservation is a different period, not in today');
 
-  const results = [];
+  release('ywo');   // release the yesterday WO
+  assert.equal(peek(o, DAILY, MONTHLY).daily.used, 200_000,
+    'releasing a prior-day reservation must not decrement today');
+  assert.equal(q().getReservation.get('ywo').active, 0, 'and it did deactivate the right (yesterday) row');
+});
+
+// ─── multi-month: completion prevents double-count → full cap usable ─────────
+
+test('R4 #1: completing work + seedFloor reflecting it does not double-count the monthly floor', () => {
+  const o = org();
+  const monthly = 2_000_000;
+  // Ship 1M (10 WOs of 100k), complete them — each complete() bumps the monthly
+  // floor by 100k (1M total moved from active reservations into the floor).
   for (let i = 0; i < 10; i++) {
-    results.push(reserve(org, 30, dayLimit, monthLimit));
+    assert.equal(R(o, `c${i}`, 100_000, DAILY, monthly).granted, true);
+    complete(`c${i}`);
   }
-
-  const granted = results.filter(r => r.granted);
-  const denied = results.filter(r => !r.granted);
-
-  // 100/30 = 3 full grants → 90 used, 4th of 30 would hit 120>100 → denied.
-  // No subsequent call can succeed either (daily is always the gate).
-  assert.equal(granted.length, 3);
-  assert.equal(denied.length, 7);
-  // All denials here are for daily — monthly limit (350) is never hit because
-  // daily blocks first.
-  assert.ok(denied.every(r => r.reason === 'daily'));
-
-  const p = peek(org, dayLimit, monthLimit);
-  assert.equal(p.daily.used, 90);
-  assert.equal(p.monthly.used, 90);
+  assert.equal(peek(o, DAILY, monthly).monthly.used, 1_000_000, 'completion moved 1M into the floor');
+  // Adobe's /quota now reports that same 1M consumed. seedFloor MAX must NOT add
+  // on top of the completion bumps — otherwise the monthly cap would halve.
+  seedFloor(o, 1_000_000, 1_000_000);
+  assert.equal(peek(o, DAILY, monthly).monthly.used, 1_000_000,
+    'no double-count: MAX(1M floor, 1M Adobe) stays 1M, not 2M');
 });

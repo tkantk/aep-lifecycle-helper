@@ -14,9 +14,8 @@ const cwd = process.cwd();
 // override for advanced setups.
 const dataDir = process.env.DATA_DIR || path.join(cwd, 'data');
 
-// Resolve a numeric env var, PRESERVING an explicit 0 (e.g.
-// MONTHLY_IDENTIFIER_LIMIT=0 means "disable monthly tracking"). `|| default`
-// wrongly turned 0 back into the default. Empty/unset/NaN → fallback.
+// Resolve a numeric env var, PRESERVING an explicit 0 (the naive `|| default`
+// wrongly turns 0 back into the default). Empty/unset/NaN → fallback.
 function numEnv(name, fallback) {
   const raw = process.env[name];
   if (raw === undefined || raw === '') return fallback;
@@ -91,9 +90,9 @@ export const config = {
   workOrderConcurrency: Number(process.env.WORK_ORDER_CONCURRENCY) || 2,
   maxIdsPerWorkOrder: Number(process.env.MAX_IDS_PER_WORK_ORDER) || 100_000,
   dailyIdentifierLimit: Number(process.env.DAILY_IDENTIFIER_LIMIT) || 1_000_000,
-  // Monthly identifier cap is contract-dependent. Default 3M/month matches
-  // the typical base Data Hygiene entitlement; override via env or the Config
-  // tab to match your contract. Set to 0 to disable monthly tracking.
+  // Monthly identifier cap — FALLBACK ONLY (live Adobe /quota wins). Adobe
+  // always enforces a monthly cap, so there is no "disable monthly" option
+  // (review R4 #4). Default 3M/month matches the typical base entitlement.
   monthlyIdentifierLimit: numEnv('MONTHLY_IDENTIFIER_LIMIT', 3_000_000),
   requestTimeoutMs: Number(process.env.REQUEST_TIMEOUT_MS) || 60_000,
 

@@ -23,9 +23,13 @@ import { canonicalizeNamespace } from './namespaces.js';
  *   ...
  * ]
  *
- * Position in the response array matches position of the corresponding
- * input id. If Adobe returns fewer results than we sent, we iterate
- * by the input array and assume missing entries have empty identities.
+ * Each requested source is matched to its cluster STRICTLY by
+ * `compositeXid.id` (Adobe documents "one entry per requested XID regardless of
+ * cluster association"). There is NO positional fallback (review R4 #2) —
+ * guessing by array position could silently mis-assign one source's cluster to
+ * another. The batch FAILS CLOSED on any source Adobe didn't return, on
+ * Adobe-reported `unprocessedXids`/`unprocessedNids`, or on an unrecognized
+ * response shape, rather than emit a source-only partial delete.
  */
 
 // Defence-in-depth allowlist — see services/namespaces.js for the rationale.

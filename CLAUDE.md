@@ -234,43 +234,44 @@ But the default should be to keep them together.
 
 The flow is:
 
-1. `reserve(imsOrgId, count, dailyLimit, monthlyLimit)` checks BOTH caps.
-   Denies with `reason: 'daily'` or `reason: 'monthly'` depending on which
-   cap would overflow. If both pass, both ledgers are incremented.
+1. `reserve({workOrderId, imsOrgId, count, dailyLimit, monthlyLimit})` checks
+   BOTH caps against `effective_used` (see the per-WO model below). Denies with
+   `reason: 'daily'` or `reason: 'monthly'`. On grant it records an active
+   per-WO reservation.
 2. If `granted === false`, the work order is marked `deferred`. Daily
    denials clear at UTC midnight; monthly denials clear at UTC first-of-month.
-3. If the subsequent Adobe submission **fails**, we call
-   `release(imsOrgId, count, monthlyLimit)` — decrementing the daily ledger
-   always, and the monthly ledger only when `monthlyLimit != null`. Without
-   this, a transient 500 would waste quota permanently.
+3. If the subsequent Adobe submission **fails** (4xx) or is rolled back, we call
+   `release(workOrderId)` — deactivating that WO's reservation (both dimensions,
+   its own period). Without this, a transient failure would waste quota.
 
-`monthlyLimit` can be `null` (or 0 from the UI) to disable monthly tracking
-for a job — useful for operators whose contract has no monthly cap. In that
-mode only the daily dimension is checked, AND `release` skips the monthly
-decrement so it can't eat headroom from unrelated jobs on the same org that
-have monthly tracking on. **Pass the same `monthlyLimit` you passed to
-`reserve`.** Since the live monthly limit (`quotaSnapshot.monthly.quota`) can
-differ from `job.monthly_limit`, the effective value reserve() used is
-**persisted on the work order as `reserved_monthly`** at submit time, and
-`recovery.js` releases using *that* column — not `job.monthly_limit` — so the
-two dimensions can never disagree and leak the monthly ledger (review finding
-#4, 2026-05-31). NULL `reserved_monthly` = monthly was not reserved → skip the
-monthly decrement (the safe direction: never decrement a ledger we didn't
-increment).
+**Per-work-order reservation model (review R4 #1, 2026-05-31 — supersedes the
+earlier aggregate-`used`/`reserved_monthly` design).** The local ledger now
+separates Adobe's observed usage from our reservations, so a release can never
+mis-account:
 
-**Live-remaining enforcement (review blocker #1, 2026-05-31):** the local
-ledger only counts THIS process's reservations, so before every submit run
-`runSubmission` calls `quotaManager.seedFloor(org, daily.consumed,
-monthly.consumed)` to raise the ledger UP to Adobe's reported org-wide
-`consumed` (MAX, never lower). This makes `reserve` — which still compares
-`used + count` against the full cap — mathematically enforce Adobe's true
-*remaining*, closing the over-ship via the explicit-bucket path and the
-sequential-`/quota`-lag path. **`seedFloor` records the observed consumption in
-a SEPARATE `adobe_floor` column (review #3, R3), NOT just in `used`** — and
-`release` clamps at `adobe_floor` (not 0). Otherwise a delayed orphan `release`
-could decrement `used` below Adobe's floor and let a later `reserve` over-ship.
-The `adobe_floor` is the Adobe-observed component; `used - adobe_floor` is our
-own net reservations, which is all a `release` may give back.
+```
+effective_used(period) = adobe_floor(period) + Σ active reservations(period)
+```
+
+- **`adobe_floor`** (per period, in `quota_usage`/`_monthly`) = Adobe's observed
+  org-wide consumed. Raised two ways that COMPOSE safely (MAX never lowers):
+  `seedFloor(org, daily.consumed, monthly.consumed)` (MAX with live `/quota`,
+  called at the top of every submit run) and the monitor's `complete(woId)`
+  (additive `+= a finished WO's count`, atomically moving it OUT of active
+  reservations). It is tracked SEPARATELY from our reservations, so `seedFloor`
+  can never absorb/lose them.
+- **`quota_reservations`** — one row per WO (`count`, its own `utc_date` +
+  `utc_year_month`, `active`). `reserve({workOrderId,…})` grants iff
+  `effective_used + count` stays within BOTH caps, then records an active row.
+  `release(woId)` deactivates it (Adobe didn't process it) using the WO's OWN
+  period (no cross-day mis-decrement). `reactivate(woId)` restores it (a 'failed'
+  WO that Adobe actually processed). `complete(woId)` moves it into `adobe_floor`.
+
+Monthly is **ALWAYS** tracked (review R4 #4 removed "0 = disable monthly" —
+Adobe always enforces a monthly cap). Live `/quota` caps win; `job.monthly_limit`
++ config are fallbacks. Submission requires a FRESH `/quota` (refuses `stale`,
+review R4 #2). Any code that submits MUST pair `reserve(woId,…)` with
+`release(woId)`/`complete(woId)`.
 
 Any code that submits a work order MUST pair `reserve` with `release`
 in a try/catch. **Exception**: on network timeout we don't know if Adobe

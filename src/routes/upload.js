@@ -139,7 +139,10 @@ router.post('/', uploadMiddleware, async (req, res, next) => {
       sourceNamespace: sourceNamespace || 'hashedKocid',
       sourceNamespaceId: finiteNsidOrNull(sourceNamespaceId),
       dailyLimit: Number(dailyLimit) || config.dailyIdentifierLimit,
-      monthlyLimit: Number(monthlyLimit) > 0 ? Number(monthlyLimit) : null,
+      // Adobe always enforces a monthly cap (review R4 #4 removed "0 = disable
+      // monthly"). job.monthly_limit is a FALLBACK only — submission uses
+      // Adobe's live /quota monthly cap. Store a positive value (default config).
+      monthlyLimit: Number(monthlyLimit) > 0 ? Number(monthlyLimit) : config.monthlyIdentifierLimit,
       uploadPath: req.file.path,
       totalSourceIds,
     });

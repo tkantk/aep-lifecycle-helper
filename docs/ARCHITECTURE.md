@@ -497,7 +497,7 @@ src/
 
 test/                       node --test (via `npm test` → scripts/run-tests.mjs,
                             which enumerates test/*.test.js and sets a stable
-                            test ENCRYPTION_KEY). 231 tests covering hygiene
+                            test ENCRYPTION_KEY). 227 tests covering hygiene
                             validators,
                             namespace canonicalization, IMS token cache, quota
                             atomicity (incl. monthly-disabled release gating),
@@ -547,7 +547,7 @@ data/                       Runtime state; in .gitignore.
 - Request: `{ compositeXids:[{ns,nsid,id}], "graph-type": "Private Graph" }`
 - **Current response** (AEP v1.1.0, observed): `{ version, clusters:[{compositeXid:{nsid,id}, members:[{nsid,id},...]}] }` — members have no `ns` code; canonicalize via registry.
 - **Legacy response** (older regions may still emit): bare array `[{xid, identities:[{ns,nsid,id}]}]`.
-- Matching: by `compositeXid.id` (preferred) or array position (fallback).
+- Matching: STRICTLY by `compositeXid.id` (no positional fallback, review R4 #2). Fails closed on any unmatched source, on `unprocessedXids`/`unprocessedNids`, or on an unrecognized shape.
 
 **Work order** `POST platform.adobe.io/data/core/hygiene/workorder`
 - See CLAUDE.md I1 for the exact payload contract. Key rules: `action: "delete_identity"`, `datasetId` ∈ `ALL` | single | comma list, `targetServices` iff `datasetId === "ALL"`, total ids ≤ 100k, each namespace group identified by `code` OR `id` OR both.
@@ -579,8 +579,9 @@ data/                       Runtime state; in .gitignore.
 | `jobs` | One per upload. Status: created → expanding → expanded → ready → submitting → submitted/partial/failed. `projected_months` (Phase 2) tracks the redistributor's max month_index for shift detection. `source_column` (2026-05-31, default `'0'`) persists the upload-time CSV column so crash-recovery resumes against the same column. | FK creds_id |
 | `expanded_identities` | One row per (cluster member, source). No unique index — dedup deferred to planning via `GROUP BY` in `streamIdentitiesBySource`. Only `idx_ei_job_source(job_id, source_id)` remains; `idx_ei_job_ns` was dropped 2026-05-29 (proven via EXPLAIN QUERY PLAN to be redundant — every reader falls back to `idx_ei_job_source` with an identical plan). | FK job_id |
 | `work_orders` | One per Adobe work order. Statuses: planned → submitting → submitted → completed/failed/deferred. `month_index` (Phase 2) + `day_index` form the bucket label assigned by the redistributor on un-shipped WOs only. `last_polled_at` (2026-05-31) is the monitor's fairness cursor so >100 open WOs all get polled (no starvation). `reserved_monthly` (2026-05-31 R2) records the effective monthly limit reserve() used, so recovery releases exactly the dimensions reserved (no monthly-ledger leak). | FK job_id, ordered by rowid |
-| `quota_usage` | Daily local ledger: (ims_org_id, utc_date) → used. `adobe_floor` (2026-05-31 R3) records Adobe's observed consumed SEPARATELY so `release` can clamp at it (never below Adobe's reality → no over-ship). | PK |
-| `quota_usage_monthly` | Monthly local ledger: (ims_org_id, utc_year_month) → used + `adobe_floor` (see `quota_usage`). | PK |
+| `quota_usage` | Per-period **adobe_floor** = Adobe's observed consumed (R4: `used` is now vestigial). Raised by `seedFloor` (MAX with live /quota) and `complete()` (additive, moving a finished WO into the floor). | PK(ims_org_id, utc_date) |
+| `quota_usage_monthly` | Monthly counterpart of `quota_usage`'s `adobe_floor`. | PK(ims_org_id, utc_year_month) |
+| `quota_reservations` | **Per-work-order quota reservation** (2026-05-31 R4 #1): (work_order_id) → count + utc_date + utc_year_month + active. `effective_used(period) = adobe_floor(period) + Σ active reservations(period)`. reserve/release/complete are keyed by WO id → exact + period-correct (fixes same-day ownership, cross-day, multi-month double-count). | PK(work_order_id) |
 | `app_settings` | Generic key/value bag (Phase 3). First users: `auto_resume_*` keys for the scheduler. | PK(key) |
 
 Both ledgers are incremented by `reserve()` atomically and decremented by

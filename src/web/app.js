@@ -20,7 +20,7 @@ const state = {
     deleteMode: 'datasets',      // 'datasets' | 'all' | 'profile-only'
     datasetIds: [],              // array of selected dataset ids
     dailyLimit: 1_000_000,
-    monthlyLimit: 3_000_000,     // 0 disables monthly tracking
+    monthlyLimit: 3_000_000,     // fallback only — Adobe's live monthly cap wins
     sourceNamespace: 'hashedKocid',  // code; defaults to hashedKocid for backwards compat
     sourceNamespaceId: null,         // numeric nsid — filled from the namespace registry
   },
@@ -198,8 +198,9 @@ function updateConfigState() {
   state.config.sandboxName  = $('#c-sandbox-picker').value;
   state.config.deleteMode   = $('#c-delete-mode').value;
   state.config.dailyLimit   = parseInt($('#c-daily').value, 10) || 1_000_000;
-  // Monthly: 0 or empty means "no monthly cap tracking" — sent as 0 to the
-  // backend which maps it to null on the jobs row.
+  // Monthly cap is a fallback only — Adobe always enforces a monthly cap and
+  // submission uses the live /quota value (review R4 #4). 0/empty → backend
+  // default, never "disabled".
   state.config.monthlyLimit = Math.max(0, parseInt($('#c-monthly').value, 10) || 0);
 
   const canTest = state.config.imsOrgId && state.config.clientId && state.config.clientSecret;
@@ -598,7 +599,7 @@ function autoPopulateCapsFromQuota(q) {
       state.config.monthlyLimit = q.monthly.quota;
     }
     if (monthlyHint) {
-      monthlyHint.textContent = `Adobe-reported entitlement: ${q.monthly.quota.toLocaleString()} / month · 0 = unlimited`;
+      monthlyHint.textContent = `Adobe-reported entitlement: ${q.monthly.quota.toLocaleString()} / month`;
     }
   }
   updateConfigState();

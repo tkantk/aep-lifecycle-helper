@@ -303,14 +303,22 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
       throw e;
     }
 
-    // When this job tracks a monthly cap, Adobe MUST report a valid monthly
-    // entitlement too — otherwise we'd track monthly against a guessed/absent
-    // number and could over-consume the monthly pool (review finding #3). A
-    // job with monthly tracking explicitly disabled (monthly_limit null/0) is
-    // the defensible exception and skips this requirement.
-    const jobTracksMonthly = !(job.monthly_limit === null || job.monthly_limit === 0);
-    if (jobTracksMonthly && (!quotaSnapshot?.monthly || !(Number(quotaSnapshot.monthly.quota) > 0))) {
-      const e = new Error('Cannot submit: this job tracks a monthly cap but Adobe /quota returned no recognized monthly entitlement.');
+    // Adobe ALWAYS enforces a monthly cap (review R4 #4 removed the
+    // "0 = disable monthly" option), so a valid monthly entitlement is REQUIRED
+    // before any destructive submit.
+    if (!quotaSnapshot?.monthly || !(Number(quotaSnapshot.monthly.quota) > 0)) {
+      const e = new Error('Cannot submit: Adobe /quota returned no recognized monthly entitlement.');
+      e.code = 'quota_unavailable';
+      throw e;
+    }
+
+    // The destructive boundary requires a FRESH /quota (review R4 #2). A stale
+    // snapshot (served from cache after a failed live refresh) is fine for the
+    // UI banner and for planning, but org-wide EXTERNAL usage can advance during
+    // an Adobe outage — shipping against an obsolete snapshot risks
+    // over-consuming a cap the operator can't see. Refuse and retry later.
+    if (quotaSnapshot.stale) {
+      const e = new Error('Cannot submit: Adobe /quota is unreachable; refusing to ship against a stale (cached) snapshot.');
       e.code = 'quota_unavailable';
       throw e;
     }
@@ -353,31 +361,28 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
       }
     }
 
-    // Use live quota cap values for the local reserve() ledger so the safety
-    // net is consistent with what Adobe will actually enforce (F-003). Fall
-    // back to job-row values only when the live snapshot is unavailable.
-    const liveDailyLimit   = quotaSnapshot?.daily?.quota   || job.daily_limit;
-    const liveMonthlyLimit = job.monthly_limit === null || job.monthly_limit === 0
-      ? (quotaSnapshot?.monthly?.quota ? quotaSnapshot.monthly.quota : null)
-      : (quotaSnapshot?.monthly?.quota || job.monthly_limit);
+    // Live caps from the (fresh, validated-above) /quota snapshot. Both
+    // dimensions are guaranteed present by the guards above.
+    const liveDailyLimit   = quotaSnapshot.daily.quota;
+    const liveMonthlyLimit = quotaSnapshot.monthly.quota;
 
-    // Seed the local ledger UP to Adobe's reported consumed BEFORE any reserve,
-    // so reserve() (which compares against the full cap) enforces Adobe's true
-    // remaining — closing the over-ship via the explicit-bucket path and the
-    // sequential-lag path (review blocker #1). Monthly is seeded only when this
-    // job tracks monthly (liveMonthlyLimit != null), matching reserve/release.
-    seedFloor(
-      creds.imsOrgId,
-      quotaSnapshot.daily.consumed,
-      liveMonthlyLimit != null ? (quotaSnapshot.monthly?.consumed ?? null) : null,
-    );
+    // Raise the Adobe-observed floor (MAX) to the live consumed numbers BEFORE
+    // any reserve, so reserve() enforces Adobe's true remaining. The floor is
+    // tracked SEPARATELY from our per-WO reservations (review R4 #1), so it can
+    // never absorb/lose them.
+    seedFloor(creds.imsOrgId, quotaSnapshot.daily.consumed, quotaSnapshot.monthly.consumed);
 
     q().updateJobStatus.run('submitting', null, jobId);
 
     let submitted = 0, deferred = 0, failed = 0;
 
     const tasks = orders.map(wo => limit(async () => {
-      const res = reserve(creds.imsOrgId, wo.identifier_count, liveDailyLimit, liveMonthlyLimit);
+      // Per-WO reservation (review R4 #1): keyed by wo.id so release/complete
+      // are exact and period-correct.
+      const res = reserve({
+        workOrderId: wo.id, imsOrgId: creds.imsOrgId, count: wo.identifier_count,
+        dailyLimit: liveDailyLimit, monthlyLimit: liveMonthlyLimit,
+      });
       if (!res.granted) {
         const reason = res.reason === 'monthly'
           ? `monthly quota: ${res.monthlyUsed}/${res.monthlyLimit} used`
@@ -387,18 +392,13 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
         return;
       }
 
-      // Record the EFFECTIVE monthly dimension we just reserved so recovery
-      // releases EXACTLY this dimension later, not the (possibly different)
-      // job-row monthly_limit (review finding #4 — monthly-ledger leak).
-      q().setReservedMonthly.run(liveMonthlyLimit ?? null, wo.id);
-
       try {
         // Durably commit the reserve + 'submitting' intent before the
         // non-idempotent POST (review #8), via a synchronous=FULL commit rather
         // than a (reader-blocking) wal_checkpoint (review #6). Fail CLOSED: if
         // the durable write errors, do NOT POST — release and defer for retry.
         if (!setWorkOrderSubmittingDurable(wo.id)) {
-          release(creds.imsOrgId, wo.identifier_count, liveMonthlyLimit);
+          release(wo.id);
           q().updateWorkOrderStatus.run(
             'deferred', 'durability not confirmed; will retry next run', wo.id);
           deferred++;
@@ -458,7 +458,7 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
         const isAdobeRejection = status != null && status >= 400 && status < 500;
 
         if (isAdobeRejection) {
-          release(creds.imsOrgId, wo.identifier_count, liveMonthlyLimit);
+          release(wo.id);
           q().updateWorkOrderStatus.run('failed', err.message, wo.id);
           failed++;
           logger.error({ localId: wo.id, status, err: err.message },

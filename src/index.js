@@ -1,5 +1,6 @@
 import path from 'node:path';
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';
 import express from 'express';
@@ -45,42 +46,72 @@ fs.mkdirSync(path.dirname(config.dbPath), { recursive: true });
 // never opened while another instance holds the lock. Reclaim only a stale
 // lock whose recorded pid is no longer alive. Released on shutdown.
 const lockPath = config.dbPath === ':memory:' ? null : path.resolve(config.dbPath) + '.lock';
+
+// Synchronous sleep — startup runs synchronously before the server. Atomics.wait
+// blocks the thread without a busy-loop.
+function sleepSync(ms) {
+  try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* */ }
+}
+function readLockHolder(p) {
+  try { return fs.readFileSync(p, 'utf8').trim(); } catch { return null; }
+}
+
 function acquireSingleProcessLock() {
   if (!lockPath) return;   // in-memory DB has no shared file to guard
-  for (let attempt = 0; attempt < 2; attempt++) {
+  const myToken = `${process.pid}:${crypto.randomUUID()}`;
+  const tmpPath = `${lockPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+
+  for (let attempt = 0; attempt < 8; attempt++) {
+    // Create the lock ATOMICALLY and ALREADY-POPULATED via link(): write the
+    // token to a temp file, then hard-link it onto the lock path. link() fails
+    // EEXIST if the lock is held, and — unlike open(O_EXCL)+write — the lock
+    // file is never observable in an EMPTY state, eliminating both the
+    // publication-window race (review #3) and the zero-byte strand (review #7).
+    fs.writeFileSync(tmpPath, myToken);
+    let linked = false;
     try {
-      const fd = fs.openSync(lockPath, 'wx');   // O_EXCL — fails if it exists
-      fs.writeSync(fd, String(process.pid));
-      fs.closeSync(fd);
-      return;
+      fs.linkSync(tmpPath, lockPath);
+      linked = true;
     } catch (err) {
-      if (err.code !== 'EEXIST') throw err;
-      const raw = fs.readFileSync(lockPath, 'utf8').trim();
-      const existingPid = Number(raw);
-      // A lock file written by a crashed process can be EMPTY (created with
-      // O_EXCL but killed before the pid was written). Number('') === 0, and
-      // process.kill(0, 0) targets the process GROUP and reports "alive" — which
-      // would strand startup forever. Only treat a POSITIVE INTEGER pid as a
-      // real holder; anything else (empty / 0 / NaN / negative) is a corrupt
-      // lock to reclaim (review #7).
-      const validPid = Number.isInteger(existingPid) && existingPid > 0;
-      let alive = false;
-      if (validPid) {
-        try { process.kill(existingPid, 0); alive = true; } catch (e) { alive = e.code === 'EPERM'; }
-      }
-      if (validPid && alive && existingPid !== process.pid) {
-        logger.error(
-          `Another instance (pid ${existingPid}) is already running against the database ` +
-          `${config.dbPath}. Running two instances on one database corrupts the WAL. Stop the ` +
-          `other instance first, or point DB_PATH at a different database file.`);
-        process.exit(1);
-      }
-      // Stale or corrupt lock (pid not alive, or not a positive integer) — reclaim.
-      logger.warn({ stalePid: raw || '(empty)' }, 'reclaiming stale/corrupt single-process lock');
-      try { fs.unlinkSync(lockPath); } catch { /* */ }
+      if (err.code !== 'EEXIST') { try { fs.unlinkSync(tmpPath); } catch { /* */ } throw err; }
     }
+    try { fs.unlinkSync(tmpPath); } catch { /* */ }
+
+    if (linked) {
+      // Ownership verification — confirm the lock holds OUR token (defends
+      // against a racing reclaim+rewrite). If not, back off and retry.
+      if (readLockHolder(lockPath) === myToken) return;
+      sleepSync(25);
+      continue;
+    }
+
+    // Lock is held. Inspect the holder, with a GRACE RETRY for an empty lock
+    // (a legacy openSync-based writer mid-publication, or a crashed one).
+    let holder = readLockHolder(lockPath);
+    for (let g = 0; g < 5 && holder === ''; g++) { sleepSync(40); holder = readLockHolder(lockPath); }
+    if (holder === null) { sleepSync(25); continue; }   // vanished — retry
+
+    const pid = Number(String(holder).split(':')[0]);
+    const validPid = Number.isInteger(pid) && pid > 0;
+    let alive = false;
+    if (validPid) { try { process.kill(pid, 0); alive = true; } catch (e) { alive = e.code === 'EPERM'; } }
+
+    if (validPid && alive && pid !== process.pid) {
+      logger.error(
+        `Another instance (pid ${pid}) is already running against the database ${config.dbPath}. ` +
+        `Running two instances on one database corrupts the WAL. Stop the other instance first, ` +
+        `or point DB_PATH at a different database file.`);
+      process.exit(1);
+    }
+
+    // Dead pid, or genuinely-empty-after-grace (crashed publication) → reclaim.
+    // VERIFY the content is UNCHANGED since we read it before unlinking, so we
+    // never clobber a lock a fresh writer just published (review #3).
+    logger.warn({ staleHolder: holder || '(empty)' }, 'reclaiming stale/corrupt single-process lock');
+    if (readLockHolder(lockPath) === holder) { try { fs.unlinkSync(lockPath); } catch { /* */ } }
+    sleepSync(25);
   }
-  throw new Error('could not acquire single-process lock');
+  throw new Error('could not acquire single-process lock after retries');
 }
 acquireSingleProcessLock();
 

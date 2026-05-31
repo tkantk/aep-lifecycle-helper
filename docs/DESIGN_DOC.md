@@ -690,7 +690,7 @@ unreachable and no cache exists.
 | Variable                   | Default       | Description                                                                                                           |
 |----------------------------|---------------|-----------------------------------------------------------------------------------------------------------------------|
 | `DAILY_IDENTIFIER_LIMIT`   | `1000000`     | Fallback daily identifier deletion cap. Match your Adobe contract entitlement. |
-| `MONTHLY_IDENTIFIER_LIMIT` | `3000000`     | Fallback monthly identifier deletion cap. Match your Adobe contract. Set to `0` to disable monthly quota tracking (useful for contracts with no monthly cap). |
+| `MONTHLY_IDENTIFIER_LIMIT` | `3000000`     | FALLBACK monthly identifier cap (live Adobe `/quota` wins). Adobe always enforces a monthly cap, so there is no "disable monthly" option (review R4 #4). |
 
 #### Adobe Endpoints (advanced)
 

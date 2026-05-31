@@ -413,8 +413,9 @@ Our code handles both.
   (e.g. `hashedKocid`) need the numeric nsid to reliably match clusters.
 - Parses both response shapes: extracts `data.clusters` OR `data` itself
   depending on which form was returned.
-- Matches each cluster to its source by `compositeXid.id` (falls back to
-  array position if absent).
+- Matches each cluster to its source STRICTLY by `compositeXid.id` — no
+  positional fallback (review R4 #2). Fails closed on any unmatched source,
+  on `unprocessedXids`/`unprocessedNids`, or on an unrecognized shape.
 - Each `member.nsid` is canonicalized via the namespace registry to fill in
   the missing `code`. If the registry has no hit, the row is still stored
   with only the nsid — Adobe's Hygiene API accepts namespace groups with

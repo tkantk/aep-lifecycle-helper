@@ -245,23 +245,19 @@ test('reconcile: transient error leaves orphan alone for next startup', async ()
   assert.equal(wo.adobe_workorder_id, null);
 });
 
-test('reconcile: rollback releases the EFFECTIVE monthly dimension (no monthly leak)', async () => {
-  // Review finding #4 (R2): submission reserved with a LIVE monthly limit even
-  // though the job row has monthly tracking disabled. The persisted
-  // reserved_monthly must drive release, so rollback decrements BOTH ledgers.
-  // Pre-fix, release used job.monthly_limit (null) and the monthly ledger
-  // leaked (daily -> 0 but monthly stayed at 100).
+test('reconcile: rollback releases the WO reservation on BOTH dimensions (review R4 #1)', async () => {
+  // The per-WO reservation records both the daily and monthly period; an
+  // orphan rollback (Adobe didn't process it) deactivates it by WO id, freeing
+  // both dimensions exactly — no monthly leak, no cross-period mis-decrement.
   const { jobId } = seedCredAndJob({ name: 'monthly-leak' });
   const imsOrgId = `org-${seq}@AcmeOrg`;
   const localId = `wo-mleak-${seq}`;
   seedOrphanWorkOrder(jobId, localId);          // identifier_count = 2
   const COUNT = 2;
 
-  // Simulate submission reserving against BOTH dimensions with a live monthly
-  // cap, and persisting that effective monthly limit on the WO.
-  const r = reserve(imsOrgId, COUNT, 1_000_000, 3_000_000);
+  // Submission reserved this WO against both dimensions.
+  const r = reserve({ workOrderId: localId, imsOrgId, count: COUNT, dailyLimit: 1_000_000, monthlyLimit: 3_000_000 });
   assert.equal(r.granted, true);
-  q().setReservedMonthly.run(3_000_000, localId);
   assert.equal(peek(imsOrgId, 1_000_000, 3_000_000).daily.used, COUNT);
   assert.equal(peek(imsOrgId, 1_000_000, 3_000_000).monthly.used, COUNT);
 
@@ -276,8 +272,8 @@ test('reconcile: rollback releases the EFFECTIVE monthly dimension (no monthly l
   await reconcileOrphanWorkOrders();
 
   const after = peek(imsOrgId, 1_000_000, 3_000_000);
-  assert.equal(after.daily.used, 0, 'daily ledger released');
-  assert.equal(after.monthly.used, 0, 'monthly ledger MUST be released too (no leak)');
+  assert.equal(after.daily.used, 0, 'daily reservation released');
+  assert.equal(after.monthly.used, 0, 'monthly reservation released too (no leak)');
   const wo = q().getAllOrdersForJob.all(jobId)[0];
   assert.equal(wo.status, 'planned');
 });

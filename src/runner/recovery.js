@@ -4,7 +4,7 @@ import { logger } from '../utils/logger.js';
 import { runExpansion } from './expansion.js';
 import { getWorkOrder } from '../services/hygiene.js';
 import { decryptCreds } from '../utils/crypto.js';
-import { release } from '../services/quotaManager.js';
+import { release, reactivate } from '../services/quotaManager.js';
 
 /**
  * Startup reconciliation for jobs and work orders left in flight when the
@@ -116,14 +116,10 @@ export async function reconcileOrphanWorkOrders() {
           'recovery: matched orphan to existing Adobe work order');
       } else {
         // Adobe responded successfully and the order is not there. Safe to
-        // release quota and roll back. Release EXACTLY the monthly dimension
-        // reserve() used (persisted on the WO), so a job whose live monthly
-        // limit differed from job.monthly_limit doesn't leak the monthly
-        // ledger (review finding #4). NULL means monthly was not reserved →
-        // skip the monthly decrement (the safe direction: never decrement a
-        // ledger we didn't increment, which would under-count and risk a
-        // later over-ship).
-        release(creds.imsOrgId, wo.identifier_count, wo.reserved_monthly ?? null);
+        // deactivate the WO's reservation (Adobe didn't process it) and roll
+        // back — release is keyed by WO id, so it frees exactly this WO's
+        // reservation in its own period (review R4 #1).
+        release(wo.id);
         q().rollbackWorkOrderToPlanned.run('rolled back after process crash', wo.id);
         logger.info({ localId: wo.id }, 'recovery: rolled back orphan to planned');
       }
@@ -278,21 +274,13 @@ export async function reconcileJobOrphans(jobId) {
         // the right tool — we're correcting the ledger to match reality,
         // not reserving fresh capacity.
         if (wo.status === 'failed') {
-          const today = utcToday();
-          q().upsertQuota.run(creds.imsOrgId, today, wo.identifier_count);
-          // Re-reserve the monthly dimension to mirror what Adobe actually
-          // spent (review finding #4). Prefer the persisted reserved_monthly;
-          // for a LEGACY 'failed' row from before that column existed
-          // (reserved_monthly NULL), fall back to the job-row monthly_limit so
-          // we DON'T under-count Adobe's monthly spend (the safe direction here
-          // is the ledger being higher — under-counting would risk a later
-          // monthly over-ship).
-          const monthlyOn = wo.reserved_monthly != null
-            ? wo.reserved_monthly > 0
-            : (wo.j_monthly_limit != null && wo.j_monthly_limit > 0);
-          if (monthlyOn) {
-            q().upsertMonthlyQuota.run(creds.imsOrgId, utcYearMonth(), wo.identifier_count);
-          }
+          // The WO was marked 'failed' (its reservation deactivated) but Adobe
+          // actually processed it — re-activate the WO's reservation so the
+          // ledger reflects the real spend (review R4 #1). The next seedFloor
+          // (reading live /quota) and the monitor's complete() then move it into
+          // adobe_floor. If there's no reservation row (legacy), this is a no-op
+          // and the floor still picks it up via /quota on the next submit.
+          reactivate(wo.id);
         }
         q().updateWorkOrderSubmitted.run({
           id: wo.id,
@@ -309,10 +297,10 @@ export async function reconcileJobOrphans(jobId) {
 
       // Not found in Adobe.
       if (wo.status === 'submitting') {
-        // Safe to roll back — Adobe didn't get it. Release the still-held
-        // quota so the next submit run can retry cleanly. Use the persisted
-        // reserved monthly dimension, not job.monthly_limit (finding #4).
-        release(creds.imsOrgId, wo.identifier_count, wo.reserved_monthly ?? null);
+        // Safe to roll back — Adobe didn't get it. Deactivate the WO's
+        // reservation (keyed by WO id) so the next submit run can retry cleanly
+        // (review R4 #1).
+        release(wo.id);
         q().rollbackWorkOrderToPlanned.run(
           'reconcile: not found in Adobe — rolled back to planned', wo.id);
         rolledBack++;
@@ -330,17 +318,6 @@ export async function reconcileJobOrphans(jobId) {
   }
 
   return { total: orphans.length, matched, rolledBack, indeterminate, stillFailed, perWoError };
-}
-
-// UTC helpers — kept private here to avoid pulling in the entire
-// quotaManager just for two one-line functions.
-function utcToday() {
-  const d = new Date();
-  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
-}
-function utcYearMonth() {
-  const d = new Date();
-  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
 }
 
 /** Top-level entrypoint called by src/index.js after the DB is ready. */

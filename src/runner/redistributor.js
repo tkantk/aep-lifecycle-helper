@@ -85,9 +85,13 @@ export function redistributeUnshippedOrders(jobId, quota) {
     quota?.daily?.quota,
     safeInt(job.daily_limit, config.dailyIdentifierLimit)
   );
-  const monthlyFresh = job.monthly_limit === null || job.monthly_limit === 0
-    ? safeInt(quota?.monthly?.quota, null)
-    : safeInt(quota?.monthly?.quota, safeInt(job.monthly_limit, null));
+  // Monthly is ALWAYS tracked (review R4 #4 removed "0 = disable monthly" —
+  // Adobe always enforces a monthly cap). Live /quota wins; job row + config
+  // are fallbacks.
+  const monthlyFresh = safeInt(
+    quota?.monthly?.quota,
+    safeInt(job.monthly_limit, config.monthlyIdentifierLimit)
+  );
 
   // First-period remainders — live values from Adobe if we have them,
   // otherwise full fresh caps.

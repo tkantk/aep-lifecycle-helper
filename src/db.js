@@ -173,6 +173,28 @@ export function initDb() {
       PRIMARY KEY (ims_org_id, utc_year_month)
     );
 
+    -- ─── Per-work-order quota reservations (review R4 #1) ─────────────────
+    -- The aggregate quota_usage.used counter conflated OUR reservations with
+    -- Adobe's observed floor, so a delayed release could mis-account (lose
+    -- ownership / cross-day). This table records ONE row per reserved work
+    -- order with its own period keys, so release/complete are exact and
+    -- period-correct. effective_used(period) = adobe_floor(period)
+    --   + SUM(count) of ACTIVE reservations in that period.
+    --   active=1: reserved / in-flight (counts toward effective).
+    --   active=0: released (Adobe didn't process) OR completed (moved into
+    --             adobe_floor — see quotaManager.complete()).
+    CREATE TABLE IF NOT EXISTS quota_reservations (
+      work_order_id   TEXT PRIMARY KEY,
+      ims_org_id      TEXT NOT NULL,
+      utc_date        TEXT NOT NULL,
+      utc_year_month  TEXT NOT NULL,
+      count           INTEGER NOT NULL,
+      active          INTEGER NOT NULL DEFAULT 1,
+      created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_qr_org_date  ON quota_reservations(ims_org_id, utc_date, active);
+    CREATE INDEX IF NOT EXISTS idx_qr_org_month ON quota_reservations(ims_org_id, utc_year_month, active);
+
     -- ─── App-global settings (Phase 3, 2026-05-15) ──────────────────
     -- Generic key/value bag for settings that aren't tied to a credential
     -- or a job. Initial users:
@@ -572,46 +594,52 @@ function prepared() {
     // associated filesystem artefacts (uploaded CSV, exported CSV).
     deleteJob: db.prepare('DELETE FROM jobs WHERE id = ?'),
 
-    // ─── Quota (daily) ────────────────────────────────────────────────
-    getQuota: db.prepare(`SELECT used FROM quota_usage WHERE ims_org_id = ? AND utc_date = ?`),
-    upsertQuota: db.prepare(`
-      INSERT INTO quota_usage (ims_org_id, utc_date, used) VALUES (?, ?, ?)
-      ON CONFLICT(ims_org_id, utc_date) DO UPDATE SET used = used + excluded.used
+    // ─── Quota: Adobe-observed floor (per period) ─────────────────────
+    // adobe_floor = org-wide consumed as observed by Adobe. Raised two ways:
+    //   • seedFloor → MAX(floor, live /quota consumed)  (absolute, handles lag)
+    //   • complete()→ floor += a completed WO's count   (additive; moves it out
+    //     of active reservations). MAX and += COMPOSE safely: MAX never lowers,
+    //     so a later seedFloor whose Adobe number already includes that WO
+    //     keeps the same value (no double-count); if others consumed more, MAX
+    //     raises it. (`used` column is vestigial post-R4 — reservations replace
+    //     it; left at 0.)
+    getDailyFloor:   db.prepare(`SELECT adobe_floor FROM quota_usage WHERE ims_org_id = ? AND utc_date = ?`),
+    getMonthlyFloor: db.prepare(`SELECT adobe_floor FROM quota_usage_monthly WHERE ims_org_id = ? AND utc_year_month = ?`),
+    maxDailyFloor: db.prepare(`
+      INSERT INTO quota_usage (ims_org_id, utc_date, used, adobe_floor) VALUES (?, ?, 0, ?)
+      ON CONFLICT(ims_org_id, utc_date) DO UPDATE SET adobe_floor = MAX(adobe_floor, excluded.adobe_floor)
     `),
-    // Release clamps at adobe_floor (NOT 0): a release only undoes OUR
-    // reservation, which sits ON TOP of Adobe's observed floor — it must never
-    // drop the ledger below what Adobe has already consumed, or a concurrent
-    // reserve could over-ship (review #3).
-    decQuota: db.prepare(`
-      UPDATE quota_usage SET used = MAX(adobe_floor, used - ?) WHERE ims_org_id = ? AND utc_date = ?
+    maxMonthlyFloor: db.prepare(`
+      INSERT INTO quota_usage_monthly (ims_org_id, utc_year_month, used, adobe_floor) VALUES (?, ?, 0, ?)
+      ON CONFLICT(ims_org_id, utc_year_month) DO UPDATE SET adobe_floor = MAX(adobe_floor, excluded.adobe_floor)
     `),
-    // Reconcile the daily ledger UP to Adobe's reported consumed (review
-    // blocker #1). MAX (not +): never lowers a value, so it can't undo our own
-    // just-reserved increments, and a lagging (lower) Adobe consumed leaves our
-    // higher local value intact. Raising the floor to org-wide consumed makes
-    // reserve() enforce Adobe's true remaining instead of just the full cap.
-    upsertQuotaFloor: db.prepare(`
-      INSERT INTO quota_usage (ims_org_id, utc_date, used, adobe_floor) VALUES (?, ?, ?, ?)
-      ON CONFLICT(ims_org_id, utc_date) DO UPDATE SET
-        used        = MAX(used, excluded.used),
-        adobe_floor = MAX(adobe_floor, excluded.adobe_floor)
+    bumpDailyFloor: db.prepare(`
+      INSERT INTO quota_usage (ims_org_id, utc_date, used, adobe_floor) VALUES (?, ?, 0, ?)
+      ON CONFLICT(ims_org_id, utc_date) DO UPDATE SET adobe_floor = adobe_floor + excluded.adobe_floor
+    `),
+    bumpMonthlyFloor: db.prepare(`
+      INSERT INTO quota_usage_monthly (ims_org_id, utc_year_month, used, adobe_floor) VALUES (?, ?, 0, ?)
+      ON CONFLICT(ims_org_id, utc_year_month) DO UPDATE SET adobe_floor = adobe_floor + excluded.adobe_floor
     `),
 
-    // ─── Quota (monthly) ──────────────────────────────────────────────
-    getMonthlyQuota: db.prepare(`SELECT used FROM quota_usage_monthly WHERE ims_org_id = ? AND utc_year_month = ?`),
-    upsertMonthlyQuota: db.prepare(`
-      INSERT INTO quota_usage_monthly (ims_org_id, utc_year_month, used) VALUES (?, ?, ?)
-      ON CONFLICT(ims_org_id, utc_year_month) DO UPDATE SET used = used + excluded.used
+    // ─── Quota: per-work-order reservations (review R4 #1) ─────────────
+    upsertReservation: db.prepare(`
+      INSERT INTO quota_reservations (work_order_id, ims_org_id, utc_date, utc_year_month, count, active)
+        VALUES (@workOrderId, @imsOrgId, @utcDate, @utcMonth, @count, 1)
+      ON CONFLICT(work_order_id) DO UPDATE SET
+        ims_org_id = excluded.ims_org_id, utc_date = excluded.utc_date,
+        utc_year_month = excluded.utc_year_month, count = excluded.count, active = 1
     `),
-    decMonthlyQuota: db.prepare(`
-      UPDATE quota_usage_monthly SET used = MAX(adobe_floor, used - ?) WHERE ims_org_id = ? AND utc_year_month = ?
+    deactivateReservation: db.prepare(`UPDATE quota_reservations SET active = 0 WHERE work_order_id = ?`),
+    reactivateReservation: db.prepare(`UPDATE quota_reservations SET active = 1 WHERE work_order_id = ?`),
+    getReservation: db.prepare(`SELECT * FROM quota_reservations WHERE work_order_id = ?`),
+    sumActiveDaily: db.prepare(`
+      SELECT COALESCE(SUM(count), 0) AS s FROM quota_reservations
+       WHERE ims_org_id = ? AND utc_date = ? AND active = 1
     `),
-    // Monthly counterpart of upsertQuotaFloor (review blocker #1).
-    upsertMonthlyQuotaFloor: db.prepare(`
-      INSERT INTO quota_usage_monthly (ims_org_id, utc_year_month, used, adobe_floor) VALUES (?, ?, ?, ?)
-      ON CONFLICT(ims_org_id, utc_year_month) DO UPDATE SET
-        used        = MAX(used, excluded.used),
-        adobe_floor = MAX(adobe_floor, excluded.adobe_floor)
+    sumActiveMonthly: db.prepare(`
+      SELECT COALESCE(SUM(count), 0) AS s FROM quota_reservations
+       WHERE ims_org_id = ? AND utc_year_month = ? AND active = 1
     `),
 
     // ─── Recovery (startup reconciliation) ────────────────────────────

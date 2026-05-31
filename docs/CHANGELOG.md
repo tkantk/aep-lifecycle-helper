@@ -9,6 +9,66 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-05-31 (R4) — Fourth-round review: quota model rebuilt + lock/monthly fixes
+
+A fourth review showed the quota safety boundary was still bypassable — the
+aggregate `used` counter (patched twice in R2/R3) conflated OUR reservations
+with Adobe's observed usage, so `seedFloor`'s MAX could absorb-and-lose our
+reservations and a delayed release could mis-account. Rather than patch a 4th
+time, the ledger was rebuilt around **per-work-order reservation ownership**.
+Suite **231 → 227** (the quota test was consolidated; net new coverage added),
+audit clean.
+
+### #1 (blocker) — per-WO reservation quota model
+
+New `quota_reservations` table (one row per WO: count + `utc_date` +
+`utc_year_month` + `active`). `effective_used(period) = adobe_floor(period)
++ Σ active reservations(period)`. `adobe_floor` is tracked SEPARATELY from our
+reservations (so it can never absorb them) and raised two ways that compose
+safely: `seedFloor` (MAX with live `/quota` consumed) and the monitor's
+`complete()` (additive `+= a completed WO's count`, atomically moving it out of
+active reservations). `reserve` is keyed by WO id; `release` / `reactivate` /
+`complete` act on the WO's OWN row → exact and period-correct. This fixes the
+same-day ownership loss, the cross-day mis-decrement, AND the latent multi-month
+double-count (which would have halved monthly throughput). `quotaManager` API:
+`reserve({workOrderId,imsOrgId,count,dailyLimit,monthlyLimit})`,
+`release(woId)`, `reactivate(woId)`, `complete(woId)`, `seedFloor`, `peek`.
+Wired through `submission.js`, `recovery.js`, and a new `monitor.js` completion
+hook. Tests in `quotaManager.test.js` (same-day delayed release, cross-day,
+multi-month no-double-count).
+
+### #2 (blocker) — submit requires a FRESH /quota
+
+`runSubmission` now refuses a `stale` snapshot (`quota_unavailable`). A cached
+snapshot (served after a failed live refresh, ≤24h) is fine for the UI banner
+and planning, but external org-wide usage can advance during an Adobe outage —
+shipping against an obsolete snapshot could over-consume. Fresh-only at the
+destructive boundary.
+
+### #3 (high) — lock concurrent-start race
+
+The R3 zero-byte fix let a concurrent start observe a mid-publication empty lock
+and reclaim it. Replaced with **link()-based atomic locking**: write a
+pid:token to a temp file, then `linkSync` it onto the lock path — the lock file
+is never observable empty. Plus a grace-retry for legacy empty locks and
+write-then-reread ownership verification. New `lockConcurrent.test.js` (5
+concurrent starts → exactly 1 acquires); 8-way concurrent boot smoke verified.
+
+### #4 (medium) — removed the phantom `MONTHLY=0` control
+
+Adobe always enforces a monthly cap, and the redistributor/submission re-enabled
+it from Adobe anyway, so "0 = disable monthly" was misleading. Removed: monthly
+is ALWAYS tracked (live `/quota` cap, with job-row/config fallbacks). Updated
+`upload.js`, `redistributor.js`, `submission.js`, `config.js`, and the Config UI
+hint (`index.html`/`app.js`).
+
+### #5 (low) — stale graph docs
+
+`identityGraph.js` header, ARCHITECTURE, and REVIEW updated off the
+removed positional fallback.
+
+---
+
 ## 2026-05-31 (R3) — Third-round review remediation (3 blockers + 5 findings)
 
 A third review found destructive-path gaps remaining after R2, several in the
