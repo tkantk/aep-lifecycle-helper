@@ -254,18 +254,22 @@ effective_used(period) = adobe_floor(period) + Σ active reservations(period)
 ```
 
 - **`adobe_floor`** (per period, in `quota_usage`/`_monthly`) = Adobe's observed
-  org-wide consumed. Raised two ways that COMPOSE safely (MAX never lowers):
-  `seedFloor(org, daily.consumed, monthly.consumed)` (MAX with live `/quota`,
-  called at the top of every submit run) and the monitor's `complete(woId)`
-  (additive `+= a finished WO's count`, atomically moving it OUT of active
-  reservations). It is tracked SEPARATELY from our reservations, so `seedFloor`
-  can never absorb/lose them.
+  org-wide consumed. Raised in exactly ONE way: `seedFloor(org, daily.consumed,
+  monthly.consumed)` (MAX with live `/quota`, called at the top of every submit
+  run; MAX never lowers it). It is tracked SEPARATELY from our reservations, so
+  `seedFloor` can never absorb/lose them. **`complete(woId)` does NOT bump the
+  floor** (review R4.1 fix): a finished WO is already counted in Adobe's `/quota`,
+  so the next `seedFloor` picks it up via MAX. An additive bump on top of that
+  MAX would double-count it permanently (MEDIUM finding), and — when Adobe lags
+  on our WO but leads on external usage — MAX would swallow our completed count
+  and we'd over-ship (HIGH finding). So completion is deactivate-only.
 - **`quota_reservations`** — one row per WO (`count`, its own `utc_date` +
   `utc_year_month`, `active`). `reserve({workOrderId,…})` grants iff
   `effective_used + count` stays within BOTH caps, then records an active row.
   `release(woId)` deactivates it (Adobe didn't process it) using the WO's OWN
   period (no cross-day mis-decrement). `reactivate(woId)` restores it (a 'failed'
-  WO that Adobe actually processed). `complete(woId)` moves it into `adobe_floor`.
+  WO that Adobe actually processed). `complete(woId)` deactivates it (Adobe HAS
+  processed it; it's now reflected in `/quota` and seeded into `adobe_floor`).
 
 Monthly is **ALWAYS** tracked (review R4 #4 removed "0 = disable monthly" —
 Adobe always enforces a monthly cap). Live `/quota` caps win; `job.monthly_limit`
@@ -720,9 +724,11 @@ which require `https://platform-{region}.adobe.io` (region ∈ `va7`, `nld2`,
    costs a round-trip.
 6. Never add telemetry, analytics, or outbound calls beyond the documented
    Adobe endpoints.
-7. Run `node --test test` before suggesting a change is done. **113 tests
-   should pass** (as of the 2026-04-28 in-flight-first + sandbox-filter
-   session).
+7. Run `npm test` before suggesting a change is done (use `npm test`, NOT
+   `node --test test` — on Node ≥23 the bare `test` arg is treated as a test
+   name and silently runs nothing; `npm test` → `scripts/run-tests.mjs` which
+   enumerates `test/*.test.js`). **230 tests should pass** (as of the 2026-05-31
+   R4.1 quota-rebuild adversarial-review session).
 8. **After your change**, append a bullet to the current session in
    `docs/CHANGELOG.md` describing what + why. If you changed the module map,
    data flow, Adobe contract, or DB schema, also update `docs/ARCHITECTURE.md`.

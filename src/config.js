@@ -92,8 +92,8 @@ export const config = {
   dailyIdentifierLimit: Number(process.env.DAILY_IDENTIFIER_LIMIT) || 1_000_000,
   // Monthly identifier cap — FALLBACK ONLY (live Adobe /quota wins). Adobe
   // always enforces a monthly cap, so there is no "disable monthly" option
-  // (review R4 #4). Default 3M/month matches the typical base entitlement.
-  monthlyIdentifierLimit: numEnv('MONTHLY_IDENTIFIER_LIMIT', 3_000_000),
+  // (review R4 #4); a 0 is coerced to the 3M default, never "unlimited".
+  monthlyIdentifierLimit: numEnv('MONTHLY_IDENTIFIER_LIMIT', 3_000_000) || 3_000_000,
   requestTimeoutMs: Number(process.env.REQUEST_TIMEOUT_MS) || 60_000,
 
   // ─── Security ──────────────────────────────────────────────────────

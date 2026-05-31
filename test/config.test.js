@@ -35,9 +35,9 @@ test('DATA_DIR relocates db, uploads, and output (not just the key)', () => {
   assert.ok(cfg.outputDir.startsWith(dir + '/'), `outputDir should be under DATA_DIR, got ${cfg.outputDir}`);
 });
 
-test('MONTHLY_IDENTIFIER_LIMIT=0 disables monthly tracking (stays 0, not 3M)', () => {
+test('MONTHLY_IDENTIFIER_LIMIT=0 coerces to the 3M default (no "disable monthly", review R4 #4)', () => {
   const cfg = loadConfigWith({ MONTHLY_IDENTIFIER_LIMIT: '0' });
-  assert.equal(cfg.monthly, 0, '0 must be preserved as "monthly tracking disabled"');
+  assert.equal(cfg.monthly, 3_000_000, '0 is no longer "disabled" — Adobe always enforces a monthly cap');
 });
 
 test('MONTHLY_IDENTIFIER_LIMIT unset falls back to the 3M default', () => {

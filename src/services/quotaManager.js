@@ -122,18 +122,21 @@ export function reactivate(workOrderId) {
 }
 
 /**
- * A work order reached a terminal Adobe state (Adobe accepted + counted it).
- * Atomically move its reservation into adobe_floor: deactivate the row AND
- * `floor += count` for its period. effective_used is unchanged at this instant
- * (it just moves from "ours, in-flight" to "Adobe-observed"), so there is no
- * double-count and no lag window. No-op if there is no active reservation.
+ * A work order reached a terminal Adobe state. Adobe has long since counted it
+ * (a 'completed'/'failed' terminal is days after the request was accepted, and
+ * accepted requests count immediately), so it is already reflected in Adobe's
+ * `/quota` — i.e. in `adobe_floor` once the next `seedFloor` runs. We therefore
+ * just DEACTIVATE its reservation, removing it from the active sum so it isn't
+ * counted twice (once via adobe_floor, once via the active reservation).
+ *
+ * We deliberately do NOT additively bump adobe_floor here: seedFloor sets the
+ * floor to Adobe's ABSOLUTE consumed via MAX, and an additive bump would either
+ * be swallowed by a later MAX (losing the count → over-ship) or stack on top of
+ * a MAX that already included this WO (permanent double-count → over-defer).
+ * Deactivate-only keeps `effective = adobe_floor + Σ active` exact in steady
+ * state; the only residual is a SAFE transient over-defer for a WO that Adobe
+ * has counted but that we haven't deactivated yet (it never over-ships).
  */
 export function complete(workOrderId) {
-  db.transaction(() => {
-    const r = q().getReservation.get(workOrderId);
-    if (!r || !r.active) return;
-    q().bumpDailyFloor.run(r.ims_org_id, r.utc_date, r.count);
-    q().bumpMonthlyFloor.run(r.ims_org_id, r.utc_year_month, r.count);
-    q().deactivateReservation.run(workOrderId);
-  })();
+  q().deactivateReservation.run(workOrderId);
 }

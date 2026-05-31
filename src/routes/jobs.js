@@ -328,6 +328,10 @@ router.delete('/:id', async (req, res, next) => {
       return next(err);
     }
 
+    // Drop this job's quota reservations FIRST (while its work_orders still
+    // exist for the subquery) — quota_reservations isn't cascaded, and a left-
+    // behind ACTIVE reservation would keep consuming the org's cap (review R4.1).
+    q().deleteReservationsForJob.run(jobId);
     // CASCADE FK constraints on expanded_identities + work_orders collapse all
     // dependent rows in this single statement (the deletion is atomic).
     q().deleteJob.run(jobId);

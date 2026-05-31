@@ -323,6 +323,12 @@ export async function reconcileJobOrphans(jobId) {
 /** Top-level entrypoint called by src/index.js after the DB is ready. */
 export async function runStartupRecovery() {
   try {
+    // GC quota reservations whose work order no longer exists (force-deleted
+    // job, etc.) so a stale ACTIVE reservation can't keep consuming the org's
+    // cap (review R4.1).
+    const gced = q().gcOrphanReservations.run().changes;
+    if (gced > 0) logger.info({ orphanReservations: gced }, 'startup: GC\'d orphan quota reservations');
+
     const [expanded, reconciled] = await Promise.all([
       resumeExpandingJobs(),
       reconcileOrphanWorkOrders(),

@@ -237,12 +237,8 @@ export function initDb() {
     // ALL open work orders instead of re-polling the first 100 by rowid every
     // tick (which starved order #101+ on large jobs). NULL = never polled.
     { table: 'work_orders', column: 'last_polled_at', type: 'TEXT' },
-    // Review finding #4 (R2): the EFFECTIVE monthly limit passed to reserve()
-    // for this WO. NULL = monthly tracking was off at reserve time (or a
-    // legacy/never-reserved row). Recovery releases using THIS value, not the
-    // job row's monthly_limit, so reserve and release always agree on the
-    // monthly dimension (no monthly-ledger leak on rollback).
-    { table: 'work_orders', column: 'reserved_monthly', type: 'INTEGER' },
+    // (R2's work_orders.reserved_monthly migration was removed in R4 — the
+    // per-WO quota_reservations table replaced the reserved_monthly approach.)
     // Review #2 (R2): cumulative count of linked members the Identity Graph
     // returned for the job. Persisted (not just run-local) so the empty-graph
     // fail-closed check is correct across a crash + resume.
@@ -581,9 +577,6 @@ function prepared() {
        LIMIT 100
     `),
     stampWorkOrderPolled: db.prepare(`UPDATE work_orders SET last_polled_at = datetime('now') WHERE id = ?`),
-    // Records the effective monthly limit reserve() used for this WO (review
-    // finding #4). Recovery reads it back to release the SAME dimensions.
-    setReservedMonthly: db.prepare(`UPDATE work_orders SET reserved_monthly = ? WHERE id = ?`),
     countWorkOrdersByStatus: db.prepare(`
       SELECT status, COUNT(*) AS count FROM work_orders WHERE job_id = ? GROUP BY status
     `),
@@ -593,16 +586,28 @@ function prepared() {
     // potentially millions of rows. Caller is responsible for cleaning up
     // associated filesystem artefacts (uploaded CSV, exported CSV).
     deleteJob: db.prepare('DELETE FROM jobs WHERE id = ?'),
+    // quota_reservations is keyed by work_order_id but NOT cascaded from jobs
+    // (it has no job_id). Delete a job's reservations explicitly BEFORE the job
+    // (the job-delete cascades the work_orders away). An ACTIVE reservation left
+    // behind would keep counting toward the org's cap forever (review R4.1).
+    deleteReservationsForJob: db.prepare(`
+      DELETE FROM quota_reservations
+       WHERE work_order_id IN (SELECT id FROM work_orders WHERE job_id = ?)
+    `),
+    // Startup GC: drop reservations whose work order no longer exists (covers a
+    // force-delete, a pre-FK DB, or any other orphan).
+    gcOrphanReservations: db.prepare(`
+      DELETE FROM quota_reservations
+       WHERE work_order_id NOT IN (SELECT id FROM work_orders)
+    `),
 
     // ─── Quota: Adobe-observed floor (per period) ─────────────────────
     // adobe_floor = org-wide consumed as observed by Adobe. Raised two ways:
-    //   • seedFloor → MAX(floor, live /quota consumed)  (absolute, handles lag)
-    //   • complete()→ floor += a completed WO's count   (additive; moves it out
-    //     of active reservations). MAX and += COMPOSE safely: MAX never lowers,
-    //     so a later seedFloor whose Adobe number already includes that WO
-    //     keeps the same value (no double-count); if others consumed more, MAX
-    //     raises it. (`used` column is vestigial post-R4 — reservations replace
-    //     it; left at 0.)
+    //   • seedFloor → MAX(floor, live /quota consumed) — Adobe's ABSOLUTE
+    //     observed value. This is the ONLY way the floor rises: a completed WO
+    //     is already in Adobe's /quota, so complete() merely deactivates its
+    //     reservation (no additive bump — that would double-count vs the MAX).
+    //     (`used` column is vestigial post-R4 — reservations replace it; 0.)
     getDailyFloor:   db.prepare(`SELECT adobe_floor FROM quota_usage WHERE ims_org_id = ? AND utc_date = ?`),
     getMonthlyFloor: db.prepare(`SELECT adobe_floor FROM quota_usage_monthly WHERE ims_org_id = ? AND utc_year_month = ?`),
     maxDailyFloor: db.prepare(`
@@ -612,14 +617,6 @@ function prepared() {
     maxMonthlyFloor: db.prepare(`
       INSERT INTO quota_usage_monthly (ims_org_id, utc_year_month, used, adobe_floor) VALUES (?, ?, 0, ?)
       ON CONFLICT(ims_org_id, utc_year_month) DO UPDATE SET adobe_floor = MAX(adobe_floor, excluded.adobe_floor)
-    `),
-    bumpDailyFloor: db.prepare(`
-      INSERT INTO quota_usage (ims_org_id, utc_date, used, adobe_floor) VALUES (?, ?, 0, ?)
-      ON CONFLICT(ims_org_id, utc_date) DO UPDATE SET adobe_floor = adobe_floor + excluded.adobe_floor
-    `),
-    bumpMonthlyFloor: db.prepare(`
-      INSERT INTO quota_usage_monthly (ims_org_id, utc_year_month, used, adobe_floor) VALUES (?, ?, 0, ?)
-      ON CONFLICT(ims_org_id, utc_year_month) DO UPDATE SET adobe_floor = adobe_floor + excluded.adobe_floor
     `),
 
     // ─── Quota: per-work-order reservations (review R4 #1) ─────────────
@@ -657,24 +654,19 @@ function prepared() {
       SELECT w.*,
              j.creds_id      AS j_creds_id,
              j.sandbox_name  AS j_sandbox_name,
-             j.name          AS j_name,
-             j.monthly_limit AS j_monthly_limit
+             j.name          AS j_name
         FROM work_orders w JOIN jobs j ON j.id = w.job_id
        WHERE w.status = 'submitting' AND w.adobe_workorder_id IS NULL
     `),
     // Per-job reconcilable orphans — includes both 'submitting' (uncertain
-    // submit) and 'failed' (e.g. previous-buggy-behaviour where a timeout
-    // marked the WO failed and released quota even though Adobe processed
-    // it). For 'failed' rows the caller needs to re-reserve quota if it
-    // finds the WO in Adobe; for 'submitting' rows the quota was never
-    // released, so no re-reservation is needed.
+    // submit) and 'failed' (a timeout marked the WO failed even though Adobe
+    // processed it). For 'failed' matches the caller re-activates the WO's
+    // reservation (review R4 #1).
     listReconcilableOrphansForJob: db.prepare(`
       SELECT w.*,
              j.creds_id      AS j_creds_id,
              j.sandbox_name  AS j_sandbox_name,
-             j.name          AS j_name,
-             j.monthly_limit AS j_monthly_limit,
-             j.daily_limit   AS j_daily_limit
+             j.name          AS j_name
         FROM work_orders w JOIN jobs j ON j.id = w.job_id
        WHERE w.job_id = ?
          AND w.adobe_workorder_id IS NULL

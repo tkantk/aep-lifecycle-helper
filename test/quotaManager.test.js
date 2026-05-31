@@ -78,17 +78,41 @@ test('reactivate restores a released reservation', () => {
   assert.equal(peek(o, DAILY, MONTHLY).daily.used, 500_000);
 });
 
-test('complete moves a reservation into adobe_floor with effective unchanged', () => {
+test('complete deactivates the reservation (no additive floor bump)', () => {
   const o = org();
   R(o, 'wo1', 400_000);
-  const before = peek(o, DAILY, MONTHLY).daily.used;
   complete('wo1');
-  const after = peek(o, DAILY, MONTHLY).daily.used;
-  assert.equal(after, before, 'effective used unchanged (active → floor)');
-  // The reservation is now inactive; the floor carries it.
+  // The reservation is inactive; it is NOT additively bumped into the floor —
+  // a completed WO is already in Adobe's /quota and is picked up by the next
+  // seedFloor. Bumping here would double-count against seedFloor's MAX.
   assert.equal(q().getReservation.get('wo1').active, 0);
-  const today = new Date().toISOString().slice(0, 10);   // YYYY-MM-DD (UTC)
-  assert.equal(q().getDailyFloor.get(o, today)?.adobe_floor, 400_000);
+  const today = new Date().toISOString().slice(0, 10);
+  assert.equal(q().getDailyFloor.get(o, today)?.adobe_floor ?? 0, 0, 'no additive bump');
+  assert.equal(peek(o, DAILY, MONTHLY).daily.used, 0, 'effective drops (floor 0 + no active)');
+});
+
+test('R4 review HIGH: complete + external consumption cannot over-ship (no MAX-vs-bump loss)', () => {
+  // reserve+complete 'a' (300k), an external tool consumes 600k, Adobe /quota
+  // then reports 900k (it includes our completed 'a'). A new 'b' of 400k would
+  // make 1.3M and MUST be denied. The old additive bump let MAX swallow 'a' and
+  // wrongly granted 'b'.
+  const o = org();
+  R(o, 'a', 300_000); complete('a');
+  seedFloor(o, 900_000, null);              // 600k external + 300k our completed 'a'
+  assert.equal(peek(o, DAILY, null).daily.used, 900_000);
+  assert.equal(R(o, 'b', 400_000, DAILY, null).granted, false, 'must deny — 1.3M > 1M cap');
+});
+
+test('R4 review MEDIUM: seedFloor seeing an active WO then completing it does not permanently double-count', () => {
+  // Adobe counts 'a' fast: seedFloor sees 300k while 'a' is still active →
+  // transient over-count (floor 300k + active 300k = 600k). complete('a') must
+  // resolve it to 300k, not leave a permanent 600k (which would under-grant).
+  const o = org();
+  R(o, 'a', 300_000);
+  seedFloor(o, 300_000, null);
+  assert.equal(peek(o, DAILY, null).daily.used, 600_000, 'transient over-count while active + in floor');
+  complete('a');
+  assert.equal(peek(o, DAILY, null).daily.used, 300_000, 'resolves to 300k, not a permanent 600k');
 });
 
 // ─── review #1: same-day delayed release must not lose ownership ─────────────
@@ -128,21 +152,50 @@ test('R4 #1: releasing a prior-day reservation does not touch today\'s usage', (
   assert.equal(q().getReservation.get('ywo').active, 0, 'and it did deactivate the right (yesterday) row');
 });
 
+// ─── job-delete / orphan cleanup (review R4.1) ──────────────────────────────
+
+test('deleting a job clears its reservations; startup GC removes orphans', () => {
+  const o = `del-org@AcmeOrg`;
+  // Minimal job + work order so the reservation has a referent.
+  q().insertCred.run({ id: 'del-cred', label: 'D', clientName: null, environment: 'prod',
+    region: 'VA7', imsOrgId: o, clientId: 'del-client',
+    enc: Buffer.from('x'), iv: Buffer.alloc(12), tag: Buffer.alloc(16) });
+  q().insertJob.run({ id: 'del-job', name: 'D', credsId: 'del-cred', sandboxName: 'prod',
+    datasetIds: 'ALL', targetServicesJson: null, sourceNamespace: 'hashedKocid',
+    sourceNamespaceId: null, dailyLimit: DAILY, monthlyLimit: MONTHLY, uploadPath: null, totalSourceIds: 0 });
+  q().insertWorkOrder.run({ id: 'del-wo', jobId: 'del-job', dayIndex: 1, datasetIds: 'ALL',
+    targetServicesJson: null, namespacesIdentities: '[]', identifierCount: 100_000, status: 'submitting' });
+
+  R(o, 'del-wo', 100_000);
+  assert.equal(peek(o, DAILY, MONTHLY).daily.used, 100_000);
+
+  // Job-delete path: clear reservations, then the job (cascades the WO away).
+  q().deleteReservationsForJob.run('del-job');
+  q().deleteJob.run('del-job');
+  assert.equal(peek(o, DAILY, MONTHLY).daily.used, 0, 'active reservation must not survive a job delete');
+
+  // And the startup GC removes any reservation with no work order (force-delete).
+  q().upsertReservation.run({ workOrderId: 'ghost-wo', imsOrgId: o, utcDate: new Date().toISOString().slice(0,10), utcMonth: new Date().toISOString().slice(0,7), count: 50_000 });
+  assert.equal(peek(o, DAILY, MONTHLY).daily.used, 50_000);
+  q().gcOrphanReservations.run();
+  assert.equal(peek(o, DAILY, MONTHLY).daily.used, 0, 'orphan reservation (no WO) GC\'d at startup');
+});
+
 // ─── multi-month: completion prevents double-count → full cap usable ─────────
 
-test('R4 #1: completing work + seedFloor reflecting it does not double-count the monthly floor', () => {
+test('R4 #1: multi-month — completed work is accounted via the floor, not double-counted', () => {
   const o = org();
   const monthly = 2_000_000;
-  // Ship 1M (10 WOs of 100k), complete them — each complete() bumps the monthly
-  // floor by 100k (1M total moved from active reservations into the floor).
+  // Ship 1M (10 WOs of 100k) and complete them — complete() just deactivates;
+  // the completed work is reflected by Adobe's /quota, picked up by seedFloor.
   for (let i = 0; i < 10; i++) {
     assert.equal(R(o, `c${i}`, 100_000, DAILY, monthly).granted, true);
     complete(`c${i}`);
   }
-  assert.equal(peek(o, DAILY, monthly).monthly.used, 1_000_000, 'completion moved 1M into the floor');
-  // Adobe's /quota now reports that same 1M consumed. seedFloor MAX must NOT add
-  // on top of the completion bumps — otherwise the monthly cap would halve.
+  // Adobe's /quota now reports the 1M consumed.
   seedFloor(o, 1_000_000, 1_000_000);
   assert.equal(peek(o, DAILY, monthly).monthly.used, 1_000_000,
-    'no double-count: MAX(1M floor, 1M Adobe) stays 1M, not 2M');
+    'monthly used = floor(1M) + active(0) = 1M — no double-count');
+  // The remaining 1M of the monthly cap is still usable (no halving).
+  assert.equal(R(o, 'next', 100_000, 5_000_000, monthly).granted, true);
 });

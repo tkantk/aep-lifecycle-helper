@@ -9,6 +9,40 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-05-31 (R4.1) — Adversarial review of the R4 quota rebuild
+
+An adversarial review (parallel-agent workflow) of the R4 per-WO reservation
+model found the "MAX floor + additive `complete()` bump" combination composes
+**unsafely** on a lagging org-wide counter. Both repros were reproduced
+empirically before fixing, and resolved after.
+
+- **(HIGH) over-ship** — `seedFloor` MAX could swallow our just-completed WO.
+  Scenario: reserve+complete WO `a` (300k, bumped into floor), an external tool
+  consumes 600k, Adobe `/quota` reports 900k (it already includes our `a`).
+  `seedFloor(900k)` MAXes against `floor(300k)` → 900k, but our `a`'s 300k is now
+  counted only once even though the bump had also added it — so a new 400k WO
+  saw room for 1.3M and shipped past the 1M cap. **Fix:** `complete(woId)` is
+  now **deactivate-only** (no floor bump). A completed WO is already in Adobe's
+  `/quota`; the next `seedFloor` picks it up via MAX. `src/services/quotaManager.js`,
+  `src/db.js` (removed `bumpDailyFloor`/`bumpMonthlyFloor`).
+- **(MEDIUM) permanent double-count** — if Adobe counted our WO fast, `seedFloor`
+  saw it (floor += via MAX) *and* the additive bump added it again → a permanent
+  2× that under-granted forever. Same deactivate-only fix resolves it; regression
+  tests added to `quotaManager.test.js` (R4 HIGH + MEDIUM cases).
+- **(MEDIUM) job-delete reservation leak** — deleting a job left its active
+  reservations consuming quota forever. `DELETE /api/jobs/:id` now calls
+  `deleteReservationsForJob` before `deleteJob`; startup adds a
+  `gcOrphanReservations` sweep (reservations with no work order). Test added.
+- **(LOW) `MONTHLY_IDENTIFIER_LIMIT=0`** now coerces to the 3M default via a
+  `numEnv` helper (an explicit `0` env was the only remaining "disable monthly"
+  path after R4 #4). Dead code removed: `setReservedMonthly` statement, the
+  `reserved_monthly` migration, and unused `j_monthly_limit`/`j_daily_limit`
+  SELECT aliases in the two recovery queries.
+
+Suite **227 → 230** pass, 0 fail; `npm audit` clean; migration boot smoke clean.
+
+---
+
 ## 2026-05-31 (R4) — Fourth-round review: quota model rebuilt + lock/monthly fixes
 
 A fourth review showed the quota safety boundary was still bypassable — the
@@ -24,18 +58,18 @@ audit clean.
 New `quota_reservations` table (one row per WO: count + `utc_date` +
 `utc_year_month` + `active`). `effective_used(period) = adobe_floor(period)
 + Σ active reservations(period)`. `adobe_floor` is tracked SEPARATELY from our
-reservations (so it can never absorb them) and raised two ways that compose
-safely: `seedFloor` (MAX with live `/quota` consumed) and the monitor's
-`complete()` (additive `+= a completed WO's count`, atomically moving it out of
-active reservations). `reserve` is keyed by WO id; `release` / `reactivate` /
-`complete` act on the WO's OWN row → exact and period-correct. This fixes the
-same-day ownership loss, the cross-day mis-decrement, AND the latent multi-month
-double-count (which would have halved monthly throughput). `quotaManager` API:
-`reserve({workOrderId,imsOrgId,count,dailyLimit,monthlyLimit})`,
+reservations (so it can never absorb them) and raised by ONE path: `seedFloor`
+(MAX with live `/quota` consumed). `reserve` is keyed by WO id; `release` /
+`reactivate` / `complete` act on the WO's OWN row → exact and period-correct.
+This fixes the same-day ownership loss, the cross-day mis-decrement, AND the
+latent multi-month double-count (which would have halved monthly throughput).
+`quotaManager` API: `reserve({workOrderId,imsOrgId,count,dailyLimit,monthlyLimit})`,
 `release(woId)`, `reactivate(woId)`, `complete(woId)`, `seedFloor`, `peek`.
 Wired through `submission.js`, `recovery.js`, and a new `monitor.js` completion
 hook. Tests in `quotaManager.test.js` (same-day delayed release, cross-day,
-multi-month no-double-count).
+multi-month no-double-count). **See R4.1 below for the `complete()` fix — the
+original additive-floor-bump in this entry was found unsafe by adversarial
+review and removed before merge.**
 
 ### #2 (blocker) — submit requires a FRESH /quota
 
