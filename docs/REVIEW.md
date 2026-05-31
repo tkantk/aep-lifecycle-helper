@@ -163,8 +163,9 @@ with auto-populated forms and live quota banners.
 │              │      fresh numbers (work may shift to a later month).
 │              │   c. For each planned OR deferred order in target
 │              │      (month, day) bucket (p-limit 2):
-│              │       - reserve(imsOrgId, count, dailyLimit, monthlyLimit)
-│              │         — atomic SQLite UPSERT, both dimensions.
+│              │       - reserve({workOrderId, imsOrgId, count, dailyLimit,
+│              │         monthlyLimit}) — per-WO row; caps are live /quota
+│              │         × (1 − QUOTA_SAFETY_BUFFER) (R5/R6).
 │              │       - If not granted → mark 'deferred', skip.
 │              │       - If granted → POST /data/core/hygiene/workorder.
 │              │         POST is non-idempotent: NO retry on 5xx/network.

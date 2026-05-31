@@ -1,6 +1,6 @@
 import pLimit from 'p-limit';
 import { v4 as uuid } from 'uuid';
-import { submitWorkOrder } from '../services/hygiene.js';
+import { submitWorkOrder, normalizeDisplayName } from '../services/hygiene.js';
 import { reserve, release, markAccepted, seedFloor } from '../services/quotaManager.js';
 import { getOrgQuota } from '../services/quotaApi.js';
 import { redistributeUnshippedOrders } from './redistributor.js';
@@ -12,11 +12,6 @@ import { decryptCreds } from '../utils/crypto.js';
 // Module-level set guards against two concurrent runSubmission calls for the
 // same job in the same process (e.g. user double-clicks the Submit button).
 const inFlight = new Set();
-
-// Adobe truncates a work-order displayName to 255 chars (see hygiene.js). We
-// build the name UUID-first and slice to the same bound so the stored copy
-// equals what Adobe receives and the UUID always survives (review R6 #2).
-const MAX_DISPLAY_NAME = 255;
 
 /**
  * Work-order planning and submission.
@@ -408,9 +403,10 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
       try {
         // The EXACT displayName Adobe will store. UUID FIRST so the unique key
         // survives Adobe's 255-char truncation even for a long job name — orphan
-        // recovery matches on this value (review R6 #2). Truncate here so the
-        // stored copy equals what Adobe receives (hygiene also slices at 255).
-        const displayName = `WO ${wo.id} - Delete ${job.name}`.slice(0, MAX_DISPLAY_NAME);
+        // recovery matches on this value (review R6 #2). normalizeDisplayName is
+        // the SHARED, idempotent transform submitWorkOrder also applies, so the
+        // stored copy byte-equals what Adobe receives (incl. trailing-whitespace).
+        const displayName = normalizeDisplayName(`WO ${wo.id} - Delete ${job.name}`);
 
         // Durably commit the reserve + 'submitting' intent + the exact
         // displayName before the non-idempotent POST (review #8 + R6 #2), via a

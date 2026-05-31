@@ -223,6 +223,40 @@ test('R6 #2: displayName is UUID-first, persisted before POST, and survives 255-
   assert.equal(stored, sentDisplayName, 'work_orders.display_name equals exactly what Adobe received');
 });
 
+test('R6 #2: a trailing-whitespace job name still yields stored display_name === POSTed value (recovery match holds)', async () => {
+  // hygiene trims before POST; if submission persisted an UN-trimmed name, the
+  // stored copy would diverge from Adobe's stored value and recovery's exact
+  // match would never find the WO. The shared idempotent normalizeDisplayName
+  // guarantees stored === posted for ANY whitespace-padded name.
+  seq++;
+  const credsId = storeCreds({
+    label: `WS ${seq}`, environment: 'prod', region: 'VA7',
+    imsOrgId: `ws-org-${seq}@AcmeOrg`, clientId: `ws-client-${seq}`, clientSecret: 'secret',
+  });
+  const jobId = `ws-job-${seq}`;
+  q().insertJob.run({ id: jobId, name: 'Q1 Batch   ', credsId, sandboxName: 'prod',   // trailing spaces
+    datasetIds: 'ALL', targetServicesJson: null, sourceNamespace: 'hashedKocid', sourceNamespaceId: null,
+    dailyLimit: 1_000_000, monthlyLimit: 3_000_000, uploadPath: null, totalSourceIds: 0 });
+  q().updateJobStatus.run('ready', null, jobId);
+  q().insertWorkOrder.run({ id: `${jobId}-wo-0`, jobId, dayIndex: 1, datasetIds: 'ALL', targetServicesJson: null,
+    namespacesIdentities: JSON.stringify([{ namespace: { code: 'email', id: 6 }, ids: ['a@x.com'] }]),
+    identifierCount: 100_000, status: 'planned' });
+
+  mockIms();
+  mockOrgQuota({ dailyRemaining: 1_000_000 });
+  let sent = null;
+  nock(GATEWAY).persist().post('/data/core/hygiene/workorder').reply(200, (_uri, body) => {
+    sent = body.displayName;
+    return { workorderId: 'DI-ws', status: 'received', createdAt: '2026-05-31T00:00:00Z' };
+  });
+
+  await runSubmission({ jobId });
+
+  const stored = q().getAllOrdersForJob.all(jobId)[0].display_name;
+  assert.equal(stored, sent, 'stored display_name byte-equals the POSTed (trimmed) value');
+  assert.ok(!/\s$/.test(stored), 'no trailing whitespace survives — matches Adobe\'s stored value');
+});
+
 test('R5 finding #1: a successfully-submitted WO has an ACCEPTED, held reservation (not released on terminal)', async () => {
   // The over-ship fix (R5): submission.js must call markAccepted on a 2xx, so the
   // reservation is accepted=1. An accepted reservation can never be released and
