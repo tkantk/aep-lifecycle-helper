@@ -96,6 +96,17 @@ export const config = {
   monthlyIdentifierLimit: numEnv('MONTHLY_IDENTIFIER_LIMIT', 3_000_000) || 3_000_000,
   requestTimeoutMs: Number(process.env.REQUEST_TIMEOUT_MS) || 60_000,
 
+  // Fraction (0..0.95) of each Adobe quota held back as headroom for CONCURRENT
+  // EXTERNAL writers (review R6 #3). This tool's zero-over-ship guarantee covers
+  // only ITS OWN accounting: Adobe `/quota` is ORG-WIDE and we snapshot it once
+  // per submit run, so another UI user / API client / second helper instance in
+  // the same org can consume quota between our snapshot and our submit, and we
+  // can't see it until the next run. If you CANNOT guarantee this tool is the
+  // only writer, set e.g. QUOTA_SAFETY_BUFFER=0.1 to reserve 10% as a margin.
+  // Default 0 assumes operational exclusivity. Clamped to [0, 0.95] so a typo
+  // can never drive the effective cap to zero-or-negative.
+  quotaSafetyBuffer: Math.min(0.95, Math.max(0, numEnv('QUOTA_SAFETY_BUFFER', 0))),
+
   // ─── Security ──────────────────────────────────────────────────────
   // 32-byte hex key used to encrypt client secrets at rest. Auto-generated
   // and stored in data/ on first run if not provided. Don't commit this.

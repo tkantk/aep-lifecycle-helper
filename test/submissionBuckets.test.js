@@ -185,6 +185,44 @@ test('runSubmission fails closed when /quota has no recognized daily entitlement
   assert.equal(posts, 0, 'no work order may ship when the daily entitlement is unrecognized');
 });
 
+test('R6 #2: displayName is UUID-first, persisted before POST, and survives 255-char truncation on a long job name', async () => {
+  // Seed a job whose name alone exceeds Adobe's 255-char displayName cap.
+  seq++;
+  const longName = 'L'.repeat(300);
+  const credsId = storeCreds({
+    label: `Long ${seq}`, environment: 'prod', region: 'VA7',
+    imsOrgId: `long-org-${seq}@AcmeOrg`, clientId: `long-client-${seq}`, clientSecret: 'secret',
+  });
+  const jobId = `long-job-${seq}`;
+  q().insertJob.run({ id: jobId, name: longName, credsId, sandboxName: 'prod',
+    datasetIds: 'ALL', targetServicesJson: null, sourceNamespace: 'hashedKocid', sourceNamespaceId: null,
+    dailyLimit: 1_000_000, monthlyLimit: 3_000_000, uploadPath: null, totalSourceIds: 0 });
+  q().updateJobStatus.run('ready', null, jobId);
+  const woId = `${jobId}-wo-0`;
+  q().insertWorkOrder.run({ id: woId, jobId, dayIndex: 1, datasetIds: 'ALL', targetServicesJson: null,
+    namespacesIdentities: JSON.stringify([{ namespace: { code: 'email', id: 6 }, ids: ['a@x.com'] }]),
+    identifierCount: 100_000, status: 'planned' });
+
+  mockIms();
+  mockOrgQuota({ dailyRemaining: 1_000_000 });
+  let sentDisplayName = null;
+  nock(GATEWAY).persist().post('/data/core/hygiene/workorder').reply(200, (_uri, body) => {
+    sentDisplayName = body.displayName;
+    return { workorderId: 'DI-long', status: 'received', createdAt: '2026-05-31T00:00:00Z' };
+  });
+
+  await runSubmission({ jobId });
+
+  assert.ok(sentDisplayName, 'a displayName was POSTed');
+  assert.ok(sentDisplayName.length <= 255, `sent displayName must be ≤255 (was ${sentDisplayName.length})`);
+  assert.ok(sentDisplayName.startsWith(`WO ${woId} `), 'displayName is UUID-first so the unique key survives truncation');
+  assert.ok(sentDisplayName.includes(woId), 'the full work-order UUID is present in the sent name');
+
+  // The exact sent value is persisted durably for recovery to match against.
+  const stored = q().getAllOrdersForJob.all(jobId)[0].display_name;
+  assert.equal(stored, sentDisplayName, 'work_orders.display_name equals exactly what Adobe received');
+});
+
 test('R5 finding #1: a successfully-submitted WO has an ACCEPTED, held reservation (not released on terminal)', async () => {
   // The over-ship fix (R5): submission.js must call markAccepted on a 2xx, so the
   // reservation is accepted=1. An accepted reservation can never be released and

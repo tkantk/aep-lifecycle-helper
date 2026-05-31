@@ -539,6 +539,17 @@ Adobe's `operationCount` in the POST work-order response is logged when it
 diverges from our pre-submit `total` — drift detector for identifier-
 counting discrepancies without needing a live delete to verify.
 
+**External-writer caveat (review R6 #3).** `/quota` is ORG-WIDE and we snapshot
+it ONCE per submit run, then grant local reservations against it. The R5
+hold-until-rollover model gives zero over-ship **for this tool's own
+accounting** — but it cannot see a CONCURRENT external writer (another UI user,
+API client, or a second helper instance in the same org) who consumes quota
+between our snapshot and our submit. The mitigations are operational: ensure
+this tool is the only writer, or set `QUOTA_SAFETY_BUFFER` (fraction 0..0.95,
+default 0) to hold back headroom. `runner/submission.js` applies it as
+`liveCap = floor(quota × (1 − buffer))`. Do NOT claim "zero over-ship" without
+this qualifier.
+
 ### I16. Configurable auto-resume scheduler is opt-in and routes through `runSubmission`
 
 `runner/scheduler.js` provides a setInterval(60s) tick that resubmits
@@ -686,13 +697,18 @@ These are NOT yet implemented but are worth flagging if the user asks:
 3. **Audit export.** We have `api_audit` in the schema but no write path
    yet. If the client needs SOC-style audit logs, wire logging in
    `adobeClient.js` to insert one row per Adobe call.
-4. **Implement the recovery list-without-filter fallback.** When Adobe's
-   `GET /hygiene/workorder?displayName=…` returns 400, the recovery
-   path currently leaves the orphan in `submitting` (safer than rolling
-   back, since rolling back risks duplicates). The originally documented
-   fallback was to list recent orders without the filter and match
-   client-side. Add it if Adobe ever breaks the displayName filter for
-   real and we need automated recovery rather than operator triage.
+4. **Operator-resolution UI for indeterminate orphans.** Recovery NEVER
+   auto-rolls-back an uncertain orphan (review R6 #1): on ANY no-match
+   (recognized-empty list, 400, or transient error) the WO is LEFT in
+   `submitting` with its reservation HELD, because Adobe's async work-order
+   creation gives no read-after-write guarantee — a missing list entry does
+   not prove absence, and rolling back would risk a duplicate irreversible
+   delete on retry. Today the operator resolves these by checking Adobe's UI
+   and either force-deleting (tombstone kept) or letting a later reconcile
+   match once Adobe's list catches up. A future enhancement: an explicit
+   "I confirmed this is absent in Adobe — roll back & retry" operator action,
+   and/or the list-without-filter fallback (match recent orders client-side)
+   for when Adobe's displayName filter itself 400s.
 
 **Already done (don't ask again):**
 - Resume a job across restarts — `runner/recovery.js::resumeExpandingJobs`
@@ -752,8 +768,8 @@ which require `https://platform-{region}.adobe.io` (region ∈ `va7`, `nld2`,
 7. Run `npm test` before suggesting a change is done (use `npm test`, NOT
    `node --test test` — on Node ≥23 the bare `test` arg is treated as a test
    name and silently runs nothing; `npm test` → `scripts/run-tests.mjs` which
-   enumerates `test/*.test.js`). **237 tests should pass** (as of the 2026-05-31
-   R5 hold-until-rollover quota-lifecycle session).
+   enumerates `test/*.test.js`). **241 tests should pass** (as of the 2026-05-31
+   R6 recovery-safety session — UUID-first displayName + indeterminate-on-no-match).
 8. **After your change**, append a bullet to the current session in
    `docs/CHANGELOG.md` describing what + why. If you changed the module map,
    data flow, Adobe contract, or DB schema, also update `docs/ARCHITECTURE.md`.

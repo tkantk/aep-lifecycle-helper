@@ -20,7 +20,7 @@ process.env.DB_PATH = dbPath;
 process.env.UPLOAD_DIR = os.tmpdir();
 process.env.OUTPUT_DIR = os.tmpdir();
 
-const { initDb, q } = await import('../src/db.js');
+const { initDb, q, db } = await import('../src/db.js');
 const { storeCreds } = await import('../src/utils/crypto.js');
 const { reconcileOrphanWorkOrders, resumeExpandingJobs } = await import('../src/runner/recovery.js');
 const { reserve, peek } = await import('../src/services/quotaManager.js');
@@ -29,7 +29,14 @@ const GATEWAY = 'https://platform.adobe.io';
 
 before(() => { initDb(); });
 
-afterEach(() => { nock.cleanAll(); });
+// Wipe per-test state. Recovery now leaves un-matched orphans in 'submitting'
+// (R6 #1 — no unsafe auto-rollback), so without this they would accumulate and
+// a later reconcileOrphanWorkOrders() would process prior tests' orphans against
+// the current test's single nock mock → spurious live retries.
+afterEach(() => {
+  nock.cleanAll();
+  db.exec('DELETE FROM quota_reservations; DELETE FROM work_orders; DELETE FROM jobs;');
+});
 
 after(() => {
   for (const ext of ['', '-wal', '-shm']) {
@@ -62,7 +69,7 @@ function seedCredAndJob({ status = 'submitting', name = 'test-job' } = {}) {
   return { credsId, jobId };
 }
 
-function seedOrphanWorkOrder(jobId, localId) {
+function seedOrphanWorkOrder(jobId, localId, displayName = null) {
   q().insertWorkOrder.run({
     id: localId, jobId, dayIndex: 1,
     datasetIds: 'ALL', targetServicesJson: null,
@@ -72,6 +79,7 @@ function seedOrphanWorkOrder(jobId, localId) {
     identifierCount: 2,
     status: 'submitting',   // stuck mid-submit
   });
+  if (displayName) q().setWorkOrderSubmittingWithName.run({ id: localId, displayName });
 }
 
 function mockIms() {
@@ -82,10 +90,18 @@ function mockIms() {
 
 // ─── reconcileOrphanWorkOrders ────────────────────────────────────────────────
 
-test('reconcile: Adobe has no matching displayName → roll back to planned', async () => {
+test('R6 #1: Adobe list has no match for an uncertain POST → INDETERMINATE (stays submitting, NOT rolled back)', async () => {
+  // A recognized-but-empty list does NOT prove Adobe never received the POST —
+  // work-order creation is async and Adobe gives no read-after-write contract.
+  // Rolling back to 'planned' + releasing would let the next submit re-POST a
+  // work order Adobe may already be processing → DUPLICATE irreversible delete.
+  // So a no-match is treated as indeterminate: leave the orphan in 'submitting',
+  // hold its reservation, and surface it for operator reconciliation.
   const { jobId } = seedCredAndJob({ name: 'match-miss' });
   const localId = `wo-miss-${seq}`;
   seedOrphanWorkOrder(jobId, localId);
+  // The orphan holds a pending reservation (reserved, POST outcome unknown).
+  reserve({ workOrderId: localId, imsOrgId: `org-${seq}@AcmeOrg`, count: 2, dailyLimit: 1_000_000, monthlyLimit: null });
 
   mockIms();
   nock(GATEWAY)
@@ -97,8 +113,37 @@ test('reconcile: Adobe has no matching displayName → roll back to planned', as
   assert.equal(count, 1);
 
   const wo = q().getAllOrdersForJob.all(jobId)[0];
-  assert.equal(wo.status, 'planned');
-  assert.match(wo.last_error || '', /rolled back/);
+  assert.equal(wo.status, 'submitting', 'must NOT roll back — absence is not proven');
+  assert.equal(q().getReservation.get(localId).active, 1, 'reservation stays held (not released)');
+  assert.match(wo.last_error || '', /unconfirmed|not yet listed|reconcil/i);
+});
+
+test('R6 #2: recovery matches a long-job-name orphan via the stored UUID-first display_name', async () => {
+  // A long job name truncated at 255 would drop a trailing UUID, making the WO
+  // invisible to recovery → false "absent". The fix: a UUID-FIRST displayName is
+  // persisted durably (work_orders.display_name) before the POST, and recovery
+  // matches that exact stored value (not a reconstruction). The orphan is then
+  // correctly found and accepted, never lost.
+  const longName = 'X'.repeat(300);
+  const { jobId } = seedCredAndJob({ name: longName });
+  const localId = `wo-long-${seq}`;
+  const sentName = `WO ${localId} - Delete ${longName}`.slice(0, 255);   // UUID survives at the front
+  seedOrphanWorkOrder(jobId, localId, sentName);
+  reserve({ workOrderId: localId, imsOrgId: `org-${seq}@AcmeOrg`, count: 2, dailyLimit: 1_000_000, monthlyLimit: null });
+  assert.ok(sentName.includes(localId), 'precondition: the UUID survives 255-char truncation');
+
+  mockIms();
+  nock(GATEWAY)
+    .get(/\/data\/core\/hygiene\/workorder/)
+    .query(true)
+    .reply(200, { results: [{ workorderId: 'DI-long-1', displayName: sentName, status: 'received', createdAt: '2026-05-31T00:00:00Z' }] });
+
+  await reconcileOrphanWorkOrders();
+
+  const wo = q().getAllOrdersForJob.all(jobId)[0];
+  assert.equal(wo.status, 'submitted', 'matched by stored display_name → recorded as submitted');
+  assert.equal(wo.adobe_workorder_id, 'DI-long-1');
+  assert.equal(q().getReservation.get(localId).accepted, 1, 'matched orphan is marked accepted (held)');
 });
 
 test('reconcile: Adobe finds matching work order → record Adobe ID', async () => {
@@ -245,26 +290,24 @@ test('reconcile: transient error leaves orphan alone for next startup', async ()
   assert.equal(wo.adobe_workorder_id, null);
 });
 
-test('reconcile: rollback releases the WO reservation on BOTH dimensions (review R4 #1)', async () => {
-  // The per-WO reservation records both the daily and monthly period; an
-  // orphan rollback (Adobe didn't process it) deactivates it by WO id, freeing
-  // both dimensions exactly — no monthly leak, no cross-period mis-decrement.
-  const { jobId } = seedCredAndJob({ name: 'monthly-leak' });
+test('R6 #1: a no-match does NOT release the reservation (held until operator resolution, no over-ship/duplicate)', async () => {
+  // Pre-R6 this rolled back + released on a no-match. That was unsafe: if Adobe
+  // had actually processed the (uncertain) POST, releasing freed quota Adobe
+  // spent AND the next submit re-POSTed a duplicate. R6 holds the reservation
+  // and keeps the WO in 'submitting' — the SAFE direction (over-defer until the
+  // operator confirms, never over-ship, never duplicate).
+  const { jobId } = seedCredAndJob({ name: 'held-on-nomatch' });
   const imsOrgId = `org-${seq}@AcmeOrg`;
-  const localId = `wo-mleak-${seq}`;
+  const localId = `wo-held-${seq}`;
   seedOrphanWorkOrder(jobId, localId);          // identifier_count = 2
   const COUNT = 2;
 
-  // Submission reserved this WO against both dimensions.
   const r = reserve({ workOrderId: localId, imsOrgId, count: COUNT, dailyLimit: 1_000_000, monthlyLimit: 3_000_000 });
   assert.equal(r.granted, true);
   assert.equal(peek(imsOrgId, 1_000_000, 3_000_000).daily.used, COUNT);
-  assert.equal(peek(imsOrgId, 1_000_000, 3_000_000).monthly.used, COUNT);
 
   mockIms();
-  // persist: this run reconciles EVERY orphan in the DB (including any left
-  // 'submitting' by earlier tests); all must get the empty-results response.
-  nock(GATEWAY).persist()
+  nock(GATEWAY)
     .get(/\/data\/core\/hygiene\/workorder/)
     .query(true)
     .reply(200, { results: [], total: 0, count: 0 });
@@ -272,10 +315,10 @@ test('reconcile: rollback releases the WO reservation on BOTH dimensions (review
   await reconcileOrphanWorkOrders();
 
   const after = peek(imsOrgId, 1_000_000, 3_000_000);
-  assert.equal(after.daily.used, 0, 'daily reservation released');
-  assert.equal(after.monthly.used, 0, 'monthly reservation released too (no leak)');
+  assert.equal(after.daily.used, COUNT, 'reservation still HELD (not released on an unproven absence)');
+  assert.equal(after.monthly.used, COUNT, 'monthly still held too');
   const wo = q().getAllOrdersForJob.all(jobId)[0];
-  assert.equal(wo.status, 'planned');
+  assert.equal(wo.status, 'submitting', 'stays submitting for operator reconciliation — never auto-rolled-back');
 });
 
 // ─── resumeExpandingJobs ──────────────────────────────────────────────────────

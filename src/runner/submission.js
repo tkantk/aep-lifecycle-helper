@@ -13,6 +13,11 @@ import { decryptCreds } from '../utils/crypto.js';
 // same job in the same process (e.g. user double-clicks the Submit button).
 const inFlight = new Set();
 
+// Adobe truncates a work-order displayName to 255 chars (see hygiene.js). We
+// build the name UUID-first and slice to the same bound so the stored copy
+// equals what Adobe receives and the UUID always survives (review R6 #2).
+const MAX_DISPLAY_NAME = 255;
+
 /**
  * Work-order planning and submission.
  *
@@ -362,9 +367,17 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
     }
 
     // Live caps from the (fresh, validated-above) /quota snapshot. Both
-    // dimensions are guaranteed present by the guards above.
-    const liveDailyLimit   = quotaSnapshot.daily.quota;
-    const liveMonthlyLimit = quotaSnapshot.monthly.quota;
+    // dimensions are guaranteed present by the guards above. The optional safety
+    // buffer (review R6 #3) holds back a fraction as headroom for concurrent
+    // EXTERNAL writers we can't see between this once-per-run snapshot and our
+    // submit — our zero-over-ship guarantee otherwise assumes exclusive access.
+    const buffer = config.quotaSafetyBuffer || 0;
+    const liveDailyLimit   = Math.floor(quotaSnapshot.daily.quota   * (1 - buffer));
+    const liveMonthlyLimit = Math.floor(quotaSnapshot.monthly.quota * (1 - buffer));
+    if (buffer > 0) {
+      logger.info({ jobId, buffer, liveDailyLimit, liveMonthlyLimit },
+        'applying quota safety buffer for external writers');
+    }
 
     // Raise the Adobe-observed floor (MAX) to the live consumed numbers BEFORE
     // any reserve, so reserve() enforces Adobe's true remaining. The floor is
@@ -393,11 +406,18 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
       }
 
       try {
-        // Durably commit the reserve + 'submitting' intent before the
-        // non-idempotent POST (review #8), via a synchronous=FULL commit rather
-        // than a (reader-blocking) wal_checkpoint (review #6). Fail CLOSED: if
-        // the durable write errors, do NOT POST — release and defer for retry.
-        if (!setWorkOrderSubmittingDurable(wo.id)) {
+        // The EXACT displayName Adobe will store. UUID FIRST so the unique key
+        // survives Adobe's 255-char truncation even for a long job name — orphan
+        // recovery matches on this value (review R6 #2). Truncate here so the
+        // stored copy equals what Adobe receives (hygiene also slices at 255).
+        const displayName = `WO ${wo.id} - Delete ${job.name}`.slice(0, MAX_DISPLAY_NAME);
+
+        // Durably commit the reserve + 'submitting' intent + the exact
+        // displayName before the non-idempotent POST (review #8 + R6 #2), via a
+        // synchronous=FULL commit rather than a (reader-blocking) wal_checkpoint
+        // (review #6). Fail CLOSED: if the durable write errors, do NOT POST —
+        // release and defer for retry.
+        if (!setWorkOrderSubmittingDurable(wo.id, displayName)) {
           release(wo.id);
           q().updateWorkOrderStatus.run(
             'deferred', 'durability not confirmed; will retry next run', wo.id);
@@ -412,7 +432,7 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
           creds,
           sandboxName: job.sandbox_name,
           datasetId: wo.dataset_ids || job.dataset_ids,
-          displayName: `Delete ${job.name} - WO ${wo.id}`,
+          displayName,
           description: `Bulk delete (Job ${jobId.slice(0, 8)}, Day ${wo.day_index})`,
           targetServices,
           namespacesIdentities,

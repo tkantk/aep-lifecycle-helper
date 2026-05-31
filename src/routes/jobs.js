@@ -232,9 +232,14 @@ router.post('/:id/approve-month', (req, res, next) => {
  *  Response: { matched, rolledBack, indeterminate, stillFailed, perWoError, total }
  *
  *  - matched        → found in Adobe, status now 'submitted', Adobe ID recorded
- *  - rolledBack     → 'submitting' WO confirmed absent in Adobe → 'planned'
+ *                     (markAccepted, or reactivate if it was 'failed')
+ *  - indeterminate  → a 'submitting' WO with NO match (absence unproven — async
+ *                     creation may lag) OR a 400 from the lookup. Left in
+ *                     'submitting' with its reservation HELD for operator
+ *                     reconciliation; NEVER auto-rolled-back (review R6 #1).
  *  - stillFailed    → 'failed' WO confirmed absent in Adobe → left as 'failed'
- *  - indeterminate  → Adobe rejected the lookup query (400); retry later
+ *  - rolledBack     → always 0 (R6 #1 removed auto-rollback; field kept for
+ *                     response-shape stability)
  *  - perWoError     → other failures (credentials missing, network) — left as-is
  */
 router.post('/:id/reconcile', async (req, res, next) => {

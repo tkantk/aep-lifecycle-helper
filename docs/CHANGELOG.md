@@ -9,6 +9,61 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-05-31 (R6) — Sixth-round review: recovery duplicate-submission safety
+
+R5 fixed the quota lifecycle structurally, but a sixth review found two
+duplicate-submission BLOCKERS in the orphan-recovery path plus a HIGH external-
+writer caveat. All verified against the code and Adobe's docs. Suite **237 →
+241** pass, audit clean, fresh + legacy boots verified.
+
+### #1 (blocker) — a recognized-empty Adobe list refunded an uncertain POST
+
+`reconcileOrphanWorkOrders` (startup) and `reconcileJobOrphans` (manual) rolled a
+'submitting' orphan back to 'planned' + released its quota whenever Adobe's list
+endpoint returned a recognized-but-empty response. But Adobe documents work-order
+creation as ASYNCHRONOUS with NO read-after-write guarantee, so a missing entry
+does NOT prove Adobe never received the (uncertain-POST) work order — the next
+submit would then re-POST a DUPLICATE irreversible delete. **Fix:** a no-match is
+now INDETERMINATE — the WO is held in 'submitting' with its reservation intact and
+surfaced for operator reconciliation; recovery NEVER auto-rolls-back. Removed the
+now-unreachable `rollbackWorkOrderToPlanned` statement. `runner/recovery.js`,
+`db.js`, `routes/jobs.js`.
+
+### #2 (blocker) — long job names made accepted work orders invisible to recovery
+
+The displayName was `Delete <job.name> - WO <uuid>` with the UUID at the END;
+Adobe truncates displayName at 255, so a long job name dropped the UUID, and
+recovery (which reconstructed the untruncated name and required exact equality)
+could never match → false "absent" → duplicate on resubmit. **Fix:** the
+displayName is now UUID-FIRST (`WO <uuid> - Delete <name>`) so the unique key
+always survives truncation, and the EXACT sent value is persisted durably
+(`work_orders.display_name`) BEFORE the POST; recovery matches that stored value
+(falling back to reconstruction for legacy rows). `submission.js`, `db.js`
+(durable checkpoint + column), `runner/recovery.js`.
+
+### #3 (high) — zero-over-ship assumed an exclusive writer
+
+R5's guarantee covers only this tool's own accounting; `/quota` is org-wide and
+snapshotted once per run, so a concurrent external writer can over-consume.
+**Fix:** added `QUOTA_SAFETY_BUFFER` (fraction 0..0.95, default 0) applied as
+`liveCap = floor(quota × (1 − buffer))` in `runSubmission`; documented the
+exclusive-writer assumption (CLAUDE.md I15, ARCHITECTURE). `config.js`,
+`runner/submission.js`.
+
+### #4 (medium) — stale safety docs
+
+Fixed ARCHITECTURE quota signatures, the obsolete release/rollback semantics, and
+the timeout-behavior section; corrected the recovery docs that overstated a single
+200 no-match as proof of absence.
+
+### Tests
+
+`recovery.test.js` rewritten for the indeterminate behavior + the UUID-first
+display_name match + proper per-test isolation; `submissionBuckets.test.js`
+(UUID-first persisted name); new `quotaSafetyBuffer.test.js`.
+
+---
+
 ## 2026-05-31 (R5) — Fifth-round review: hold-until-rollover quota lifecycle
 
 A fifth review found the R4.1 quota model still had three over-ship paths plus an

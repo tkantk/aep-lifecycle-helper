@@ -261,6 +261,12 @@ export function initDb() {
     // row gets DEFAULT 0, then the backfill below promotes legacy in-flight rows
     // to accepted=1 so release()'s guard can't refund Adobe-processed work.
     { table: 'quota_reservations',  column: 'accepted', type: 'INTEGER NOT NULL DEFAULT 0' },
+    // Review R6 #2: the EXACT displayName sent to Adobe (UUID-first, ≤255),
+    // persisted durably BEFORE the POST so orphan recovery matches Adobe's stored
+    // value exactly instead of reconstructing it (a long job name truncated at
+    // 255 used to drop the trailing UUID → orphan invisible → duplicate on
+    // resubmit). NULL for legacy rows; recovery falls back to reconstruction.
+    { table: 'work_orders', column: 'display_name', type: 'TEXT' },
   ];
   for (const { table, column, type } of additiveColumns) {
     try {
@@ -581,6 +587,16 @@ function prepared() {
     updateWorkOrderStatus: db.prepare(`
       UPDATE work_orders SET status = ?, last_error = ?, updated_at = datetime('now') WHERE id = ?
     `),
+    // Durable pre-POST checkpoint (review R6 #2): set status='submitting' AND the
+    // exact displayName that will be sent to Adobe. COALESCE keeps an existing
+    // display_name when @displayName is null (the legacy/no-name durable path).
+    setWorkOrderSubmittingWithName: db.prepare(`
+      UPDATE work_orders
+         SET status = 'submitting', last_error = NULL,
+             display_name = COALESCE(@displayName, display_name),
+             updated_at = datetime('now')
+       WHERE id = @id
+    `),
     updateWorkOrderSubmitted: db.prepare(`
       UPDATE work_orders
          SET status = 'submitted',
@@ -730,10 +746,9 @@ function prepared() {
          AND w.adobe_workorder_id IS NULL
          AND w.status IN ('submitting', 'failed')
     `),
-    rollbackWorkOrderToPlanned: db.prepare(`
-      UPDATE work_orders SET status = 'planned', last_error = ?, updated_at = datetime('now')
-       WHERE id = ?
-    `),
+    // (rollbackWorkOrderToPlanned was removed in R6 #1 — recovery never auto-rolls
+    //  an uncertain orphan back to 'planned' because that risked a duplicate
+    //  irreversible delete; a no-match is now INDETERMINATE, left in 'submitting'.)
 
     // ─── App settings (Phase 3) ────────────────────────────────────
     listAppSettingsByPrefix: db.prepare(
@@ -847,11 +862,13 @@ export const q = () => prepared();
  * Returns true on success; false (caller fails closed, does not POST) only if
  * the write itself errors.
  */
-export function setWorkOrderSubmittingDurable(workOrderId) {
+export function setWorkOrderSubmittingDurable(workOrderId, displayName = null) {
   const prev = db.pragma('synchronous', { simple: true });   // numeric (1 = NORMAL)
   try {
     db.pragma('synchronous = FULL');
-    prepared().updateWorkOrderStatus.run('submitting', null, workOrderId);
+    // Persist status='submitting' AND the exact displayName to be POSTed, so
+    // orphan recovery can match Adobe's stored value even after a crash (R6 #2).
+    prepared().setWorkOrderSubmittingWithName.run({ id: workOrderId, displayName });
     return true;
   } catch {
     return false;
