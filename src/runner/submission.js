@@ -377,8 +377,8 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
     let submitted = 0, deferred = 0, failed = 0;
 
     const tasks = orders.map(wo => limit(async () => {
-      // Per-WO reservation (review R4 #1): keyed by wo.id so release/complete
-      // are exact and period-correct.
+      // Per-WO reservation (review R4 #1, R5 lifecycle): keyed by wo.id so
+      // reserve/markAccepted/release are exact and period-correct.
       const res = reserve({
         workOrderId: wo.id, imsOrgId: creds.imsOrgId, count: wo.identifier_count,
         dailyLimit: liveDailyLimit, monthlyLimit: liveMonthlyLimit,
