@@ -204,6 +204,10 @@ export function initDb() {
     // never selected. Default '0' keeps legacy rows (and the single-column
     // common case) correct.
     { table: 'jobs',        column: 'source_column', type: "TEXT NOT NULL DEFAULT '0'" },
+    // Review finding #9: a poll cursor so the monitor rotates fairly through
+    // ALL open work orders instead of re-polling the first 100 by rowid every
+    // tick (which starved order #101+ on large jobs). NULL = never polled.
+    { table: 'work_orders', column: 'last_polled_at', type: 'TEXT' },
   ];
   for (const { table, column, type } of additiveColumns) {
     try {
@@ -517,13 +521,19 @@ function prepared() {
              updated_at = datetime('now')
        WHERE id = ?
     `),
+    // Oldest-polled (and never-polled) first, so every open WO is eventually
+    // observed even when more than 100 are in flight (review finding #9 —
+    // starvation). The monitor stamps last_polled_at on every attempt, so a
+    // polled WO rotates to the back of the queue.
     listOpenWorkOrders: db.prepare(`
       SELECT w.*, j.creds_id AS j_creds_id, j.sandbox_name AS j_sandbox_name
         FROM work_orders w JOIN jobs j ON j.id = w.job_id
        WHERE w.adobe_workorder_id IS NOT NULL
          AND (w.adobe_status IS NULL OR w.adobe_status NOT IN ('completed','failed'))
+       ORDER BY w.last_polled_at IS NOT NULL, w.last_polled_at, w.rowid
        LIMIT 100
     `),
+    stampWorkOrderPolled: db.prepare(`UPDATE work_orders SET last_polled_at = datetime('now') WHERE id = ?`),
     countWorkOrdersByStatus: db.prepare(`
       SELECT status, COUNT(*) AS count FROM work_orders WHERE job_id = ? GROUP BY status
     `),

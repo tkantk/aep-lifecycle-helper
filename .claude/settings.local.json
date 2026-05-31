@@ -37,7 +37,10 @@
       "Bash(ENCRYPTION_KEY=0000000000000000000000000000000000000000000000000000000000000000 node --test test/recoveryColumn.test.js test/recovery.test.js test/integration.test.js)",
       "Bash(ENCRYPTION_KEY=0000000000000000000000000000000000000000000000000000000000000000 node --test)",
       "Bash(ENCRYPTION_KEY=0000000000000000000000000000000000000000000000000000000000000000 node --test test/config.test.js)",
-      "Bash(git commit -q -m ' *)"
+      "Bash(git commit -q -m ' *)",
+      "Bash(ENCRYPTION_KEY=0000000000000000000000000000000000000000000000000000000000000000 node --test test/monitorPoll.test.js)",
+      "Bash(cp src/db.js /tmp/db.js.bak)",
+      "Bash(perl -0pi -e \"s/\\\\\\\\s*ORDER BY w\\\\\\\\.last_polled_at IS NOT NULL, w\\\\\\\\.last_polled_at, w\\\\\\\\.rowid\\\\\\\\n//\" src/db.js)"
     ]
   }
 }

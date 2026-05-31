@@ -84,6 +84,11 @@ async function tick() {
     let succeeded = 0, failed = 0;
     const limit = pLimit(POLL_CONCURRENCY);
     await Promise.all(open.map(wo => limit(async () => {
+      // Stamp the poll cursor on every ATTEMPT (success or failure) so this WO
+      // rotates to the back of listOpenWorkOrders and can't starve others on
+      // jobs with >100 open orders (review finding #9). A permafailing WO
+      // therefore yields to never-polled ones instead of monopolising the tick.
+      q().stampWorkOrderPolled.run(wo.id);
       try {
         const creds = await getCreds(wo.j_creds_id);
         const adobe = await getWorkOrder({

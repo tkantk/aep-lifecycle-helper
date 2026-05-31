@@ -62,8 +62,17 @@ export async function runExpansion({
       namespacesJson: JSON.stringify(namespaces),
     });
   } catch (err) {
-    logger.warn({ err: err.message }, 'namespace registry load failed - proceeding without canonicalization');
-    namespaceIndex = undefined;
+    // FAIL CLOSED (review finding #10). Without the registry we can't
+    // canonicalize linked identities to {code,id}, and we can't resolve the
+    // source namespace's nsid — the Identity Graph would very likely return
+    // empty clusters and the operator would delete ONLY the source ids while
+    // the linked email/phone/CRMID survive (the silent-partial-delete failure
+    // mode, same family as I9). Abort rather than expand blind.
+    logger.error({ jobId, err: err.message },
+      'namespace registry load failed — aborting expansion (cannot canonicalize / resolve nsid)');
+    q().updateJobStatus.run('failed', `namespace registry load failed: ${err.message}`, jobId);
+    liveProgress.delete(jobId);
+    throw err;
   }
 
   // Custom namespaces (like hashedKocid) often need the numeric nsid to resolve
@@ -77,9 +86,18 @@ export async function runExpansion({
       resolvedNsid = Number(hit.id);
       logger.info({ jobId, sourceNamespace, resolvedNsid }, 'resolved source namespace nsid from registry');
     } else {
+      // FAIL CLOSED (review finding #10): the source namespace isn't in the
+      // org's registry AND the caller gave us no explicit nsid. Expanding
+      // would send an unrecognized namespace to the Identity Graph, get empty
+      // clusters back, and delete only the source ids — a silent partial
+      // delete. Abort instead.
       const available = [...namespaceIndex.byCode.keys()].slice(0, 20);
-      logger.warn({ jobId, sourceNamespace, availableSample: available },
-        'source namespace code not found in registry — Identity Graph will likely return empty clusters');
+      logger.error({ jobId, sourceNamespace, availableSample: available },
+        'source namespace not found in registry and no nsid provided — aborting expansion');
+      const msg = `source namespace "${sourceNamespace}" not found in the sandbox's namespace registry`;
+      q().updateJobStatus.run('failed', msg, jobId);
+      liveProgress.delete(jobId);
+      throw new Error(msg);
     }
   }
 
