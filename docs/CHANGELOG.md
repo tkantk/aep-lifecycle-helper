@@ -14,7 +14,7 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 A second external review found that several round-1 fixes were incomplete and
 that a few round-1 changes introduced regressions. All 11 findings were
 independently re-verified (an 8-agent adversarial verification pass plus direct
-reproduction) before fixing. Suite **209 → 219**, `npm audit` clean. Every fix
+reproduction) before fixing. Suite **209 → 221**, `npm audit` clean. Every fix
 is test-first.
 
 ### Blockers
