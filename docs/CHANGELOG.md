@@ -9,6 +9,77 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-05-31 (R2) — Second-round review remediation (2 blockers + 9 findings)
+
+A second external review found that several round-1 fixes were incomplete and
+that a few round-1 changes introduced regressions. All 11 findings were
+independently re-verified (an 8-agent adversarial verification pass plus direct
+reproduction) before fixing. Suite **209 → 219**, `npm audit` clean. Every fix
+is test-first.
+
+### Blockers
+
+- **#1 — Quota reserve still didn't enforce Adobe's remaining.** Round 1 fixed
+  bucket *selection* but `reserve()` still compared against the FULL daily cap,
+  and the local ledger was never seeded from Adobe's org-wide `consumed`. So an
+  explicit future-bucket submit, or a second run while `/quota.consumed` lagged,
+  could ship past today's remaining. Fix: `quotaManager.seedFloor()` raises the
+  ledger to Adobe's `consumed` (MAX, never lower) before every run, so reserve
+  enforces true remaining. `db.js` gained `upsertQuotaFloor` /
+  `upsertMonthlyQuotaFloor` (`ON CONFLICT … SET used = MAX(used, excluded.used)`).
+  Tests: sequential + explicit-bucket over-ship in `submissionBuckets.test.js`.
+- **#2 — All-empty Identity Graph still produced source-only deletes.** Round 1
+  blocked registry-*load* failure, but a 200 `{clusters:[]}` (wrong region /
+  nsid / empty graph) still emitted a source-only plan. Fix: expansion fails
+  CLOSED when a FRESH run processed sources but Adobe returned ZERO linked
+  members across the whole job (the right discriminator — the legitimate
+  source-only case still gets the source echoed back as a member, so it passes;
+  `recoveryColumn.test` stays green). Override via `ALLOW_EMPTY_GRAPH=1`. Test in
+  `expansionFailClosed.test.js`.
+
+### Other findings
+
+- **#3 — Quota shape fail-open.** `normalizeQuotaEntry` coerced a non-finite
+  `consumed`/`quota` to 0 (faking remaining). Now returns null on
+  non-finite/negative (0 stays valid), so the daily guard fails closed.
+  Submission also now requires a valid monthly entitlement when the job tracks
+  monthly. Tests in `submissionBuckets.test.js`.
+- **#4 — Monthly-reservation leak on recovery.** Reserve could use a live
+  monthly limit while recovery released with `job.monthly_limit` (null) →
+  monthly ledger leaked. New `work_orders.reserved_monthly` records the
+  effective monthly limit at reserve time; both recovery paths release/re-reserve
+  using it. Test in `recovery.test.js` (asserts both ledgers return to 0).
+- **#5 — Durable checkpoint wasn't fail-closed.** `durableCheckpoint()` ignored
+  `wal_checkpoint(FULL)`'s `busy` row. It now returns a real durability boolean;
+  submission releases + reverts to planned + defers when durability is
+  unverified, rather than POSTing. Test in `durableCheckpoint.test.js` (forces
+  busy with a concurrent reader).
+- **#6 — Lock keyed on DATA_DIR, not the DB.** Two instances with different
+  `DATA_DIR` but the same `DB_PATH` both ran. Lock is now keyed on the resolved
+  `DB_PATH` (`<dbPath>.lock`) and acquired BEFORE db.js opens the connection
+  (imports reordered in `index.js`). Handles `:memory:`.
+- **#7 — Startup purge could delete unrelated files.** Now only deletes files
+  matching the helper's generated `<epoch>_<uuidv4>.<ext>` pattern.
+- **#8 — Source nsid not validated at ingress.** `upload.js` coerces a
+  non-finite nsid to null (`finiteNsidOrNull`); expansion normalizes
+  `resolvedNsid` and fails closed on a code/nsid registry mismatch;
+  `identityGraph.expandBatch` only templates a finite nsid into the body. Tests
+  in `identityGraphNsid.test.js`.
+- **#9 — Test wrapper recursion (round-1 regression).** `scripts/test.mjs` was
+  named `test.mjs`, matching `node --test`'s default glob → it ran itself
+  recursively and inflated the count to 210. Renamed to
+  `scripts/run-tests.mjs` and now ENUMERATES `test/*.test.js`. Real count: 219.
+  (Also fixed a `*/`-in-a-`**/`-comment that broke the wrapper's own parse.)
+- **#10 — Submit reported false success.** `POST /jobs/:id/submit` returned
+  `{ok:true}` before the async preflight; a `quota_unavailable` failure was only
+  logged. The route now clears and PERSISTS the failure to `job.last_error`
+  (observable via `GET /jobs/:id`) and returns `{ok:true, async:true}`. Test in
+  `submitRouteError.test.js`.
+- **#11 — Docs/settings cleanup.** Reverted machine-local `.claude/settings.local.json`
+  additions; updated ARCHITECTURE's stale "No file lock guard" line and test count.
+
+---
+
 ## 2026-05-31 — External review remediation (4 blockers + 7 high-priority + hardening)
 
 Context: an external review flagged four production-blocking paths that could

@@ -101,4 +101,11 @@ export const config = {
   // 32-byte hex key used to encrypt client secrets at rest. Auto-generated
   // and stored in data/ on first run if not provided. Don't commit this.
   encryptionKey: process.env.ENCRYPTION_KEY,
+
+  // When the Identity Graph returns ZERO linked members across an ENTIRE fresh
+  // expansion, that is the wrong-region / wrong-nsid / empty-graph fingerprint
+  // and we fail closed (a source-only deletion would silently leave linked
+  // identities alive — review finding #2). Set to 1 only when you have
+  // deliberately confirmed the sources genuinely have no linked identities.
+  allowEmptyGraph: process.env.ALLOW_EMPTY_GRAPH === '1',
 };

@@ -64,6 +64,34 @@ export function peek(imsOrgId, dailyLimit, monthlyLimit) {
  * When both checks pass, both ledgers are incremented in a single SQLite
  * transaction so we never end up with daily incremented and monthly not.
  */
+/**
+ * Reconcile the local ledger UP to Adobe's reported consumption (review
+ * blocker #1). The local ledger only tracks THIS process's reservations; an
+ * external tool consuming the org's shared quota is otherwise invisible and
+ * reserve() would grant up to the full cap on top of it. Raising the ledger
+ * floor to `consumed` (MAX, never lower) makes the subsequent reserve()
+ * calls — which still compare local_used + count against the full cap —
+ * mathematically enforce Adobe's true remaining (cap - consumed).
+ *
+ * MAX semantics are what make this safe and non-double-counting:
+ *   - others consumed more than we've tracked → floor rises to their level;
+ *   - Adobe's number lags below our own reservations → MAX keeps ours;
+ *   - Adobe has counted our work (consumed == our ledger) → MAX is a no-op.
+ *
+ * Pass `monthlyConsumed = null` to skip the monthly dimension (job has monthly
+ * tracking disabled), mirroring reserve()/release()'s monthlyLimit gate (I5).
+ */
+export function seedFloor(imsOrgId, dailyConsumed, monthlyConsumed) {
+  db.transaction(() => {
+    if (Number.isFinite(dailyConsumed) && dailyConsumed > 0) {
+      q().upsertQuotaFloor.run(imsOrgId, utcToday(), dailyConsumed);
+    }
+    if (monthlyConsumed != null && Number.isFinite(monthlyConsumed) && monthlyConsumed > 0) {
+      q().upsertMonthlyQuotaFloor.run(imsOrgId, utcYearMonth(), monthlyConsumed);
+    }
+  })();
+}
+
 export function reserve(imsOrgId, count, dailyLimit, monthlyLimit) {
   const today = utcToday();
   const month = utcYearMonth();

@@ -85,6 +85,84 @@ function mockOrgQuota({ dailyRemaining, monthlyRemaining = 3_000_000 }) {
   });
 }
 
+test('explicit future-bucket submit cannot over-ship past Adobe remaining', async () => {
+  // Review blocker #1 (explicit-bucket path): with 100k remaining, the
+  // redistributor puts WO0 in day 1 and WO1+WO2 in day 2. An operator viewing
+  // "Day 2" submits dayIndex=2 explicitly. The ledger seed caps it at remaining,
+  // so at most one 100k WO ships, never both.
+  const { jobId } = seedJobWithOrders([100_000, 100_000, 100_000]);
+  mockIms();
+  mockOrgQuota({ dailyRemaining: 100_000 });
+  let posts = 0;
+  nock(GATEWAY).persist().post('/data/core/hygiene/workorder').reply(200, () => {
+    posts++; return { workorderId: `DI-${posts}`, status: 'received', createdAt: '2026-05-31T00:00:00Z' };
+  });
+
+  // First run buckets the WOs (and ships day-1). Then explicitly submit day 2.
+  await runSubmission({ jobId });                          // ships day-1 WO (100k)
+  await runSubmission({ jobId, dayIndex: 2, monthIndex: 1 }); // explicit future bucket
+
+  assert.equal(posts, 1, 'explicit Day-2 submit must not ship beyond Adobe remaining (already exhausted)');
+});
+
+test('two sequential no-bucket runs do not over-ship past Adobe remaining (ledger seeded to consumed)', async () => {
+  // Review blocker #1: Adobe reports 100k remaining today (consumed 900k by
+  // OTHER tools). The local ledger starts at 0 and reserve compares against the
+  // FULL cap, so without seeding the ledger to Adobe's consumed, a second run
+  // (Adobe /quota.consumed still lagging at 900k) re-buckets and ships another
+  // 100k — 200k total against a 100k remaining. The fix seeds the ledger UP to
+  // consumed (MAX) each run, so only 100k ever ships until Adobe's number moves.
+  const { jobId } = seedJobWithOrders([100_000, 100_000, 100_000]);
+  mockIms();
+  mockOrgQuota({ dailyRemaining: 100_000 });   // consumed = 900k, quota = 1M
+  let posts = 0;
+  nock(GATEWAY).persist().post('/data/core/hygiene/workorder').reply(200, () => {
+    posts++; return { workorderId: `DI-${posts}`, status: 'received', createdAt: '2026-05-31T00:00:00Z' };
+  });
+
+  await runSubmission({ jobId });   // ships the single day-1 WO (100k)
+  await runSubmission({ jobId });   // must NOT ship a second 100k — remaining is exhausted
+
+  assert.equal(posts, 1, 'only Adobe\'s reported remaining (100k = 1 WO) may ever ship while consumed stays 900k');
+  const submitted = q().getAllOrdersForJob.all(jobId).filter(o => o.status === 'submitted');
+  assert.equal(submitted.length, 1);
+});
+
+test('runSubmission fails closed when daily consumed is malformed (not a finite number)', async () => {
+  // Review finding #3: consumed:"not-a-number" was coerced to 0, faking full
+  // remaining. Now the entry is invalid → daily missing → fail closed.
+  const { jobId } = seedJobWithOrders([100_000]);
+  mockIms();
+  nock(GATEWAY).persist().get('/data/core/hygiene/quota').reply(200, {
+    quotas: [{ name: 'dailyConsumerDeleteIdentitiesQuota', consumed: 'not-a-number', quota: 1_000_000 }],
+  });
+  let posts = 0;
+  nock(GATEWAY).persist().post('/data/core/hygiene/workorder').reply(200, () => {
+    posts++; return { workorderId: 'DI-x', status: 'received', createdAt: '2026-05-31T00:00:00Z' };
+  });
+  await assert.rejects(() => runSubmission({ jobId }),
+    err => { assert.equal(err.code, 'quota_unavailable'); return true; });
+  assert.equal(posts, 0, 'no WO may ship on a malformed daily entitlement');
+});
+
+test('runSubmission fails closed when job tracks monthly but Adobe reports no monthly entitlement', async () => {
+  // Review finding #3: a job with a monthly cap must not ship when Adobe's
+  // /quota lacks a valid monthly dimension (we would otherwise track monthly
+  // against a guessed/absent number).
+  const { jobId } = seedJobWithOrders([100_000]);   // seedJobWithOrders sets monthly_limit 3M (tracks monthly)
+  mockIms();
+  nock(GATEWAY).persist().get('/data/core/hygiene/quota').reply(200, {
+    quotas: [{ name: 'dailyConsumerDeleteIdentitiesQuota', consumed: 0, quota: 1_000_000 }],
+  });
+  let posts = 0;
+  nock(GATEWAY).persist().post('/data/core/hygiene/workorder').reply(200, () => {
+    posts++; return { workorderId: 'DI-x', status: 'received', createdAt: '2026-05-31T00:00:00Z' };
+  });
+  await assert.rejects(() => runSubmission({ jobId }),
+    err => { assert.equal(err.code, 'quota_unavailable'); return true; });
+  assert.equal(posts, 0, 'no WO may ship when the monthly dimension is required but missing');
+});
+
 test('runSubmission fails closed when /quota has no recognized daily entitlement', async () => {
   // Review finding #6: a 200 whose shape we don't recognize (no daily quota
   // entry) used to leave quotaSnapshot.daily = null, and submission silently

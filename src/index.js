@@ -16,18 +16,6 @@ dotenv.config({ path: path.join(__dirname, '..', '.env') });
 
 const { config, detectCloudSyncPath } = await import('./config.js');
 const { logger } = await import('./utils/logger.js');
-const { initDb, db } = await import('./db.js');
-const { startMonitor, stopMonitor } = await import('./runner/monitor.js');
-const { runStartupRecovery } = await import('./runner/recovery.js');
-const { startScheduler, stopScheduler } = await import('./runner/scheduler.js');
-const { hostHeaderGuard, originRefererGuard, makeErrorHandler } =
-  await import('./middleware/security.js');
-
-const configRouter   = (await import('./routes/config.js')).default;
-const uploadRouter   = (await import('./routes/upload.js')).default;
-const jobsRouter     = (await import('./routes/jobs.js')).default;
-const adobeRouter    = (await import('./routes/adobe.js')).default;
-const settingsRouter = (await import('./routes/settings.js')).default;
 
 // ─── Refuse non-loopback bind without explicit acknowledgment ───────────
 // The API has no authentication and submits irreversible deletes. Binding to
@@ -48,12 +36,17 @@ fs.mkdirSync(config.uploadDir, { recursive: true });
 fs.mkdirSync(config.outputDir, { recursive: true });
 fs.mkdirSync(path.dirname(config.dbPath), { recursive: true });
 
-// ─── Single-process advisory lock ───────────────────────────────────────
-// Two instances against the same state.db corrupt the WAL (no multi-writer
-// coordination). Take an exclusive lock file; reclaim it only if the recorded
-// pid is no longer alive (stale lock after a crash). Released on shutdown.
-const lockPath = path.join(config.dataDir, '.lock');
+// ─── Single-process advisory lock (acquire BEFORE opening SQLite) ────────
+// Two instances against the SAME database file corrupt the WAL (no multi-
+// writer coordination). Key the lock on the canonical DB PATH — NOT DATA_DIR —
+// because DB_PATH can point elsewhere, so two different DATA_DIRs could still
+// share one database file (review finding #6). Acquire it BEFORE importing
+// db.js, which opens the connection at module-eval time, so the connection is
+// never opened while another instance holds the lock. Reclaim only a stale
+// lock whose recorded pid is no longer alive. Released on shutdown.
+const lockPath = config.dbPath === ':memory:' ? null : path.resolve(config.dbPath) + '.lock';
 function acquireSingleProcessLock() {
+  if (!lockPath) return;   // in-memory DB has no shared file to guard
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const fd = fs.openSync(lockPath, 'wx');   // O_EXCL — fails if it exists
@@ -67,9 +60,9 @@ function acquireSingleProcessLock() {
       try { process.kill(existingPid, 0); alive = true; } catch (e) { alive = e.code === 'EPERM'; }
       if (alive && existingPid !== process.pid) {
         logger.error(
-          `Another instance (pid ${existingPid}) is already running against ${config.dataDir}. ` +
-          `Running two instances on one state.db corrupts the WAL. Stop the other instance first, ` +
-          `or use a separate DATA_DIR.`);
+          `Another instance (pid ${existingPid}) is already running against the database ` +
+          `${config.dbPath}. Running two instances on one database corrupts the WAL. Stop the ` +
+          `other instance first, or point DB_PATH at a different database file.`);
         process.exit(1);
       }
       // Stale lock (pid not alive) — remove and retry once.
@@ -81,11 +74,32 @@ function acquireSingleProcessLock() {
 }
 acquireSingleProcessLock();
 
+// ─── Now safe to open SQLite + load db-dependent modules (under the lock) ─
+const { initDb, db } = await import('./db.js');
+const { startMonitor, stopMonitor } = await import('./runner/monitor.js');
+const { runStartupRecovery } = await import('./runner/recovery.js');
+const { startScheduler, stopScheduler } = await import('./runner/scheduler.js');
+const { hostHeaderGuard, originRefererGuard, makeErrorHandler } =
+  await import('./middleware/security.js');
+
+const configRouter   = (await import('./routes/config.js')).default;
+const uploadRouter   = (await import('./routes/upload.js')).default;
+const jobsRouter     = (await import('./routes/jobs.js')).default;
+const adobeRouter    = (await import('./routes/adobe.js')).default;
+const settingsRouter = (await import('./routes/settings.js')).default;
+
 // ─── Purge orphaned upload files ────────────────────────────────────────
 // CSV uploads carry raw customer identifiers. Remove any upload file in the
 // upload dir that no job references (e.g. left behind by a force-deleted job
 // or an interrupted upload) so customer data isn't retained indefinitely
 // (review hardening). Job-referenced uploads are kept for crash-resume.
+// Only the helper's own uploads match this shape: <epoch-ms>_<uuid-v4>.<ext>
+// (see src/routes/upload.js multer storage filename). Restricting the purge to
+// it guarantees we never delete a file the tool didn't create, even if
+// UPLOAD_DIR points at a shared directory (review finding #7). Keep in lockstep
+// with the multer filename in upload.js.
+const GENERATED_UPLOAD_RE =
+  /^[0-9]+_[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\.(csv|txt|tsv)$/;
 function purgeOrphanedUploads() {
   try {
     const referenced = new Set(
@@ -93,6 +107,7 @@ function purgeOrphanedUploads() {
         .all().map(r => path.resolve(r.upload_path)));
     let purged = 0;
     for (const name of fs.readdirSync(config.uploadDir)) {
+      if (!GENERATED_UPLOAD_RE.test(name)) continue;   // not ours — never touch
       const full = path.resolve(config.uploadDir, name);
       if (!referenced.has(full)) { try { fs.unlinkSync(full); purged++; } catch { /* */ } }
     }
@@ -266,7 +281,7 @@ function shutdown(sig) {
     if (err) logger.error({ err: err.message }, 'server close error');
     try { db.pragma('wal_checkpoint(TRUNCATE)'); } catch (e) { logger.warn({ err: e.message }, 'wal_checkpoint failed'); }
     try { db.close(); } catch (e) { logger.warn({ err: e.message }, 'db close failed'); }
-    try { fs.unlinkSync(lockPath); } catch { /* best-effort lock release */ }
+    if (lockPath) { try { fs.unlinkSync(lockPath); } catch { /* best-effort lock release */ } }
     clearTimeout(timer);
     logger.info('shutdown complete');
     process.exit(0);

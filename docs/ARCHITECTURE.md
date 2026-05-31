@@ -495,8 +495,10 @@ src/
     │                       gradient tile shows it in white.
     └── fonts/              Self-hosted Source Sans 3 woff2 (OFL-licensed, 4 weights).
 
-test/                       node --test (via `npm test` → scripts/test.mjs).
-                            210 tests covering hygiene validators,
+test/                       node --test (via `npm test` → scripts/run-tests.mjs,
+                            which enumerates test/*.test.js and sets a stable
+                            test ENCRYPTION_KEY). 219 tests covering hygiene
+                            validators,
                             namespace canonicalization, IMS token cache, quota
                             atomicity (incl. monthly-disabled release gating),
                             planWorkOrders cluster packing + day rollover +
@@ -576,7 +578,7 @@ data/                       Runtime state; in .gitignore.
 | `sandbox_configs` | Cached sandbox metadata + datasets + namespaces | PK(creds_id, sandbox_name) |
 | `jobs` | One per upload. Status: created → expanding → expanded → ready → submitting → submitted/partial/failed. `projected_months` (Phase 2) tracks the redistributor's max month_index for shift detection. `source_column` (2026-05-31, default `'0'`) persists the upload-time CSV column so crash-recovery resumes against the same column. | FK creds_id |
 | `expanded_identities` | One row per (cluster member, source). No unique index — dedup deferred to planning via `GROUP BY` in `streamIdentitiesBySource`. Only `idx_ei_job_source(job_id, source_id)` remains; `idx_ei_job_ns` was dropped 2026-05-29 (proven via EXPLAIN QUERY PLAN to be redundant — every reader falls back to `idx_ei_job_source` with an identical plan). | FK job_id |
-| `work_orders` | One per Adobe work order. Statuses: planned → submitting → submitted → completed/failed/deferred. `month_index` (Phase 2) + `day_index` form the bucket label assigned by the redistributor on un-shipped WOs only. `last_polled_at` (2026-05-31) is the monitor's fairness cursor so >100 open WOs all get polled (no starvation). | FK job_id, ordered by rowid |
+| `work_orders` | One per Adobe work order. Statuses: planned → submitting → submitted → completed/failed/deferred. `month_index` (Phase 2) + `day_index` form the bucket label assigned by the redistributor on un-shipped WOs only. `last_polled_at` (2026-05-31) is the monitor's fairness cursor so >100 open WOs all get polled (no starvation). `reserved_monthly` (2026-05-31 R2) records the effective monthly limit reserve() used, so recovery releases exactly the dimensions reserved (no monthly-ledger leak). | FK job_id, ordered by rowid |
 | `quota_usage` | Daily local ledger: (ims_org_id, utc_date) → used | PK |
 | `quota_usage_monthly` | Monthly local ledger: (ims_org_id, utc_year_month) → used | PK |
 | `app_settings` | Generic key/value bag (Phase 3). First users: `auto_resume_*` keys for the scheduler. | PK(key) |
@@ -658,9 +660,12 @@ runtime source of truth (CLAUDE.md I15).
   the orphan in `submitting` so the next boot retries. **Never rolls back on
   400** — rolling back would risk a duplicate Adobe work order if the original
   POST had actually been processed but our listing query happened to fail.
-- **Single-process only** — running two instances against the same `state.db`
-  corrupts the WAL. No file lock guard. Future improvement: advisory lock
-  file in `data/`.
+- **Single-process only** — running two instances against the same database
+  corrupts the WAL. Enforced by a single-process advisory lock (`index.js`):
+  a `<dbPath>.lock` file keyed on the canonical resolved `DB_PATH` (not
+  `DATA_DIR`, so two different `DATA_DIR`s sharing one `DB_PATH` still
+  collide), acquired BEFORE the SQLite connection is opened, with stale-pid
+  reclamation and release on shutdown (review finding #6).
 - **OneDrive-hosted state.db** — if `data/` lives inside a OneDrive-synced path
   (the default install location on Windows), OneDrive can transiently lock
   files and cause SQLITE_BUSY. Safer to move the state outside OneDrive, or

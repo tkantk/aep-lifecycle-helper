@@ -79,7 +79,12 @@ export async function runExpansion({
   // clusters reliably. If the caller gave us a code but no nsid, look the nsid
   // up in the registry now — sending both `ns` and `nsid` on /clusters/members
   // avoids empty responses for ambiguous custom-namespace codes.
-  let resolvedNsid = sourceNamespaceId;
+  // Defense-in-depth (review finding #8): normalize a non-finite/garbage nsid
+  // to null so the registry-resolution path below fires and a NaN can never be
+  // templated into the /clusters/members body. Catches a bad nsid from ANY
+  // caller (recovery, tests, future code), not just the upload route.
+  let resolvedNsid = Number.isInteger(sourceNamespaceId) && sourceNamespaceId >= 0
+    ? sourceNamespaceId : null;
   if (resolvedNsid == null && namespaceIndex && sourceNamespace) {
     const hit = namespaceIndex.byCode.get(sourceNamespace);
     if (hit) {
@@ -95,6 +100,22 @@ export async function runExpansion({
       logger.error({ jobId, sourceNamespace, availableSample: available },
         'source namespace not found in registry and no nsid provided — aborting expansion');
       const msg = `source namespace "${sourceNamespace}" not found in the sandbox's namespace registry`;
+      q().updateJobStatus.run('failed', msg, jobId);
+      liveProgress.delete(jobId);
+      throw new Error(msg);
+    }
+  }
+
+  // If the caller supplied BOTH a code and an nsid, verify they agree with the
+  // registry (review finding #8). A mismatched pair means the wrong nsid was
+  // selected for the namespace — fail closed rather than expand (and delete)
+  // against an unintended namespace.
+  if (resolvedNsid != null && namespaceIndex && sourceNamespace) {
+    const hit = namespaceIndex.byCode.get(sourceNamespace);
+    if (hit && Number(hit.id) !== resolvedNsid) {
+      const msg = `source namespace "${sourceNamespace}" maps to nsid ${hit.id} in the registry, ` +
+        `but nsid ${resolvedNsid} was supplied — refusing to expand against a mismatched code/nsid pair`;
+      logger.error({ jobId, sourceNamespace, registryNsid: hit.id, suppliedNsid: resolvedNsid }, msg);
       q().updateJobStatus.run('failed', msg, jobId);
       liveProgress.delete(jobId);
       throw new Error(msg);
@@ -117,6 +138,10 @@ export async function runExpansion({
   let wave   = [];
   let aborted = false;
   let skipped = 0;
+  // Total linked members Adobe returned across the whole run (review finding
+  // #2). 0 across a fresh expansion is the wrong-region/empty-graph fingerprint
+  // and triggers a fail-closed below.
+  let jobLinkedTotal = 0;
 
   // ─── Per-batch timing instrumentation ─────────────────────────────────
   // Tracks rolling p50/p95 of `adobeMs` (Identity Graph round-trip) and
@@ -155,6 +180,7 @@ export async function runExpansion({
       // If this is zero across every batch, either the namespace is wrong for this
       // sandbox or the IDs don't exist in any cluster.
       const linkedTotal = results.reduce((n, r) => n + r.linkedIdentities.length, 0);
+      jobLinkedTotal += linkedTotal;
 
       // Flatten to row tuples for bulk insert.
       // Row shape: [job_id, ns_code, ns_id, identity_id, source_id]
@@ -291,6 +317,23 @@ export async function runExpansion({
 
   try {
     await drainWave();
+
+    // FAIL CLOSED on an all-empty graph (review finding #2). When a FRESH
+    // expansion processed real sources but Adobe returned ZERO linked members
+    // for ALL of them, that is the wrong-region / wrong-nsid / 200-empty
+    // fingerprint. Proceeding would emit a source-ONLY deletion plan, silently
+    // leaving every linked email/phone/CRMID alive. We skip this guard on a
+    // resume (skipSourceIds set) — the original fresh run already applied it —
+    // and honor an explicit operator override.
+    if (!skipSourceIds && !config.allowEmptyGraph &&
+        progress.processed > 0 && jobLinkedTotal === 0) {
+      throw new Error(
+        `Identity Graph returned 0 linked identities across all ${progress.processed} source(s) — ` +
+        `this usually means a wrong region/namespace for this sandbox. Refusing to ship a ` +
+        `source-only deletion that would leave linked identities alive. ` +
+        `Verify the credential region and source namespace; set ALLOW_EMPTY_GRAPH=1 to override ` +
+        `if the sources genuinely have no linked identities.`);
+    }
 
     // With deferred dedup (no unique index), found_count was incremented with
     // raw insert counts that may include duplicates. Overwrite with the true

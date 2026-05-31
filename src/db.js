@@ -208,6 +208,12 @@ export function initDb() {
     // ALL open work orders instead of re-polling the first 100 by rowid every
     // tick (which starved order #101+ on large jobs). NULL = never polled.
     { table: 'work_orders', column: 'last_polled_at', type: 'TEXT' },
+    // Review finding #4 (R2): the EFFECTIVE monthly limit passed to reserve()
+    // for this WO. NULL = monthly tracking was off at reserve time (or a
+    // legacy/never-reserved row). Recovery releases using THIS value, not the
+    // job row's monthly_limit, so reserve and release always agree on the
+    // monthly dimension (no monthly-ledger leak on rollback).
+    { table: 'work_orders', column: 'reserved_monthly', type: 'INTEGER' },
   ];
   for (const { table, column, type } of additiveColumns) {
     try {
@@ -309,6 +315,10 @@ function prepared() {
     // contract (and its many call sites) stays untouched. Stored as TEXT
     // because the column may be a 0-based index OR a header name.
     setJobSourceColumn: db.prepare('UPDATE jobs SET source_column = ? WHERE id = ?'),
+    // Persist a submission preflight/run error on the job WITHOUT changing its
+    // status, so a fire-and-forget submit failure (e.g. quota_unavailable) is
+    // observable by the UI instead of only logged (review finding #10).
+    setJobError: db.prepare(`UPDATE jobs SET last_error = ?, updated_at = datetime('now') WHERE id = ?`),
     getJob: db.prepare('SELECT * FROM jobs WHERE id = ?'),
     listJobs: db.prepare('SELECT * FROM jobs ORDER BY created_at DESC LIMIT ? OFFSET ?'),
     // Monitor-tab feed: jobs that have at least one Adobe-acked work order,
@@ -534,6 +544,9 @@ function prepared() {
        LIMIT 100
     `),
     stampWorkOrderPolled: db.prepare(`UPDATE work_orders SET last_polled_at = datetime('now') WHERE id = ?`),
+    // Records the effective monthly limit reserve() used for this WO (review
+    // finding #4). Recovery reads it back to release the SAME dimensions.
+    setReservedMonthly: db.prepare(`UPDATE work_orders SET reserved_monthly = ? WHERE id = ?`),
     countWorkOrdersByStatus: db.prepare(`
       SELECT status, COUNT(*) AS count FROM work_orders WHERE job_id = ? GROUP BY status
     `),
@@ -553,6 +566,15 @@ function prepared() {
     decQuota: db.prepare(`
       UPDATE quota_usage SET used = MAX(0, used - ?) WHERE ims_org_id = ? AND utc_date = ?
     `),
+    // Reconcile the daily ledger UP to Adobe's reported consumed (review
+    // blocker #1). MAX (not +): never lowers a value, so it can't undo our own
+    // just-reserved increments, and a lagging (lower) Adobe consumed leaves our
+    // higher local value intact. Raising the floor to org-wide consumed makes
+    // reserve() enforce Adobe's true remaining instead of just the full cap.
+    upsertQuotaFloor: db.prepare(`
+      INSERT INTO quota_usage (ims_org_id, utc_date, used) VALUES (?, ?, ?)
+      ON CONFLICT(ims_org_id, utc_date) DO UPDATE SET used = MAX(used, excluded.used)
+    `),
 
     // ─── Quota (monthly) ──────────────────────────────────────────────
     getMonthlyQuota: db.prepare(`SELECT used FROM quota_usage_monthly WHERE ims_org_id = ? AND utc_year_month = ?`),
@@ -562,6 +584,11 @@ function prepared() {
     `),
     decMonthlyQuota: db.prepare(`
       UPDATE quota_usage_monthly SET used = MAX(0, used - ?) WHERE ims_org_id = ? AND utc_year_month = ?
+    `),
+    // Monthly counterpart of upsertQuotaFloor (review blocker #1).
+    upsertMonthlyQuotaFloor: db.prepare(`
+      INSERT INTO quota_usage_monthly (ims_org_id, utc_year_month, used) VALUES (?, ?, ?)
+      ON CONFLICT(ims_org_id, utc_year_month) DO UPDATE SET used = MAX(used, excluded.used)
     `),
 
     // ─── Recovery (startup reconciliation) ────────────────────────────
@@ -687,5 +714,16 @@ export const q = () => prepared();
  * submit / shutdown checkpoint.
  */
 export function durableCheckpoint() {
-  try { db.pragma('wal_checkpoint(FULL)'); } catch { /* best-effort */ }
+  // wal_checkpoint returns one row: { busy, log, checkpointed }. busy !== 0
+  // means a reader blocked the checkpoint and the WAL was NOT fully flushed —
+  // i.e. the commit is NOT yet durable, and SQLite does NOT throw for this
+  // (review finding #5). Return whether durability was actually achieved so
+  // the caller can fail closed instead of POSTing on an unverified intent.
+  try {
+    const res = db.pragma('wal_checkpoint(FULL)');
+    const row = Array.isArray(res) ? res[0] : res;
+    return !!row && Number(row.busy) === 0;
+  } catch {
+    return false;
+  }
 }

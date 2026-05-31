@@ -1,7 +1,7 @@
 import pLimit from 'p-limit';
 import { v4 as uuid } from 'uuid';
 import { submitWorkOrder } from '../services/hygiene.js';
-import { reserve, release } from '../services/quotaManager.js';
+import { reserve, release, seedFloor } from '../services/quotaManager.js';
 import { getOrgQuota } from '../services/quotaApi.js';
 import { redistributeUnshippedOrders } from './redistributor.js';
 import { q, db, prepareStreamIdentitiesBySource, durableCheckpoint } from '../db.js';
@@ -303,6 +303,18 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
       throw e;
     }
 
+    // When this job tracks a monthly cap, Adobe MUST report a valid monthly
+    // entitlement too — otherwise we'd track monthly against a guessed/absent
+    // number and could over-consume the monthly pool (review finding #3). A
+    // job with monthly tracking explicitly disabled (monthly_limit null/0) is
+    // the defensible exception and skips this requirement.
+    const jobTracksMonthly = !(job.monthly_limit === null || job.monthly_limit === 0);
+    if (jobTracksMonthly && (!quotaSnapshot?.monthly || !(Number(quotaSnapshot.monthly.quota) > 0))) {
+      const e = new Error('Cannot submit: this job tracks a monthly cap but Adobe /quota returned no recognized monthly entitlement.');
+      e.code = 'quota_unavailable';
+      throw e;
+    }
+
     const distribution = redistributeUnshippedOrders(jobId, quotaSnapshot);
     const shifted = previousMonths != null && distribution.months > previousMonths;
 
@@ -349,6 +361,17 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
       ? (quotaSnapshot?.monthly?.quota ? quotaSnapshot.monthly.quota : null)
       : (quotaSnapshot?.monthly?.quota || job.monthly_limit);
 
+    // Seed the local ledger UP to Adobe's reported consumed BEFORE any reserve,
+    // so reserve() (which compares against the full cap) enforces Adobe's true
+    // remaining — closing the over-ship via the explicit-bucket path and the
+    // sequential-lag path (review blocker #1). Monthly is seeded only when this
+    // job tracks monthly (liveMonthlyLimit != null), matching reserve/release.
+    seedFloor(
+      creds.imsOrgId,
+      quotaSnapshot.daily.consumed,
+      liveMonthlyLimit != null ? (quotaSnapshot.monthly?.consumed ?? null) : null,
+    );
+
     q().updateJobStatus.run('submitting', null, jobId);
 
     let submitted = 0, deferred = 0, failed = 0;
@@ -364,13 +387,27 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
         return;
       }
 
+      // Record the EFFECTIVE monthly dimension we just reserved so recovery
+      // releases EXACTLY this dimension later, not the (possibly different)
+      // job-row monthly_limit (review finding #4 — monthly-ledger leak).
+      q().setReservedMonthly.run(liveMonthlyLimit ?? null, wo.id);
+
       try {
         q().updateWorkOrderStatus.run('submitting', null, wo.id);
         // Make the reserve + 'submitting' intent DURABLE before the
         // non-idempotent POST (review finding #8). If power is lost after
         // Adobe accepts the POST but before this intent is fsynced, the WO
         // must NOT silently revert to 'planned' and get resubmitted.
-        durableCheckpoint();
+        // Fail CLOSED: if the checkpoint did not actually complete (busy),
+        // do NOT POST — release the reservation and revert to planned so the
+        // next run retries once the WAL can be flushed (review finding #5).
+        if (!durableCheckpoint()) {
+          release(creds.imsOrgId, wo.identifier_count, liveMonthlyLimit);
+          q().rollbackWorkOrderToPlanned.run(
+            'durability not confirmed (wal_checkpoint busy); will retry next run', wo.id);
+          deferred++;
+          return;
+        }
 
         const namespacesIdentities = JSON.parse(wo.namespaces_identities);
         const targetServices = wo.target_services_json ? JSON.parse(wo.target_services_json) : undefined;

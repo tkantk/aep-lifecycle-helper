@@ -116,9 +116,14 @@ export async function reconcileOrphanWorkOrders() {
           'recovery: matched orphan to existing Adobe work order');
       } else {
         // Adobe responded successfully and the order is not there. Safe to
-        // release quota and roll back. Pass job's monthly_limit so we don't
-        // decrement the monthly ledger on jobs that had it disabled.
-        release(creds.imsOrgId, wo.identifier_count, wo.j_monthly_limit);
+        // release quota and roll back. Release EXACTLY the monthly dimension
+        // reserve() used (persisted on the WO), so a job whose live monthly
+        // limit differed from job.monthly_limit doesn't leak the monthly
+        // ledger (review finding #4). NULL means monthly was not reserved →
+        // skip the monthly decrement (the safe direction: never decrement a
+        // ledger we didn't increment, which would under-count and risk a
+        // later over-ship).
+        release(creds.imsOrgId, wo.identifier_count, wo.reserved_monthly ?? null);
         q().rollbackWorkOrderToPlanned.run('rolled back after process crash', wo.id);
         logger.info({ localId: wo.id }, 'recovery: rolled back orphan to planned');
       }
@@ -275,7 +280,10 @@ export async function reconcileJobOrphans(jobId) {
         if (wo.status === 'failed') {
           const today = utcToday();
           q().upsertQuota.run(creds.imsOrgId, today, wo.identifier_count);
-          if (wo.j_monthly_limit != null && wo.j_monthly_limit > 0) {
+          // Re-reserve the monthly dimension ONLY if it was reserved at submit
+          // time (persisted on the WO), so we mirror exactly what Adobe spent
+          // (review finding #4).
+          if (wo.reserved_monthly != null && wo.reserved_monthly > 0) {
             q().upsertMonthlyQuota.run(creds.imsOrgId, utcYearMonth(), wo.identifier_count);
           }
         }
@@ -295,8 +303,9 @@ export async function reconcileJobOrphans(jobId) {
       // Not found in Adobe.
       if (wo.status === 'submitting') {
         // Safe to roll back — Adobe didn't get it. Release the still-held
-        // quota so the next submit run can retry cleanly.
-        release(creds.imsOrgId, wo.identifier_count, wo.j_monthly_limit);
+        // quota so the next submit run can retry cleanly. Use the persisted
+        // reserved monthly dimension, not job.monthly_limit (finding #4).
+        release(creds.imsOrgId, wo.identifier_count, wo.reserved_monthly ?? null);
         q().rollbackWorkOrderToPlanned.run(
           'reconcile: not found in Adobe — rolled back to planned', wo.id);
         rolledBack++;

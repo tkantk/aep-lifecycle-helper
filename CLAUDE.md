@@ -249,7 +249,23 @@ for a job — useful for operators whose contract has no monthly cap. In that
 mode only the daily dimension is checked, AND `release` skips the monthly
 decrement so it can't eat headroom from unrelated jobs on the same org that
 have monthly tracking on. **Pass the same `monthlyLimit` you passed to
-`reserve` — `submission.js` and `recovery.js` both use `job.monthly_limit`.**
+`reserve`.** Since the live monthly limit (`quotaSnapshot.monthly.quota`) can
+differ from `job.monthly_limit`, the effective value reserve() used is
+**persisted on the work order as `reserved_monthly`** at submit time, and
+`recovery.js` releases using *that* column — not `job.monthly_limit` — so the
+two dimensions can never disagree and leak the monthly ledger (review finding
+#4, 2026-05-31). NULL `reserved_monthly` = monthly was not reserved → skip the
+monthly decrement (the safe direction: never decrement a ledger we didn't
+increment).
+
+**Live-remaining enforcement (review blocker #1, 2026-05-31):** the local
+ledger only counts THIS process's reservations, so before every submit run
+`runSubmission` calls `quotaManager.seedFloor(org, daily.consumed,
+monthly.consumed)` to raise the ledger UP to Adobe's reported org-wide
+`consumed` (MAX, never lower). This makes `reserve` — which still compares
+`used + count` against the full cap — mathematically enforce Adobe's true
+*remaining*, closing the over-ship via the explicit-bucket path and the
+sequential-`/quota`-lag path.
 
 Any code that submits a work order MUST pair `reserve` with `release`
 in a try/catch. **Exception**: on network timeout we don't know if Adobe

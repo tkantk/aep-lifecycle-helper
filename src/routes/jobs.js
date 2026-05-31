@@ -150,13 +150,20 @@ router.post('/:id/submit', async (req, res, next) => {
       return next(err);
     }
 
-    // The actual submission runs async — we kick it off, return 200, and the
-    // UI polls /work-orders for progress. Errors (including quota_unavailable
-    // from runSubmission's pre-flight refresh) are logged; the operator sees
-    // the deferred/failed state on the next /work-orders poll.
-    runSubmission({ jobId: job.id, dayIndex, monthIndex }).catch(err =>
-      logger.error({ jobId: job.id, err: err.message, code: err.code }, 'submission run crashed'));
-    res.json({ ok: true });
+    // The actual submission runs async — we kick it off and return 202. So a
+    // preflight failure (e.g. quota_unavailable) isn't lost, clear any stale
+    // error now and PERSIST the failure to the job on rejection, making it
+    // observable via GET /api/jobs/:id instead of only logged (review finding
+    // #10). The UI polls and surfaces job.last_error.
+    q().setJobError.run(null, job.id);
+    runSubmission({ jobId: job.id, dayIndex, monthIndex }).catch(err => {
+      logger.error({ jobId: job.id, err: err.message, code: err.code }, 'submission run crashed');
+      try {
+        const prefix = err.code === 'quota_unavailable' ? 'Submit blocked: ' : 'Submit failed: ';
+        q().setJobError.run(prefix + (err.message || String(err)), job.id);
+      } catch (e) { logger.warn({ jobId: job.id, err: e.message }, 'failed to persist submit error'); }
+    });
+    res.json({ ok: true, async: true });
   } catch (err) { next(err); }
 });
 

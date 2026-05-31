@@ -23,6 +23,7 @@ process.env.OUTPUT_DIR = os.tmpdir();
 const { initDb, q } = await import('../src/db.js');
 const { storeCreds } = await import('../src/utils/crypto.js');
 const { reconcileOrphanWorkOrders, resumeExpandingJobs } = await import('../src/runner/recovery.js');
+const { reserve, peek } = await import('../src/services/quotaManager.js');
 
 const GATEWAY = 'https://platform.adobe.io';
 
@@ -242,6 +243,43 @@ test('reconcile: transient error leaves orphan alone for next startup', async ()
   const wo = q().getAllOrdersForJob.all(jobId)[0];
   assert.equal(wo.status, 'submitting');
   assert.equal(wo.adobe_workorder_id, null);
+});
+
+test('reconcile: rollback releases the EFFECTIVE monthly dimension (no monthly leak)', async () => {
+  // Review finding #4 (R2): submission reserved with a LIVE monthly limit even
+  // though the job row has monthly tracking disabled. The persisted
+  // reserved_monthly must drive release, so rollback decrements BOTH ledgers.
+  // Pre-fix, release used job.monthly_limit (null) and the monthly ledger
+  // leaked (daily -> 0 but monthly stayed at 100).
+  const { jobId } = seedCredAndJob({ name: 'monthly-leak' });
+  const imsOrgId = `org-${seq}@AcmeOrg`;
+  const localId = `wo-mleak-${seq}`;
+  seedOrphanWorkOrder(jobId, localId);          // identifier_count = 2
+  const COUNT = 2;
+
+  // Simulate submission reserving against BOTH dimensions with a live monthly
+  // cap, and persisting that effective monthly limit on the WO.
+  const r = reserve(imsOrgId, COUNT, 1_000_000, 3_000_000);
+  assert.equal(r.granted, true);
+  q().setReservedMonthly.run(3_000_000, localId);
+  assert.equal(peek(imsOrgId, 1_000_000, 3_000_000).daily.used, COUNT);
+  assert.equal(peek(imsOrgId, 1_000_000, 3_000_000).monthly.used, COUNT);
+
+  mockIms();
+  // persist: this run reconciles EVERY orphan in the DB (including any left
+  // 'submitting' by earlier tests); all must get the empty-results response.
+  nock(GATEWAY).persist()
+    .get(/\/data\/core\/hygiene\/workorder/)
+    .query(true)
+    .reply(200, { results: [], total: 0, count: 0 });
+
+  await reconcileOrphanWorkOrders();
+
+  const after = peek(imsOrgId, 1_000_000, 3_000_000);
+  assert.equal(after.daily.used, 0, 'daily ledger released');
+  assert.equal(after.monthly.used, 0, 'monthly ledger MUST be released too (no leak)');
+  const wo = q().getAllOrdersForJob.all(jobId)[0];
+  assert.equal(wo.status, 'planned');
 });
 
 // ─── resumeExpandingJobs ──────────────────────────────────────────────────────

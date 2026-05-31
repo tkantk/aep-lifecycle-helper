@@ -41,6 +41,40 @@ after(() => {
   try { fs.rmSync(uploadDir, { recursive: true, force: true }); } catch { /* */ }
 });
 
+test('expansion fails closed when the Identity Graph returns zero linked members (empty {clusters:[]})', async () => {
+  // Review finding #2 (R2): a 200 {clusters:[]} (wrong region / wrong nsid /
+  // empty graph) must NOT yield a source-only deletion plan. The job is marked
+  // failed, not expanded.
+  const credsId = storeCreds({
+    label: 'EmptyGraph', environment: 'prod', region: 'VA7',
+    imsOrgId: 'emptygraph-org@AcmeOrg', clientId: 'emptygraph-client', clientSecret: 'secret',
+  });
+  const csv = path.join(uploadDir, 'eg.csv');
+  fs.writeFileSync(csv, 'src-a\nsrc-b\n');
+  const jobId = 'emptygraph-job';
+  q().insertJob.run({
+    id: jobId, name: 'EmptyGraph', credsId, sandboxName: 'prod',
+    datasetIds: 'ALL', targetServicesJson: null,
+    sourceNamespace: 'hashedKocid', sourceNamespaceId: 11124296,
+    dailyLimit: 1_000_000, monthlyLimit: null, uploadPath: csv, totalSourceIds: 2,
+  });
+
+  nock(IMS).post('/ims/token/v3').reply(200, { access_token: 'tok', expires_in: 86400 });
+  nock(REGION).get('/data/core/idnamespace/identities').reply(200, [
+    { id: 11124296, code: 'hashedKocid', name: 'Hashed KOCID', custom: true, status: 'ACTIVE' },
+  ]);
+  // Adobe returns NO clusters at all — the wrong-region/empty fingerprint.
+  nock(REGION).post('/data/core/identity/clusters/members').reply(200, { version: '1.1.0', clusters: [] });
+
+  await assert.rejects(() => runExpansion({
+    jobId, uploadPath: csv, sourceNamespace: 'hashedKocid', sourceNamespaceId: 11124296,
+    credsId, sandboxName: 'prod', column: 0,
+  }));
+
+  assert.equal(q().getJob.get(jobId).status, 'failed',
+    'an all-empty graph must mark the job failed, not expanded');
+});
+
 test('expansion fails closed when the namespace registry cannot be loaded', async () => {
   const credsId = storeCreds({
     label: 'FailClosed', environment: 'prod', region: 'VA7',
