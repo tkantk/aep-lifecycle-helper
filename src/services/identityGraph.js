@@ -73,11 +73,13 @@ export async function expandBatch({ creds, sandboxName, namespace, namespaceId, 
   const compositeXids = ids.map(id => {
     const x = { id };
     if (namespace) x.ns = namespace;
-    // Only template a FINITE nsid into the body. A NaN (from Number('abc'))
+    // Only template a FINITE nsid into the body. Guard null/undefined FIRST —
+    // Number(null) === 0 is finite, so a bare isFinite() check would wrongly
+    // send "nsid": 0 when no nsid was supplied. A NaN (from Number('abc'))
     // would serialize as "nsid": null and could mis-target the graph — review
     // finding #8. The upload route + expansion runner already coerce upstream;
     // this is the last line of defense at the wire.
-    if (Number.isFinite(Number(namespaceId))) x.nsid = Number(namespaceId);
+    if (namespaceId != null && Number.isFinite(Number(namespaceId))) x.nsid = Number(namespaceId);
     return x;
   });
 

@@ -38,6 +38,21 @@ test('expandBatch omits a non-finite nsid (never sends nsid:null)', async () => 
   assert.ok(!('nsid' in x), 'a non-finite nsid must be omitted, not sent as null');
 });
 
+test('expandBatch omits nsid when none is supplied (null is not nsid:0)', async () => {
+  // Regression guard: Number(null) === 0 is finite, so the wire guard must
+  // check null/undefined BEFORE isFinite, or it would send nsid:0.
+  for (const noNsid of [null, undefined]) {
+    let body = null;
+    nock(REGION).post('/data/core/identity/clusters/members', b => { body = b; return true; })
+      .reply(200, { version: '1.1.0', clusters: [] });
+    await expandBatch({
+      creds, sandboxName: 'prod', namespace: 'hashedKocid',
+      namespaceId: noNsid, ids: ['src-a'], namespaceIndex: undefined,
+    });
+    assert.ok(!('nsid' in body.compositeXids[0]), `nsid must be omitted for ${String(noNsid)}, not 0`);
+  }
+});
+
 test('expandBatch keeps a valid finite nsid', async () => {
   let body = null;
   nock(REGION).post('/data/core/identity/clusters/members', b => { body = b; return true; })
