@@ -50,6 +50,10 @@ export const config = {
   // endpoints aren't exposed to other hosts on the network. Set HOST=0.0.0.0
   // explicitly only when you intend to expose it (e.g. SSH tunnel demo).
   host: process.env.HOST || '127.0.0.1',
+  // Binding anywhere other than loopback exposes the UNAUTHENTICATED,
+  // destructive API to the network. Require an explicit opt-in so it can
+  // never happen by a stray HOST=0.0.0.0 alone (review hardening).
+  allowNonLoopback: process.env.ALLOW_NON_LOOPBACK === '1',
   openBrowser: process.env.OPEN_BROWSER !== '0',
 
   // ─── Paths ─────────────────────────────────────────────────────────

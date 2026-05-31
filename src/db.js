@@ -674,3 +674,18 @@ export function bulkInsertIdentities(rows) {
 }
 
 export const q = () => prepared();
+
+/**
+ * Force the WAL to disk (fsync) so a just-committed transaction is durable
+ * even under synchronous=NORMAL (review finding #8). We keep NORMAL globally
+ * for expansion throughput, but the submit-intent transition
+ * (reserve quota + status='submitting') MUST survive power loss: if it were
+ * lost, the work order would revert to 'planned' on restart and could be
+ * resubmitted to Adobe — a duplicate irreversible delete. Call this right
+ * before the non-idempotent hygiene POST. Best-effort; a checkpoint failure
+ * (e.g. a concurrent reader) is non-fatal and will be retried on the next
+ * submit / shutdown checkpoint.
+ */
+export function durableCheckpoint() {
+  try { db.pragma('wal_checkpoint(FULL)'); } catch { /* best-effort */ }
+}

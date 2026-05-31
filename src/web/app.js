@@ -1581,10 +1581,10 @@ async function renderSubmit() {
           <thead><tr><th>Local ID</th><th>Status</th><th>Identities</th><th>Adobe Work Order ID</th></tr></thead>
           <tbody>${today.map(w => `
             <tr>
-              <td class="mono">${w.id.slice(0, 8)}…</td>
-              <td><span class="pill ${w.status}">${w.status}</span></td>
+              <td class="mono">${escape(w.id.slice(0, 8))}…</td>
+              <td><span class="pill ${escape(w.status)}">${escape(w.status)}</span></td>
               <td class="num">${w.identifier_count.toLocaleString()}</td>
-              <td class="mono" style="color: var(--g600)">${w.adobe_workorder_id ? w.adobe_workorder_id.slice(0, 28) + '…' : '—'}</td>
+              <td class="mono" style="color: var(--g600)">${w.adobe_workorder_id ? escape(w.adobe_workorder_id.slice(0, 28)) + '…' : '—'}</td>
             </tr>`).join('')}
           </tbody>
         </table>

@@ -29,10 +29,78 @@ const jobsRouter     = (await import('./routes/jobs.js')).default;
 const adobeRouter    = (await import('./routes/adobe.js')).default;
 const settingsRouter = (await import('./routes/settings.js')).default;
 
+// ─── Refuse non-loopback bind without explicit acknowledgment ───────────
+// The API has no authentication and submits irreversible deletes. Binding to
+// anything other than loopback exposes it to the network, so a stray
+// HOST=0.0.0.0 must be paired with ALLOW_NON_LOOPBACK=1 (review hardening).
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', 'localhost']);
+if (!LOOPBACK_HOSTS.has(config.host) && !config.allowNonLoopback) {
+  logger.error(
+    `Refusing to bind to non-loopback host "${config.host}" without ALLOW_NON_LOOPBACK=1. ` +
+    `This API is unauthenticated and performs irreversible deletions — exposing it to the ` +
+    `network is dangerous. Set ALLOW_NON_LOOPBACK=1 only for an SSH-tunneled/trusted setup.`);
+  process.exit(1);
+}
+
 // ─── Ensure data directories exist ──────────────────────────────────────
+fs.mkdirSync(config.dataDir, { recursive: true });
 fs.mkdirSync(config.uploadDir, { recursive: true });
 fs.mkdirSync(config.outputDir, { recursive: true });
 fs.mkdirSync(path.dirname(config.dbPath), { recursive: true });
+
+// ─── Single-process advisory lock ───────────────────────────────────────
+// Two instances against the same state.db corrupt the WAL (no multi-writer
+// coordination). Take an exclusive lock file; reclaim it only if the recorded
+// pid is no longer alive (stale lock after a crash). Released on shutdown.
+const lockPath = path.join(config.dataDir, '.lock');
+function acquireSingleProcessLock() {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const fd = fs.openSync(lockPath, 'wx');   // O_EXCL — fails if it exists
+      fs.writeSync(fd, String(process.pid));
+      fs.closeSync(fd);
+      return;
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err;
+      const existingPid = Number(fs.readFileSync(lockPath, 'utf8').trim());
+      let alive = false;
+      try { process.kill(existingPid, 0); alive = true; } catch (e) { alive = e.code === 'EPERM'; }
+      if (alive && existingPid !== process.pid) {
+        logger.error(
+          `Another instance (pid ${existingPid}) is already running against ${config.dataDir}. ` +
+          `Running two instances on one state.db corrupts the WAL. Stop the other instance first, ` +
+          `or use a separate DATA_DIR.`);
+        process.exit(1);
+      }
+      // Stale lock (pid not alive) — remove and retry once.
+      logger.warn({ stalePid: existingPid }, 'reclaiming stale single-process lock');
+      try { fs.unlinkSync(lockPath); } catch { /* */ }
+    }
+  }
+  throw new Error('could not acquire single-process lock');
+}
+acquireSingleProcessLock();
+
+// ─── Purge orphaned upload files ────────────────────────────────────────
+// CSV uploads carry raw customer identifiers. Remove any upload file in the
+// upload dir that no job references (e.g. left behind by a force-deleted job
+// or an interrupted upload) so customer data isn't retained indefinitely
+// (review hardening). Job-referenced uploads are kept for crash-resume.
+function purgeOrphanedUploads() {
+  try {
+    const referenced = new Set(
+      db.prepare(`SELECT upload_path FROM jobs WHERE upload_path IS NOT NULL`)
+        .all().map(r => path.resolve(r.upload_path)));
+    let purged = 0;
+    for (const name of fs.readdirSync(config.uploadDir)) {
+      const full = path.resolve(config.uploadDir, name);
+      if (!referenced.has(full)) { try { fs.unlinkSync(full); purged++; } catch { /* */ } }
+    }
+    if (purged > 0) logger.info({ purged }, 'purged orphaned upload files (no referencing job)');
+  } catch (err) {
+    logger.warn({ err: err.message }, 'orphaned-upload purge failed (non-fatal)');
+  }
+}
 
 // Warn loudly if `data/` sits inside a cloud-sync path — the encryption key
 // and all encrypted credentials live there. Syncing them to a third-party
@@ -47,6 +115,7 @@ if (cloudSync) {
 
 // ─── Init SQLite schema ─────────────────────────────────────────────────
 initDb();
+purgeOrphanedUploads();
 
 // ─── Express app ────────────────────────────────────────────────────────
 const app = express();
@@ -197,6 +266,7 @@ function shutdown(sig) {
     if (err) logger.error({ err: err.message }, 'server close error');
     try { db.pragma('wal_checkpoint(TRUNCATE)'); } catch (e) { logger.warn({ err: e.message }, 'wal_checkpoint failed'); }
     try { db.close(); } catch (e) { logger.warn({ err: e.message }, 'db close failed'); }
+    try { fs.unlinkSync(lockPath); } catch { /* best-effort lock release */ }
     clearTimeout(timer);
     logger.info('shutdown complete');
     process.exit(0);

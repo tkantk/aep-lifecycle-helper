@@ -4,7 +4,7 @@ import { submitWorkOrder } from '../services/hygiene.js';
 import { reserve, release } from '../services/quotaManager.js';
 import { getOrgQuota } from '../services/quotaApi.js';
 import { redistributeUnshippedOrders } from './redistributor.js';
-import { q, db, prepareStreamIdentitiesBySource } from '../db.js';
+import { q, db, prepareStreamIdentitiesBySource, durableCheckpoint } from '../db.js';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { decryptCreds } from '../utils/crypto.js';
@@ -366,6 +366,11 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
 
       try {
         q().updateWorkOrderStatus.run('submitting', null, wo.id);
+        // Make the reserve + 'submitting' intent DURABLE before the
+        // non-idempotent POST (review finding #8). If power is lost after
+        // Adobe accepts the POST but before this intent is fsynced, the WO
+        // must NOT silently revert to 'planned' and get resubmitted.
+        durableCheckpoint();
 
         const namespacesIdentities = JSON.parse(wo.namespaces_identities);
         const targetServices = wo.target_services_json ? JSON.parse(wo.target_services_json) : undefined;
