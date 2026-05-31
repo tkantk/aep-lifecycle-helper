@@ -9,6 +9,97 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-05-31 — External review remediation (4 blockers + 7 high-priority + hardening)
+
+Context: an external review flagged four production-blocking paths that could
+duplicate deletions or target unintended identifiers, plus seven high-priority
+correctness/durability findings and a set of hardening items. Each finding was
+independently verified against the code, our own docs, and Adobe's live
+documentation before fixing. All fixes are test-first; regression tests use
+Adobe's **real** response shapes (the old tests mocked the wrong ones, which is
+how blocker #2 hid). Suite: **197 → 210** tests, all passing.
+
+> **Test command changed.** `npm test` now runs `node scripts/test.mjs`
+> (`node --test` discovery + a deterministic test ENCRYPTION_KEY). The old
+> `node --test test` script is broken on Node ≥ 23 (the positional `test` is
+> parsed as a single test name). Works on Node 20 and 23.
+
+### Blockers
+
+- **#1 — Re-plan duplicated deferred deletes.** `db.js::deletePlannedOrders`
+  deleted only `planned` + `awaiting_approval`, but the planner allows re-plan
+  while `deferred` rows exist. A surviving deferred WO plus the freshly
+  re-emitted planned WO covered the same identities → duplicate irreversible
+  delete on the next submit. Fix: `deletePlannedOrders` now also clears
+  `deferred`. (Updated CLAUDE.md I10.) Test in `test/planWorkOrders.test.js`.
+- **#2 — Recovery misread Adobe's list response.**
+  `recovery.js::findAdobeWorkOrderByDisplayNamePrefix` looked for
+  `data.workorders`/`data.items`; Adobe's live endpoint returns matches under
+  **`results`** (`{ results, total, count, _links }`). An accepted-but-
+  uncertain WO was therefore reported ABSENT → rolled back → resubmitted. Fix:
+  parse `results` (plus a bare array / legacy containers) **and fail CLOSED** —
+  any unrecognized 200 shape is now `LOOKUP_INDETERMINATE` (leave the orphan
+  alone), never a rollback. Tests in `test/recovery.test.js` use the real
+  `results` shape + an unrecognized-shape case.
+- **#3 — Scheduled submit ignored quota buckets.** The no-bucket path
+  (`runSubmission` with neither month nor day — used by the auto-resume
+  scheduler and the default Submit) loaded EVERY planned/deferred order and
+  gated only on a local ledger seeded from the full daily cap, not Adobe's live
+  `remaining`. It shipped past today's remaining. Fix: the no-bucket path now
+  ships only the current `(lowest month, lowest day)` window the redistributor
+  sized to live remaining. Test in `test/submissionBuckets.test.js`.
+- **#4 — Expansion recovery could target the wrong CSV column.** The upload-
+  time `column` was never persisted; `recovery.js` hardcoded `column: 0`. Fix:
+  new `jobs.source_column` (migration, default `'0'`), persisted via
+  `setJobSourceColumn` in the upload route, read by recovery. Test in
+  `test/recoveryColumn.test.js`.
+
+### High-priority
+
+- **#5 — `DATA_DIR` only moved the key.** `dbPath`/`uploadDir`/`outputDir` were
+  hardcoded to `<cwd>/data`, so the documented OneDrive mitigation didn't move
+  the SQLite DB. Now all three derive from `dataDir`. Test `test/config.test.js`.
+- **#6 — Quota failed open.** A 200 with an unrecognized shape left
+  `quotaSnapshot.daily = null`, and submission silently fell back to the static
+  `job.daily_limit`. `runSubmission` now fails CLOSED (`quota_unavailable`)
+  when there is no recognized daily entitlement. (`getOrgQuota` stays graceful
+  for the UI banner — fail-closed is enforced at the destructive boundary.)
+- **#7 — Quota bookkeeping wasn't transactional.** `reserve`/`release` wrote
+  the daily and monthly ledgers as two separate statements (the "single
+  transaction" comment was aspirational). Both are now wrapped in
+  `db.transaction()`.
+- **#8 — Local durability weaker than the irreversible action.** Kept
+  `synchronous=NORMAL` globally (expansion throughput), but added a scoped
+  `durableCheckpoint()` (`wal_checkpoint(FULL)`) of the reserve + `submitting`
+  intent immediately before the non-idempotent POST, so power loss can't revert
+  a shipped WO to `planned` and resubmit it.
+- **#9 — Monitor starved orders past the first 100.** `listOpenWorkOrders` used
+  `LIMIT 100` with no ordering. New `work_orders.last_polled_at` cursor +
+  `ORDER BY` (never-polled first); the monitor stamps it on every attempt so
+  every open WO is eventually polled. Test `test/monitorPoll.test.js`.
+- **#10 — Namespace handling too optimistic.** Expansion now fails CLOSED when
+  the namespace registry can't be loaded, or when the source namespace isn't in
+  the registry and no nsid was supplied (previously it warned and expanded
+  blind → empty clusters → silent partial delete). Test
+  `test/expansionFailClosed.test.js`.
+- **#11 — Vulnerable dependencies.** `npm audit fix` (axios high + qs/express
+  moderate) and `uuid → ^11.1.1`. `npm audit` now reports 0 vulnerabilities.
+
+### Additional hardening
+
+- Refuse non-loopback bind unless `ALLOW_NON_LOOPBACK=1` (`config.js` +
+  `index.js`).
+- Single-process advisory lock (`data/.lock`, pid-checked + stale-reclaimed,
+  released on shutdown) — refuses a second instance on one `state.db`.
+- Escape Adobe-derived `adobe_workorder_id`/`status` in the Submit-tab table
+  (`web/app.js`); the detail card already escaped.
+- `canonicalizeNamespace` coerces ids to a finite integer or null (never NaN).
+- Purge orphaned upload CSVs (raw customer identifiers) at startup.
+- `MONTHLY_IDENTIFIER_LIMIT=0` is preserved as "monthly disabled" (was reverted
+  to 3M by `|| default`).
+
+---
+
 ## 2026-05-30 — Rendered diagrams + auto-load tightening + docs refresh
 
 ### Docs (`docs/diagrams/`, `docs/DESIGN_DOC.{md,docx}`)

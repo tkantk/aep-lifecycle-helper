@@ -330,6 +330,15 @@ mirrors the guard: the Plan tab no longer auto-POSTs `/plan` on tab
 entry, and the "↻ Re-plan" button auto-disables once any order has
 shipped, with a tooltip explaining why.
 
+**Critical (2026-05-31, review blocker #1):** because re-plan is allowed
+while `deferred` rows exist, `db.js::deletePlannedOrders` MUST clear
+`deferred` too — it deletes `('planned','awaiting_approval','deferred')`.
+If it left `deferred` rows behind, the surviving deferred WO plus the
+freshly re-emitted planned WO would cover the SAME identities and the
+next Submit would ship both → duplicate irreversible delete. Any status
+that is on the "safe to re-plan over" list above MUST also be in
+`deletePlannedOrders`'s delete set. Keep the two lists in lockstep.
+
 **Phase 2 refinement (2026-05-15):** At the end of `planWorkOrders`,
 `markFutureMonthsAwaitingApproval` flips all Month 2+ WOs from `planned`
 to `awaiting_approval`. These WOs are invisible to `runSubmission` (and
