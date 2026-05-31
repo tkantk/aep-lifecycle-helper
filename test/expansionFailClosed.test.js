@@ -75,6 +75,46 @@ test('expansion fails closed when the Identity Graph returns zero linked members
     'an all-empty graph must mark the job failed, not expanded');
 });
 
+test('empty-graph fail-closed also fires on a RESUME (crash mid-empty-expansion does not bypass it)', async () => {
+  // Review re-review (#2): the guard must NOT be skipped just because this is a
+  // resume (skipSourceIds set). A wrong-region job that crashed mid-expansion
+  // would otherwise resume and be marked 'expanded' with a source-only plan.
+  // The persisted graph_members_seen counter makes the check correct across
+  // the crash boundary.
+  const credsId = storeCreds({
+    label: 'EmptyResume', environment: 'prod', region: 'VA7',
+    imsOrgId: 'emptyresume-org@AcmeOrg', clientId: 'emptyresume-client', clientSecret: 'secret',
+  });
+  const csv = path.join(uploadDir, 'er.csv');
+  fs.writeFileSync(csv, 'src-a\nsrc-b\n');
+  const jobId = 'emptyresume-job';
+  q().insertJob.run({
+    id: jobId, name: 'EmptyResume', credsId, sandboxName: 'prod',
+    datasetIds: 'ALL', targetServicesJson: null,
+    sourceNamespace: 'hashedKocid', sourceNamespaceId: 11124296,
+    dailyLimit: 1_000_000, monthlyLimit: null, uploadPath: csv, totalSourceIds: 2,
+  });
+  // Simulate the prior fresh run: it processed src-a, found ZERO linked members
+  // (empty graph), then crashed before the completion guard ran.
+  q().incrementJobCounters.run(1, 1, 0, jobId);   // processed=1, found=1, members=0
+  q().updateJobStatus.run('expanding', null, jobId);
+
+  nock(IMS).post('/ims/token/v3').reply(200, { access_token: 'tok', expires_in: 86400 });
+  nock(REGION).get('/data/core/idnamespace/identities').reply(200, [
+    { id: 11124296, code: 'hashedKocid', name: 'Hashed KOCID', custom: true, status: 'ACTIVE' },
+  ]);
+  nock(REGION).post('/data/core/identity/clusters/members').reply(200, { version: '1.1.0', clusters: [] });
+
+  await assert.rejects(() => runExpansion({
+    jobId, uploadPath: csv, sourceNamespace: 'hashedKocid', sourceNamespaceId: 11124296,
+    credsId, sandboxName: 'prod', column: 0,
+    skipSourceIds: new Set(['src-a']),   // RESUME
+  }));
+
+  assert.equal(q().getJob.get(jobId).status, 'failed',
+    'a resume of an all-empty expansion must still fail closed');
+});
+
 test('expansion fails closed when the namespace registry cannot be loaded', async () => {
   const credsId = storeCreds({
     label: 'FailClosed', environment: 'prod', region: 'VA7',

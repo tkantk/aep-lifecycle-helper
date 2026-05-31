@@ -88,7 +88,11 @@ export async function runExpansion({
   if (resolvedNsid == null && namespaceIndex && sourceNamespace) {
     const hit = namespaceIndex.byCode.get(sourceNamespace);
     if (hit) {
-      resolvedNsid = Number(hit.id);
+      // Normalize the registry id too (review #8 follow-up): a corrupt
+      // non-numeric registry id must not become NaN. Fall back to code-only
+      // (resolvedNsid stays null) rather than send a NaN nsid.
+      const rid = Number(hit.id);
+      resolvedNsid = Number.isInteger(rid) && rid >= 0 ? rid : null;
       logger.info({ jobId, sourceNamespace, resolvedNsid }, 'resolved source namespace nsid from registry');
     } else {
       // FAIL CLOSED (review finding #10): the source namespace isn't in the
@@ -112,7 +116,8 @@ export async function runExpansion({
   // against an unintended namespace.
   if (resolvedNsid != null && namespaceIndex && sourceNamespace) {
     const hit = namespaceIndex.byCode.get(sourceNamespace);
-    if (hit && Number(hit.id) !== resolvedNsid) {
+    const regId = hit ? Number(hit.id) : null;
+    if (hit && Number.isInteger(regId) && regId !== resolvedNsid) {
       const msg = `source namespace "${sourceNamespace}" maps to nsid ${hit.id} in the registry, ` +
         `but nsid ${resolvedNsid} was supplied — refusing to expand against a mismatched code/nsid pair`;
       logger.error({ jobId, sourceNamespace, registryNsid: hit.id, suppliedNsid: resolvedNsid }, msg);
@@ -138,10 +143,6 @@ export async function runExpansion({
   let wave   = [];
   let aborted = false;
   let skipped = 0;
-  // Total linked members Adobe returned across the whole run (review finding
-  // #2). 0 across a fresh expansion is the wrong-region/empty-graph fingerprint
-  // and triggers a fail-closed below.
-  let jobLinkedTotal = 0;
 
   // ─── Per-batch timing instrumentation ─────────────────────────────────
   // Tracks rolling p50/p95 of `adobeMs` (Identity Graph round-trip) and
@@ -180,7 +181,6 @@ export async function runExpansion({
       // If this is zero across every batch, either the namespace is wrong for this
       // sandbox or the IDs don't exist in any cluster.
       const linkedTotal = results.reduce((n, r) => n + r.linkedIdentities.length, 0);
-      jobLinkedTotal += linkedTotal;
 
       // Flatten to row tuples for bulk insert.
       // Row shape: [job_id, ns_code, ns_id, identity_id, source_id]
@@ -199,7 +199,7 @@ export async function runExpansion({
 
       const t1 = Date.now();
       const inserted = bulkInsertIdentities(rows);
-      q().incrementJobCounters.run(batch.length, inserted, jobId);
+      q().incrementJobCounters.run(batch.length, inserted, linkedTotal, jobId);
       const sqliteMs = Date.now() - t1;
 
       progress.processed += batch.length;
@@ -318,17 +318,21 @@ export async function runExpansion({
   try {
     await drainWave();
 
-    // FAIL CLOSED on an all-empty graph (review finding #2). When a FRESH
-    // expansion processed real sources but Adobe returned ZERO linked members
-    // for ALL of them, that is the wrong-region / wrong-nsid / 200-empty
-    // fingerprint. Proceeding would emit a source-ONLY deletion plan, silently
-    // leaving every linked email/phone/CRMID alive. We skip this guard on a
-    // resume (skipSourceIds set) — the original fresh run already applied it —
-    // and honor an explicit operator override.
-    if (!skipSourceIds && !config.allowEmptyGraph &&
-        progress.processed > 0 && jobLinkedTotal === 0) {
+    // FAIL CLOSED on an all-empty graph (review finding #2). When the job
+    // processed real sources but the Identity Graph returned ZERO linked
+    // members across ALL of them, that is the wrong-region / wrong-nsid /
+    // 200-empty fingerprint — proceeding would emit a source-ONLY deletion
+    // plan, silently leaving every linked email/phone/CRMID alive. We read the
+    // PERSISTED, cumulative counters (not run-local) so this is correct even
+    // when a previous run crashed mid-expansion and this is a resume: a fresh
+    // run that crashed before this check still incremented graph_members_seen
+    // per batch, so a genuinely-empty graph stays 0 across the resume too.
+    // Honor an explicit operator override.
+    const finalJob = q().getJob.get(jobId);
+    if (!config.allowEmptyGraph &&
+        finalJob.processed_count > 0 && (finalJob.graph_members_seen || 0) === 0) {
       throw new Error(
-        `Identity Graph returned 0 linked identities across all ${progress.processed} source(s) — ` +
+        `Identity Graph returned 0 linked identities across all ${finalJob.processed_count} source(s) — ` +
         `this usually means a wrong region/namespace for this sandbox. Refusing to ship a ` +
         `source-only deletion that would leave linked identities alive. ` +
         `Verify the credential region and source namespace; set ALLOW_EMPTY_GRAPH=1 to override ` +

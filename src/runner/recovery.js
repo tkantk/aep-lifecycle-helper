@@ -280,10 +280,17 @@ export async function reconcileJobOrphans(jobId) {
         if (wo.status === 'failed') {
           const today = utcToday();
           q().upsertQuota.run(creds.imsOrgId, today, wo.identifier_count);
-          // Re-reserve the monthly dimension ONLY if it was reserved at submit
-          // time (persisted on the WO), so we mirror exactly what Adobe spent
-          // (review finding #4).
-          if (wo.reserved_monthly != null && wo.reserved_monthly > 0) {
+          // Re-reserve the monthly dimension to mirror what Adobe actually
+          // spent (review finding #4). Prefer the persisted reserved_monthly;
+          // for a LEGACY 'failed' row from before that column existed
+          // (reserved_monthly NULL), fall back to the job-row monthly_limit so
+          // we DON'T under-count Adobe's monthly spend (the safe direction here
+          // is the ledger being higher — under-counting would risk a later
+          // monthly over-ship).
+          const monthlyOn = wo.reserved_monthly != null
+            ? wo.reserved_monthly > 0
+            : (wo.j_monthly_limit != null && wo.j_monthly_limit > 0);
+          if (monthlyOn) {
             q().upsertMonthlyQuota.run(creds.imsOrgId, utcYearMonth(), wo.identifier_count);
           }
         }

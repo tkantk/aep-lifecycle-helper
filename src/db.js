@@ -84,6 +84,7 @@ export function initDb() {
       total_source_ids    INTEGER NOT NULL DEFAULT 0,
       processed_count     INTEGER NOT NULL DEFAULT 0,
       found_count         INTEGER NOT NULL DEFAULT 0,
+      graph_members_seen  INTEGER NOT NULL DEFAULT 0,  -- cumulative linked members Adobe returned (review #2 empty-graph fail-closed; survives crash/resume)
       planned_orders      INTEGER NOT NULL DEFAULT 0,
       last_error          TEXT,
       created_at          TEXT NOT NULL DEFAULT (datetime('now')),
@@ -214,6 +215,10 @@ export function initDb() {
     // job row's monthly_limit, so reserve and release always agree on the
     // monthly dimension (no monthly-ledger leak on rollback).
     { table: 'work_orders', column: 'reserved_monthly', type: 'INTEGER' },
+    // Review #2 (R2): cumulative count of linked members the Identity Graph
+    // returned for the job. Persisted (not just run-local) so the empty-graph
+    // fail-closed check is correct across a crash + resume.
+    { table: 'jobs', column: 'graph_members_seen', type: 'INTEGER NOT NULL DEFAULT 0' },
   ];
   for (const { table, column, type } of additiveColumns) {
     try {
@@ -395,9 +400,10 @@ function prepared() {
     `),
     incrementJobCounters: db.prepare(`
       UPDATE jobs
-         SET processed_count = processed_count + ?,
-             found_count     = found_count + ?,
-             updated_at      = datetime('now')
+         SET processed_count    = processed_count + ?,
+             found_count        = found_count + ?,
+             graph_members_seen = graph_members_seen + ?,
+             updated_at         = datetime('now')
        WHERE id = ?
     `),
     setPlannedOrders: db.prepare(`UPDATE jobs SET planned_orders = ?, updated_at = datetime('now') WHERE id = ?`),

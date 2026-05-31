@@ -403,8 +403,11 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
         // next run retries once the WAL can be flushed (review finding #5).
         if (!durableCheckpoint()) {
           release(creds.imsOrgId, wo.identifier_count, liveMonthlyLimit);
-          q().rollbackWorkOrderToPlanned.run(
-            'durability not confirmed (wal_checkpoint busy); will retry next run', wo.id);
+          // Mark 'deferred' (not 'planned') so the in-memory tally and the
+          // persisted row agree; 'deferred' is on the safe re-plan/re-bucket
+          // list and is retried on the next run.
+          q().updateWorkOrderStatus.run(
+            'deferred', 'durability not confirmed (wal_checkpoint busy); will retry next run', wo.id);
           deferred++;
           return;
         }

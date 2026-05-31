@@ -1592,6 +1592,17 @@ async function renderSubmit() {
 
     renderActiveJobHeader('submit-body');
 
+    // Submit-failure banner (review #10): a fire-and-forget submit that failed
+    // its preflight (e.g. quota_unavailable) persists job.last_error. Surface
+    // it so the operator isn't left with a silent {ok:true}. Clears itself on
+    // the next successful submit (runSubmission's final updateJobStatus nulls it).
+    if (state.job && state.job.last_error) {
+      const errBanner = document.createElement('div');
+      errBanner.style.cssText = 'margin: 14px 0; padding: 12px 14px; background: rgba(244,67,54,0.08); border: 1px solid rgba(244,67,54,0.45); border-radius: 6px; font-size: 13px; line-height: 1.5';
+      errBanner.innerHTML = `<b>Last submit did not run.</b><br>${escape(state.job.last_error)}`;
+      $('#submit-body').insertBefore(errBanner, $('#submit-body').querySelector('.progress-head'));
+    }
+
     // Reconciliation banner: when there are work orders that are 'failed' or
     // 'submitting' WITHOUT an adobe_workorder_id, the operator might be in
     // the "Adobe processed but our local record doesn't know" state (real
@@ -1654,6 +1665,9 @@ async function renderSubmit() {
       http('GET', `/jobs/${state.job.id}/work-orders`),
       http('GET', `/jobs/${state.job.id}`),
     ]);
+    // Keep state.job fresh so render() sees the latest job row (incl.
+    // last_error persisted by a failed async submit — review #10 UI surface).
+    if (detail && detail.job) state.job = detail.job;
 
     // Phase 2: detect month_index drift across the poll. If the redistributor
     // (run on the server before each submit) extended the projected timeline,

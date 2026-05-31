@@ -150,12 +150,14 @@ router.post('/:id/submit', async (req, res, next) => {
       return next(err);
     }
 
-    // The actual submission runs async — we kick it off and return 202. So a
-    // preflight failure (e.g. quota_unavailable) isn't lost, clear any stale
-    // error now and PERSIST the failure to the job on rejection, making it
-    // observable via GET /api/jobs/:id instead of only logged (review finding
-    // #10). The UI polls and surfaces job.last_error.
-    q().setJobError.run(null, job.id);
+    // The actual submission runs async — we kick it off and return 200. So a
+    // preflight failure (e.g. quota_unavailable) isn't lost, PERSIST it to the
+    // job on rejection, making it observable via GET /api/jobs/:id instead of
+    // only logged (review finding #10). The UI polls and surfaces
+    // job.last_error. On a SUCCESSFUL run, runSubmission's final
+    // updateJobStatus(..., null, ...) clears last_error — so we deliberately do
+    // NOT clear here (a clear-at-start could be wiped by a no-op concurrent
+    // submit and erase a real error).
     runSubmission({ jobId: job.id, dayIndex, monthIndex }).catch(err => {
       logger.error({ jobId: job.id, err: err.message, code: err.code }, 'submission run crashed');
       try {
