@@ -83,11 +83,13 @@ export function peek(imsOrgId, dailyLimit, monthlyLimit) {
  */
 export function seedFloor(imsOrgId, dailyConsumed, monthlyConsumed) {
   db.transaction(() => {
+    // Pass `consumed` for BOTH `used` (raise the ledger to the floor) and
+    // `adobe_floor` (record the floor so release() can clamp at it) — review #3.
     if (Number.isFinite(dailyConsumed) && dailyConsumed > 0) {
-      q().upsertQuotaFloor.run(imsOrgId, utcToday(), dailyConsumed);
+      q().upsertQuotaFloor.run(imsOrgId, utcToday(), dailyConsumed, dailyConsumed);
     }
     if (monthlyConsumed != null && Number.isFinite(monthlyConsumed) && monthlyConsumed > 0) {
-      q().upsertMonthlyQuotaFloor.run(imsOrgId, utcYearMonth(), monthlyConsumed);
+      q().upsertMonthlyQuotaFloor.run(imsOrgId, utcYearMonth(), monthlyConsumed, monthlyConsumed);
     }
   })();
 }

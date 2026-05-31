@@ -23,7 +23,7 @@ const creds = { clientId: 'c', imsOrgId: 'o@AcmeOrg', clientSecret: 's', region:
 test('expandBatch omits a non-finite nsid (never sends nsid:null)', async () => {
   let body = null;
   nock(REGION).post('/data/core/identity/clusters/members', b => { body = b; return true; })
-    .reply(200, { version: '1.1.0', clusters: [] });
+    .reply(200, { version: '1.1.0', clusters: [{ compositeXid: { id: 'src-a' }, members: [] }] });
 
   await expandBatch({
     creds, sandboxName: 'prod', namespace: 'hashedKocid',
@@ -44,7 +44,7 @@ test('expandBatch omits nsid when none is supplied (null is not nsid:0)', async 
   for (const noNsid of [null, undefined]) {
     let body = null;
     nock(REGION).post('/data/core/identity/clusters/members', b => { body = b; return true; })
-      .reply(200, { version: '1.1.0', clusters: [] });
+      .reply(200, { version: '1.1.0', clusters: [{ compositeXid: { id: 'src-a' }, members: [] }] });
     await expandBatch({
       creds, sandboxName: 'prod', namespace: 'hashedKocid',
       namespaceId: noNsid, ids: ['src-a'], namespaceIndex: undefined,
@@ -53,10 +53,40 @@ test('expandBatch omits nsid when none is supplied (null is not nsid:0)', async 
   }
 });
 
+test('expandBatch fails closed when Adobe reports unprocessedXids (review #2)', async () => {
+  nock(REGION).post('/data/core/identity/clusters/members').reply(200, {
+    version: '1.1.0',
+    clusters: [{ compositeXid: { id: 'src-a' }, members: [{ nsid: 6, id: 'a@x.com' }] }],
+    unprocessedXids: ['src-b'],
+  });
+  await assert.rejects(
+    () => expandBatch({ creds, sandboxName: 'prod', namespace: 'hashedKocid', namespaceId: 6, ids: ['src-a', 'src-b'], namespaceIndex: undefined }),
+    /could not process/i);
+});
+
+test('expandBatch fails closed when a requested source is missing from the response (no positional fallback)', async () => {
+  // src-b requested but absent from clusters (and not matched by id). The old
+  // positional fallback would have emitted src-b as source-only.
+  nock(REGION).post('/data/core/identity/clusters/members').reply(200, {
+    version: '1.1.0',
+    clusters: [{ compositeXid: { id: 'src-a' }, members: [{ nsid: 6, id: 'a@x.com' }] }],
+  });
+  await assert.rejects(
+    () => expandBatch({ creds, sandboxName: 'prod', namespace: 'hashedKocid', namespaceId: 6, ids: ['src-a', 'src-b'], namespaceIndex: undefined }),
+    /did not include/i);
+});
+
+test('expandBatch fails closed on an unrecognized response shape', async () => {
+  nock(REGION).post('/data/core/identity/clusters/members').reply(200, { results: [], total: 0 });
+  await assert.rejects(
+    () => expandBatch({ creds, sandboxName: 'prod', namespace: 'hashedKocid', namespaceId: 6, ids: ['src-a'], namespaceIndex: undefined }),
+    /unrecognized response shape/i);
+});
+
 test('expandBatch keeps a valid finite nsid', async () => {
   let body = null;
   nock(REGION).post('/data/core/identity/clusters/members', b => { body = b; return true; })
-    .reply(200, { version: '1.1.0', clusters: [] });
+    .reply(200, { version: '1.1.0', clusters: [{ compositeXid: { id: 'src-a' }, members: [] }] });
 
   await expandBatch({
     creds, sandboxName: 'prod', namespace: 'hashedKocid',

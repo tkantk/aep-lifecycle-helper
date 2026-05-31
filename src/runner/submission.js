@@ -4,7 +4,7 @@ import { submitWorkOrder } from '../services/hygiene.js';
 import { reserve, release, seedFloor } from '../services/quotaManager.js';
 import { getOrgQuota } from '../services/quotaApi.js';
 import { redistributeUnshippedOrders } from './redistributor.js';
-import { q, db, prepareStreamIdentitiesBySource, durableCheckpoint } from '../db.js';
+import { q, db, prepareStreamIdentitiesBySource, setWorkOrderSubmittingDurable } from '../db.js';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { decryptCreds } from '../utils/crypto.js';
@@ -393,21 +393,14 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
       q().setReservedMonthly.run(liveMonthlyLimit ?? null, wo.id);
 
       try {
-        q().updateWorkOrderStatus.run('submitting', null, wo.id);
-        // Make the reserve + 'submitting' intent DURABLE before the
-        // non-idempotent POST (review finding #8). If power is lost after
-        // Adobe accepts the POST but before this intent is fsynced, the WO
-        // must NOT silently revert to 'planned' and get resubmitted.
-        // Fail CLOSED: if the checkpoint did not actually complete (busy),
-        // do NOT POST — release the reservation and revert to planned so the
-        // next run retries once the WAL can be flushed (review finding #5).
-        if (!durableCheckpoint()) {
+        // Durably commit the reserve + 'submitting' intent before the
+        // non-idempotent POST (review #8), via a synchronous=FULL commit rather
+        // than a (reader-blocking) wal_checkpoint (review #6). Fail CLOSED: if
+        // the durable write errors, do NOT POST — release and defer for retry.
+        if (!setWorkOrderSubmittingDurable(wo.id)) {
           release(creds.imsOrgId, wo.identifier_count, liveMonthlyLimit);
-          // Mark 'deferred' (not 'planned') so the in-memory tally and the
-          // persisted row agree; 'deferred' is on the safe re-plan/re-bucket
-          // list and is retried on the next run.
           q().updateWorkOrderStatus.run(
-            'deferred', 'durability not confirmed (wal_checkpoint busy); will retry next run', wo.id);
+            'deferred', 'durability not confirmed; will retry next run', wo.id);
           deferred++;
           return;
         }

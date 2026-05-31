@@ -810,10 +810,13 @@ npm start            # starts server, opens browser at http://localhost:3000
 ### 9.3 Running Tests
 
 ```bash
-node --test test
+npm test          # runs scripts/run-tests.mjs (node --test over test/*.test.js)
 ```
 
-All **197 tests** should pass. The suite covers:
+> The historical `node --test test` form is broken on Node ≥ 23 (the positional
+> `test` is parsed as a single test name). Use `npm test`.
+
+All **231 tests** should pass. The suite covers:
 - Work-order payload validators (27 tests)
 - Namespace canonicalization (11 tests)
 - IMS token cache (7 tests)

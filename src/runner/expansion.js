@@ -2,7 +2,7 @@ import pLimit from 'p-limit';
 import { expandBatch } from '../services/identityGraph.js';
 import { listNamespaces, buildNamespaceIndex } from '../services/namespaces.js';
 import { snapshotAndResetRateLimitHits } from '../services/adobeClient.js';
-import { bulkInsertIdentities, q } from '../db.js';
+import { insertIdentitiesAndCount, q } from '../db.js';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { streamIds } from '../utils/csv.js';
@@ -83,47 +83,40 @@ export async function runExpansion({
   // to null so the registry-resolution path below fires and a NaN can never be
   // templated into the /clusters/members body. Catches a bad nsid from ANY
   // caller (recovery, tests, future code), not just the upload route.
+  // Normalize a supplied nsid to a finite non-negative integer or null (review
+  // #8): Number('abc')===NaN must never reach the wire.
   let resolvedNsid = Number.isInteger(sourceNamespaceId) && sourceNamespaceId >= 0
     ? sourceNamespaceId : null;
-  if (resolvedNsid == null && namespaceIndex && sourceNamespace) {
-    const hit = namespaceIndex.byCode.get(sourceNamespace);
-    if (hit) {
-      // Normalize the registry id too (review #8 follow-up): a corrupt
-      // non-numeric registry id must not become NaN. Fall back to code-only
-      // (resolvedNsid stays null) rather than send a NaN nsid.
-      const rid = Number(hit.id);
-      resolvedNsid = Number.isInteger(rid) && rid >= 0 ? rid : null;
-      logger.info({ jobId, sourceNamespace, resolvedNsid }, 'resolved source namespace nsid from registry');
-    } else {
-      // FAIL CLOSED (review finding #10): the source namespace isn't in the
-      // org's registry AND the caller gave us no explicit nsid. Expanding
-      // would send an unrecognized namespace to the Identity Graph, get empty
-      // clusters back, and delete only the source ids — a silent partial
-      // delete. Abort instead.
-      const available = [...namespaceIndex.byCode.keys()].slice(0, 20);
-      logger.error({ jobId, sourceNamespace, availableSample: available },
-        'source namespace not found in registry and no nsid provided — aborting expansion');
-      const msg = `source namespace "${sourceNamespace}" not found in the sandbox's namespace registry`;
-      q().updateJobStatus.run('failed', msg, jobId);
-      liveProgress.delete(jobId);
-      throw new Error(msg);
-    }
-  }
 
-  // If the caller supplied BOTH a code and an nsid, verify they agree with the
-  // registry (review finding #8). A mismatched pair means the wrong nsid was
-  // selected for the namespace — fail closed rather than expand (and delete)
-  // against an unintended namespace.
-  if (resolvedNsid != null && namespaceIndex && sourceNamespace) {
+  // Validate the source namespace against the registry — FAIL CLOSED on any
+  // ambiguity (reviews #5 + #8 + #10):
+  //   (a) the code MUST exist in the org's registry (whether or not an nsid was
+  //       supplied — previously this was only checked when no nsid was given,
+  //       so a supplied nsid bypassed it, review #5);
+  //   (b) if both a code and an nsid are present, they MUST match exactly;
+  //   (c) when no nsid was supplied, resolve it from the registry.
+  // Expanding against an unrecognized/mismatched namespace would return empty
+  // clusters and delete only the source ids — a silent partial delete.
+  const failClosed = (msg) => {
+    logger.error({ jobId, sourceNamespace }, msg);
+    q().updateJobStatus.run('failed', msg, jobId);
+    liveProgress.delete(jobId);
+    throw new Error(msg);
+  };
+  if (namespaceIndex && sourceNamespace) {
     const hit = namespaceIndex.byCode.get(sourceNamespace);
-    const regId = hit ? Number(hit.id) : null;
-    if (hit && Number.isInteger(regId) && regId !== resolvedNsid) {
-      const msg = `source namespace "${sourceNamespace}" maps to nsid ${hit.id} in the registry, ` +
-        `but nsid ${resolvedNsid} was supplied — refusing to expand against a mismatched code/nsid pair`;
-      logger.error({ jobId, sourceNamespace, registryNsid: hit.id, suppliedNsid: resolvedNsid }, msg);
-      q().updateJobStatus.run('failed', msg, jobId);
-      liveProgress.delete(jobId);
-      throw new Error(msg);
+    if (!hit) {
+      failClosed(`source namespace "${sourceNamespace}" not found in the sandbox's namespace registry`);
+    }
+    const rid = Number(hit.id);
+    const regId = Number.isInteger(rid) && rid >= 0 ? rid : null;
+    if (resolvedNsid == null) {
+      resolvedNsid = regId;   // resolve from registry (may stay null if registry id is corrupt → code-only)
+      logger.info({ jobId, sourceNamespace, resolvedNsid }, 'resolved source namespace nsid from registry');
+    } else if (regId != null && regId !== resolvedNsid) {
+      failClosed(
+        `source namespace "${sourceNamespace}" maps to nsid ${hit.id} in the registry, but nsid ` +
+        `${resolvedNsid} was supplied — refusing to expand against a mismatched code/nsid pair`);
     }
   }
 
@@ -198,8 +191,10 @@ export async function runExpansion({
       }
 
       const t1 = Date.now();
-      const inserted = bulkInsertIdentities(rows);
-      q().incrementJobCounters.run(batch.length, inserted, linkedTotal, jobId);
+      // Rows + counters in ONE transaction so a crash can't leave committed
+      // rows with a stale graph_members_seen (which a resume would then skip,
+      // bypassing the empty-graph guard) — review #1.
+      const inserted = insertIdentitiesAndCount(rows, batch.length, linkedTotal, jobId);
       const sqliteMs = Date.now() - t1;
 
       progress.processed += batch.length;

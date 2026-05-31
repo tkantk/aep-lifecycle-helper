@@ -153,6 +153,11 @@ export function initDb() {
       ims_org_id  TEXT NOT NULL,
       utc_date    TEXT NOT NULL,
       used        INTEGER NOT NULL DEFAULT 0,
+      -- Adobe's observed org-wide consumed (set by seedFloor). Tracked
+      -- SEPARATELY from the used column (our reservations) so a release can
+      -- never drop the ledger below Adobe's reality and let a later reserve
+      -- over-ship (review #3). used is always kept >= adobe_floor.
+      adobe_floor INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (ims_org_id, utc_date)
     );
 
@@ -164,6 +169,7 @@ export function initDb() {
       ims_org_id      TEXT NOT NULL,
       utc_year_month  TEXT NOT NULL,   -- 'YYYY-MM' (e.g. '2026-04')
       used            INTEGER NOT NULL DEFAULT 0,
+      adobe_floor     INTEGER NOT NULL DEFAULT 0,   -- see quota_usage (review #3)
       PRIMARY KEY (ims_org_id, utc_year_month)
     );
 
@@ -219,6 +225,9 @@ export function initDb() {
     // returned for the job. Persisted (not just run-local) so the empty-graph
     // fail-closed check is correct across a crash + resume.
     { table: 'jobs', column: 'graph_members_seen', type: 'INTEGER NOT NULL DEFAULT 0' },
+    // Review #3 (R3): Adobe's observed floor, tracked separately from `used`.
+    { table: 'quota_usage',         column: 'adobe_floor', type: 'INTEGER NOT NULL DEFAULT 0' },
+    { table: 'quota_usage_monthly', column: 'adobe_floor', type: 'INTEGER NOT NULL DEFAULT 0' },
   ];
   for (const { table, column, type } of additiveColumns) {
     try {
@@ -569,8 +578,12 @@ function prepared() {
       INSERT INTO quota_usage (ims_org_id, utc_date, used) VALUES (?, ?, ?)
       ON CONFLICT(ims_org_id, utc_date) DO UPDATE SET used = used + excluded.used
     `),
+    // Release clamps at adobe_floor (NOT 0): a release only undoes OUR
+    // reservation, which sits ON TOP of Adobe's observed floor — it must never
+    // drop the ledger below what Adobe has already consumed, or a concurrent
+    // reserve could over-ship (review #3).
     decQuota: db.prepare(`
-      UPDATE quota_usage SET used = MAX(0, used - ?) WHERE ims_org_id = ? AND utc_date = ?
+      UPDATE quota_usage SET used = MAX(adobe_floor, used - ?) WHERE ims_org_id = ? AND utc_date = ?
     `),
     // Reconcile the daily ledger UP to Adobe's reported consumed (review
     // blocker #1). MAX (not +): never lowers a value, so it can't undo our own
@@ -578,8 +591,10 @@ function prepared() {
     // higher local value intact. Raising the floor to org-wide consumed makes
     // reserve() enforce Adobe's true remaining instead of just the full cap.
     upsertQuotaFloor: db.prepare(`
-      INSERT INTO quota_usage (ims_org_id, utc_date, used) VALUES (?, ?, ?)
-      ON CONFLICT(ims_org_id, utc_date) DO UPDATE SET used = MAX(used, excluded.used)
+      INSERT INTO quota_usage (ims_org_id, utc_date, used, adobe_floor) VALUES (?, ?, ?, ?)
+      ON CONFLICT(ims_org_id, utc_date) DO UPDATE SET
+        used        = MAX(used, excluded.used),
+        adobe_floor = MAX(adobe_floor, excluded.adobe_floor)
     `),
 
     // ─── Quota (monthly) ──────────────────────────────────────────────
@@ -589,12 +604,14 @@ function prepared() {
       ON CONFLICT(ims_org_id, utc_year_month) DO UPDATE SET used = used + excluded.used
     `),
     decMonthlyQuota: db.prepare(`
-      UPDATE quota_usage_monthly SET used = MAX(0, used - ?) WHERE ims_org_id = ? AND utc_year_month = ?
+      UPDATE quota_usage_monthly SET used = MAX(adobe_floor, used - ?) WHERE ims_org_id = ? AND utc_year_month = ?
     `),
     // Monthly counterpart of upsertQuotaFloor (review blocker #1).
     upsertMonthlyQuotaFloor: db.prepare(`
-      INSERT INTO quota_usage_monthly (ims_org_id, utc_year_month, used) VALUES (?, ?, ?)
-      ON CONFLICT(ims_org_id, utc_year_month) DO UPDATE SET used = MAX(used, excluded.used)
+      INSERT INTO quota_usage_monthly (ims_org_id, utc_year_month, used, adobe_floor) VALUES (?, ?, ?, ?)
+      ON CONFLICT(ims_org_id, utc_year_month) DO UPDATE SET
+        used        = MAX(used, excluded.used),
+        adobe_floor = MAX(adobe_floor, excluded.adobe_floor)
     `),
 
     // ─── Recovery (startup reconciliation) ────────────────────────────
@@ -706,30 +723,61 @@ export function bulkInsertIdentities(rows) {
   return tx(rows);
 }
 
+/**
+ * Insert a batch of identity rows AND bump the job counters in ONE transaction
+ * (review #1). The empty-graph fail-closed guard reads jobs.graph_members_seen,
+ * and crash-recovery skips sources based on COMMITTED expanded_identities rows.
+ * If the rows committed but the counter increment didn't (separate
+ * transactions, crash in between), a resume would skip those sources, leave the
+ * counter at 0, and the guard would be bypassed — marking a source-only job
+ * 'expanded'. Binding both into one transaction makes that state impossible:
+ * either the rows AND the counters commit, or neither does.
+ *
+ * @param {Array<[job_id, ns_code, ns_id, identity_id, source_id]>} rows
+ * @param {number} sourcesProcessed  source IDs handled in this batch (→ processed_count)
+ * @param {number} membersSeen       linked members Adobe returned (→ graph_members_seen)
+ * @param {string} jobId
+ * @returns {number} rows inserted (= rows.length)
+ */
+export function insertIdentitiesAndCount(rows, sourcesProcessed, membersSeen, jobId) {
+  const p = prepared();
+  const tx = db.transaction(() => {
+    for (const r of rows) p.insertIdentity.run(r[0], r[1], r[2], r[3], r[4]);
+    p.incrementJobCounters.run(sourcesProcessed, rows.length, membersSeen, jobId);
+    return rows.length;
+  });
+  return tx();
+}
+
 export const q = () => prepared();
 
 /**
- * Force the WAL to disk (fsync) so a just-committed transaction is durable
- * even under synchronous=NORMAL (review finding #8). We keep NORMAL globally
- * for expansion throughput, but the submit-intent transition
- * (reserve quota + status='submitting') MUST survive power loss: if it were
- * lost, the work order would revert to 'planned' on restart and could be
- * resubmitted to Adobe — a duplicate irreversible delete. Call this right
- * before the non-idempotent hygiene POST. Best-effort; a checkpoint failure
- * (e.g. a concurrent reader) is non-fatal and will be retried on the next
- * submit / shutdown checkpoint.
+ * Durably commit the submit-intent (status='submitting') BEFORE the
+ * non-idempotent hygiene POST. If this write were lost to power loss, the WO
+ * would revert to 'planned' on restart and could be resubmitted — a duplicate
+ * irreversible delete (review #8).
+ *
+ * We keep synchronous=NORMAL globally for expansion throughput, and make ONLY
+ * this one commit durable by flipping synchronous=FULL around it. In WAL mode,
+ * synchronous=FULL fsyncs the WAL on commit, so this transition (and every
+ * un-fsynced frame before it, including the preceding reserve) is flushed to
+ * disk. Crucially this is NOT a wal_checkpoint — a checkpoint blocks on
+ * concurrent readers (busy_timeout) and could freeze the whole single-threaded
+ * server for the duration of a long CSV export (review #6). An fsync-on-commit
+ * does not block on readers.
+ *
+ * Returns true on success; false (caller fails closed, does not POST) only if
+ * the write itself errors.
  */
-export function durableCheckpoint() {
-  // wal_checkpoint returns one row: { busy, log, checkpointed }. busy !== 0
-  // means a reader blocked the checkpoint and the WAL was NOT fully flushed —
-  // i.e. the commit is NOT yet durable, and SQLite does NOT throw for this
-  // (review finding #5). Return whether durability was actually achieved so
-  // the caller can fail closed instead of POSTing on an unverified intent.
+export function setWorkOrderSubmittingDurable(workOrderId) {
+  const prev = db.pragma('synchronous', { simple: true });   // numeric (1 = NORMAL)
   try {
-    const res = db.pragma('wal_checkpoint(FULL)');
-    const row = Array.isArray(res) ? res[0] : res;
-    return !!row && Number(row.busy) === 0;
+    db.pragma('synchronous = FULL');
+    prepared().updateWorkOrderStatus.run('submitting', null, workOrderId);
+    return true;
   } catch {
     return false;
+  } finally {
+    try { db.pragma(`synchronous = ${Number(prev) || 1}`); } catch { /* restore best-effort */ }
   }
 }

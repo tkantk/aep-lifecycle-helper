@@ -916,7 +916,7 @@ Documented in `CLAUDE.md` but critical for review:
 
 ## 10. Test coverage and gaps
 
-**197 tests** as of the current codebase (`npm test`). Recent additions
+**231 tests** as of the current codebase (`npm test`). Recent additions
 (late-May 2026 hardening pass) extended coverage to: per-job orphan
 reconciliation, the `DELETE /api/jobs/:id` route with the in-flight
 guard, the `prepareStreamIdentitiesBySource()` Statement-per-call

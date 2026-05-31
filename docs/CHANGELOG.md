@@ -9,6 +9,59 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-05-31 (R3) — Third-round review remediation (3 blockers + 5 findings)
+
+A third review found destructive-path gaps remaining after R2, several in the
+R2 code itself. All 8 were independently verified against the code and Adobe's
+live docs before fixing. Suite **221 → 231**, audit clean, each fix test-first.
+
+### Blockers
+
+- **#1 — Crash-resume could still bypass the empty-graph guard.** Identity rows
+  (`bulkInsertIdentities`) and the job counters (`incrementJobCounters`) were
+  separate transactions; a crash between them committed rows but left
+  `graph_members_seen`/`processed_count` at 0, and a resume skips committed
+  sources — so a source-only job could be marked `expanded`. New
+  `db.js::insertIdentitiesAndCount()` writes rows + counters in ONE transaction
+  (all-or-nothing). Test in `insertAtomic.test.js`.
+- **#2 — Partially-unprocessed Identity Graph batches became partial deletes.**
+  Adobe's response includes `unprocessedXids`/`unprocessedNids` and "one entry
+  per requested XID regardless of cluster association"; `expandBatch` ignored
+  the unprocessed lists and used a positional fallback (`|| clustersArray[i]`),
+  so an unprocessed/unmatched source became source-only. Now fails CLOSED per
+  batch: on a non-empty unprocessed list, an unrecognized shape, OR any source
+  not matched by `compositeXid.id` (positional fallback removed). Tests in
+  `identityGraphNsid.test.js`.
+- **#3 — Quota floor and release shared one counter.** `seedFloor` raised
+  `quota_usage.used` to Adobe's consumed while `release` decremented the same
+  column, so a delayed orphan release could drop the ledger below Adobe's floor
+  and let a later reserve over-ship. New `adobe_floor` column (both ledgers)
+  records Adobe's observed consumption SEPARATELY; `decQuota`/`decMonthlyQuota`
+  clamp at `adobe_floor` (not 0). Tests in `quotaManager.test.js`.
+
+### Other findings
+
+- **#4 — `Number(null)===0` fail-open.** `toNonNegFinite` coerced first, so
+  `{consumed:null}` became 0 (full remaining). Replaced with a strict
+  `typeof === 'number' && Number.isInteger && >= 0` check (rejects
+  null/boolean/array/string/float/negative). Test in `quotaApi.test.js`.
+- **#5 — Registry mismatch bypassed with an explicit nsid.** The code-existence
+  check only ran when no nsid was supplied. Unified validation now requires the
+  source code to EXIST in the registry (whether or not an nsid is given) AND the
+  code/nsid pair to match exactly. Test in `expansionFailClosed.test.js`.
+- **#6 — Durability checkpoint could block the process.** `wal_checkpoint(FULL)`
+  blocks on concurrent readers (a long CSV export held the server ~5s).
+  Replaced with `setWorkOrderSubmittingDurable()` — flips `synchronous=FULL`
+  around the single submit-intent commit (an fsync-on-commit, which does NOT
+  block on readers) then restores NORMAL. Test asserts it doesn't block under a
+  held reader.
+- **#7 — Zero-byte lock file stranded startup.** An empty lock → `Number('')=0`
+  → `process.kill(0,0)` reports alive → refused forever. Now only a POSITIVE
+  INTEGER pid counts as a holder; empty/0/NaN is reclaimed. Boot-verified.
+- **#8 — Stale docs.** DESIGN_DOC/REVIEW updated off `node --test test` / 197.
+
+---
+
 ## 2026-05-31 (R2) — Second-round review remediation (2 blockers + 9 findings)
 
 A second external review found that several round-1 fixes were incomplete and

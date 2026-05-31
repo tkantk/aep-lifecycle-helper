@@ -115,6 +115,40 @@ test('empty-graph fail-closed also fires on a RESUME (crash mid-empty-expansion 
     'a resume of an all-empty expansion must still fail closed');
 });
 
+test('expansion fails closed when the source code is absent from the registry even if an nsid is supplied (review #5)', async () => {
+  // Registry maps id 411 to "actualCode". The operator supplied code
+  // "missingCode" + nsid 411. Pre-fix, the supplied nsid bypassed the
+  // code-existence check and expansion proceeded against the wrong namespace.
+  const credsId = storeCreds({
+    label: 'Mismatch', environment: 'prod', region: 'VA7',
+    imsOrgId: 'mismatch-org@AcmeOrg', clientId: 'mismatch-client', clientSecret: 'secret',
+  });
+  const csv = path.join(uploadDir, 'mm.csv');
+  fs.writeFileSync(csv, 'src-a\n');
+  const jobId = 'mismatch-job';
+  q().insertJob.run({
+    id: jobId, name: 'Mismatch', credsId, sandboxName: 'prod',
+    datasetIds: 'ALL', targetServicesJson: null,
+    sourceNamespace: 'missingCode', sourceNamespaceId: 411,
+    dailyLimit: 1_000_000, monthlyLimit: null, uploadPath: csv, totalSourceIds: 1,
+  });
+
+  nock(IMS).post('/ims/token/v3').reply(200, { access_token: 'tok', expires_in: 86400 });
+  nock(REGION).get('/data/core/idnamespace/identities').reply(200, [
+    { id: 411, code: 'actualCode', name: 'Actual', custom: true, status: 'ACTIVE' },
+  ]);
+  // Identity Graph MUST NOT be called — validation fails before any batch.
+  const clusters = nock(REGION).post('/data/core/identity/clusters/members').reply(200, { clusters: [] });
+
+  await assert.rejects(() => runExpansion({
+    jobId, uploadPath: csv, sourceNamespace: 'missingCode', sourceNamespaceId: 411,
+    credsId, sandboxName: 'prod', column: 0,
+  }), /not found in the sandbox's namespace registry/i);
+
+  assert.equal(q().getJob.get(jobId).status, 'failed');
+  assert.ok(!clusters.isDone(), 'must not call the Identity Graph for an unregistered source namespace');
+});
+
 test('expansion fails closed when the namespace registry cannot be loaded', async () => {
   const credsId = storeCreds({
     label: 'FailClosed', environment: 'prod', region: 'VA7',

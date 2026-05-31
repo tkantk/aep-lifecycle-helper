@@ -265,7 +265,12 @@ monthly.consumed)` to raise the ledger UP to Adobe's reported org-wide
 `consumed` (MAX, never lower). This makes `reserve` — which still compares
 `used + count` against the full cap — mathematically enforce Adobe's true
 *remaining*, closing the over-ship via the explicit-bucket path and the
-sequential-`/quota`-lag path.
+sequential-`/quota`-lag path. **`seedFloor` records the observed consumption in
+a SEPARATE `adobe_floor` column (review #3, R3), NOT just in `used`** — and
+`release` clamps at `adobe_floor` (not 0). Otherwise a delayed orphan `release`
+could decrement `used` below Adobe's floor and let a later `reserve` over-ship.
+The `adobe_floor` is the Adobe-observed component; `used - adobe_floor` is our
+own net reservations, which is all a `release` may give back.
 
 Any code that submits a work order MUST pair `reserve` with `release`
 in a try/catch. **Exception**: on network timeout we don't know if Adobe

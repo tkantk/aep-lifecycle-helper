@@ -497,7 +497,7 @@ src/
 
 test/                       node --test (via `npm test` → scripts/run-tests.mjs,
                             which enumerates test/*.test.js and sets a stable
-                            test ENCRYPTION_KEY). 221 tests covering hygiene
+                            test ENCRYPTION_KEY). 231 tests covering hygiene
                             validators,
                             namespace canonicalization, IMS token cache, quota
                             atomicity (incl. monthly-disabled release gating),
@@ -579,8 +579,8 @@ data/                       Runtime state; in .gitignore.
 | `jobs` | One per upload. Status: created → expanding → expanded → ready → submitting → submitted/partial/failed. `projected_months` (Phase 2) tracks the redistributor's max month_index for shift detection. `source_column` (2026-05-31, default `'0'`) persists the upload-time CSV column so crash-recovery resumes against the same column. | FK creds_id |
 | `expanded_identities` | One row per (cluster member, source). No unique index — dedup deferred to planning via `GROUP BY` in `streamIdentitiesBySource`. Only `idx_ei_job_source(job_id, source_id)` remains; `idx_ei_job_ns` was dropped 2026-05-29 (proven via EXPLAIN QUERY PLAN to be redundant — every reader falls back to `idx_ei_job_source` with an identical plan). | FK job_id |
 | `work_orders` | One per Adobe work order. Statuses: planned → submitting → submitted → completed/failed/deferred. `month_index` (Phase 2) + `day_index` form the bucket label assigned by the redistributor on un-shipped WOs only. `last_polled_at` (2026-05-31) is the monitor's fairness cursor so >100 open WOs all get polled (no starvation). `reserved_monthly` (2026-05-31 R2) records the effective monthly limit reserve() used, so recovery releases exactly the dimensions reserved (no monthly-ledger leak). | FK job_id, ordered by rowid |
-| `quota_usage` | Daily local ledger: (ims_org_id, utc_date) → used | PK |
-| `quota_usage_monthly` | Monthly local ledger: (ims_org_id, utc_year_month) → used | PK |
+| `quota_usage` | Daily local ledger: (ims_org_id, utc_date) → used. `adobe_floor` (2026-05-31 R3) records Adobe's observed consumed SEPARATELY so `release` can clamp at it (never below Adobe's reality → no over-ship). | PK |
+| `quota_usage_monthly` | Monthly local ledger: (ims_org_id, utc_year_month) → used + `adobe_floor` (see `quota_usage`). | PK |
 | `app_settings` | Generic key/value bag (Phase 3). First users: `auto_resume_*` keys for the scheduler. | PK(key) |
 
 Both ledgers are incremented by `reserve()` atomically and decremented by

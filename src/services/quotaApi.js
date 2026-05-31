@@ -50,20 +50,20 @@ export function _clearCache() {
   cache.clear();
 }
 
-// A quota number must be finite and non-negative. 0 is VALID (e.g. consumed=0).
-// Anything else (NaN from a non-numeric string, negative, Infinity) means the
-// entry is malformed — we return null so callers treat it as missing and fail
-// CLOSED, rather than coercing garbage to 0 and shipping on a fake remaining
-// (review finding #3).
-function toNonNegFinite(v) {
-  const n = Number(v);
-  return Number.isFinite(n) && n >= 0 ? n : null;
+// A quota number must be an ACTUAL non-negative integer. We deliberately do
+// NOT call Number() first: Number(null)===0, Number(true)===1, Number([5])===5,
+// Number('900')===900 — coercion would turn malformed JSON into a fake value
+// (review #4: { consumed: null } became 0 = full remaining). Only a real
+// numeric integer ≥ 0 is accepted; anything else → null → caller fails CLOSED.
+// (0 is valid, e.g. consumed=0 on a fresh day.)
+function toNonNegInt(v) {
+  return typeof v === 'number' && Number.isInteger(v) && v >= 0 ? v : null;
 }
 
 function normalizeQuotaEntry(entry) {
   if (!entry) return null;
-  const consumed = toNonNegFinite(entry.consumed);
-  const quota    = toNonNegFinite(entry.quota);
+  const consumed = toNonNegInt(entry.consumed);
+  const quota    = toNonNegInt(entry.quota);
   if (consumed === null || quota === null) return null;   // malformed → treat as missing
   return {
     consumed,

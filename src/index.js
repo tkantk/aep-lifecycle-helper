@@ -55,18 +55,28 @@ function acquireSingleProcessLock() {
       return;
     } catch (err) {
       if (err.code !== 'EEXIST') throw err;
-      const existingPid = Number(fs.readFileSync(lockPath, 'utf8').trim());
+      const raw = fs.readFileSync(lockPath, 'utf8').trim();
+      const existingPid = Number(raw);
+      // A lock file written by a crashed process can be EMPTY (created with
+      // O_EXCL but killed before the pid was written). Number('') === 0, and
+      // process.kill(0, 0) targets the process GROUP and reports "alive" — which
+      // would strand startup forever. Only treat a POSITIVE INTEGER pid as a
+      // real holder; anything else (empty / 0 / NaN / negative) is a corrupt
+      // lock to reclaim (review #7).
+      const validPid = Number.isInteger(existingPid) && existingPid > 0;
       let alive = false;
-      try { process.kill(existingPid, 0); alive = true; } catch (e) { alive = e.code === 'EPERM'; }
-      if (alive && existingPid !== process.pid) {
+      if (validPid) {
+        try { process.kill(existingPid, 0); alive = true; } catch (e) { alive = e.code === 'EPERM'; }
+      }
+      if (validPid && alive && existingPid !== process.pid) {
         logger.error(
           `Another instance (pid ${existingPid}) is already running against the database ` +
           `${config.dbPath}. Running two instances on one database corrupts the WAL. Stop the ` +
           `other instance first, or point DB_PATH at a different database file.`);
         process.exit(1);
       }
-      // Stale lock (pid not alive) — remove and retry once.
-      logger.warn({ stalePid: existingPid }, 'reclaiming stale single-process lock');
+      // Stale or corrupt lock (pid not alive, or not a positive integer) — reclaim.
+      logger.warn({ stalePid: raw || '(empty)' }, 'reclaiming stale/corrupt single-process lock');
       try { fs.unlinkSync(lockPath); } catch { /* */ }
     }
   }

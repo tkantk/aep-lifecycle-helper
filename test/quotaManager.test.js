@@ -14,7 +14,7 @@ const dbPath = path.join(os.tmpdir(), `aep-test-quota-${Date.now()}.db`);
 process.env.DB_PATH = dbPath;
 
 const { initDb } = await import('../src/db.js');
-const { reserve, release, peek } = await import('../src/services/quotaManager.js');
+const { reserve, release, peek, seedFloor } = await import('../src/services/quotaManager.js');
 
 const ORG = 'test-org@AcmeOrg';
 const DAILY = 1_000_000;
@@ -26,6 +26,34 @@ after(() => {
   for (const ext of ['', '-wal', '-shm']) {
     try { fs.unlinkSync(dbPath + ext); } catch { /* */ }
   }
+});
+
+// ─── seedFloor vs release (review #3) ──────────────────────────────────────────
+
+test('release after seedFloor cannot drop the ledger below Adobe\'s observed floor', () => {
+  // Review #3: Adobe reports 900k consumed. A delayed orphan release must NOT
+  // pull `used` below 900k, or a later reserve would over-ship past the cap.
+  const org = 'r3-seedfloor-org@AcmeOrg';
+  seedFloor(org, 900_000, null);                 // adobe_floor = used = 900k
+  assert.equal(peek(org, DAILY, null).daily.used, 900_000);
+
+  // A delayed release (e.g. orphan rollback of a prior 100k reservation).
+  release(org, 100_000, null);
+  assert.equal(peek(org, DAILY, null).daily.used, 900_000,
+    'release must clamp at the Adobe floor (900k), not drop to 800k');
+
+  // A fresh 200k reservation must now be DENIED (900k + 200k > 1M).
+  const r = reserve(org, 200_000, DAILY, null);
+  assert.equal(r.granted, false, 'reserve past Adobe remaining must be denied (no over-ship)');
+});
+
+test('release still frees OUR reservations that sit above the floor', () => {
+  const org = 'r3-seedfloor-org2@AcmeOrg';
+  seedFloor(org, 500_000, null);                 // floor 500k
+  assert.equal(reserve(org, 100_000, DAILY, null).granted, true);  // used 600k
+  assert.equal(peek(org, DAILY, null).daily.used, 600_000);
+  release(org, 100_000, null);                    // undo our 100k
+  assert.equal(peek(org, DAILY, null).daily.used, 500_000, 'back down to the floor, not below');
 });
 
 // ─── peek ─────────────────────────────────────────────────────────────────────
