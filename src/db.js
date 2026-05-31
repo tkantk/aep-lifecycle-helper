@@ -572,6 +572,10 @@ function prepared() {
     getAllOrdersForJob: db.prepare(`
       SELECT * FROM work_orders WHERE job_id = ? ORDER BY COALESCE(month_index, 1), day_index, rowid
     `),
+    // Single WO scoped to its job — used by the operator "confirmed absent →
+    // release & retry" action (review R7 #1) so a woId from a different job
+    // can't be acted on.
+    getWorkOrderByIdAndJob: db.prepare(`SELECT * FROM work_orders WHERE id = ? AND job_id = ?`),
     // Unshipped (planned + deferred) WOs in deterministic creation order.
     // The redistributor consumes this and updates each row's month/day index.
     getUnshippedOrdersForJob: db.prepare(`

@@ -240,6 +240,60 @@ test('R5 finding #2: force-delete keeps a sent WO\'s accepted reservation (tombs
     'never-sent reservation is refunded — Adobe never received it');
 });
 
+// ─── R7 #1: per-WO operator "confirmed absent → release & retry" ────────────
+
+function reserveFor(woId, org, count = 5) {
+  const today = new Date().toISOString().slice(0, 10);
+  const month = new Date().toISOString().slice(0, 7);
+  q().upsertReservation.run({ workOrderId: woId, imsOrgId: org, utcDate: today, utcMonth: month, count });
+}
+
+test('R7 #1: release-absent REQUIRES explicit confirmation', async () => {
+  const jobId = insertJob();
+  const woId = insertWorkOrder(jobId, 'submitting');
+  const res = await request('POST', `/api/jobs/${jobId}/work-orders/${woId}/release-absent`, {});
+  assert.equal(res.status, 400);
+  assert.equal(res.body.error, 'confirmation_required');
+  // Unchanged — no confirmation, no action.
+  assert.equal(q().getAllOrdersForJob.all(jobId).find(w => w.id === woId).status, 'submitting');
+});
+
+test('R7 #1: release-absent on a confirmed-absent submitting orphan releases its reservation + resets to planned', async () => {
+  const jobId = insertJob();
+  const woId = insertWorkOrder(jobId, 'submitting');
+  reserveFor(woId, 'abs-org@AcmeOrg');                       // pending (accepted=0)
+  const res = await request('POST', `/api/jobs/${jobId}/work-orders/${woId}/release-absent`, { confirmedAbsent: true });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.status, 'planned');
+  assert.equal(q().getAllOrdersForJob.all(jobId).find(w => w.id === woId).status, 'planned');
+  assert.equal(q().getReservation.get(woId).active, 0, 'reservation released for a clean retry');
+});
+
+test('R7 #1: release-absent REFUSES a WO that already has an Adobe work-order ID', async () => {
+  const jobId = insertJob();
+  const woId = insertWorkOrder(jobId, 'submitting');
+  q().updateWorkOrderSubmitted.run({ id: woId, adobeWorkorderId: 'DI-already', adobeStatus: 'received', bundleId: null, submittedAt: null });
+  const res = await request('POST', `/api/jobs/${jobId}/work-orders/${woId}/release-absent`, { confirmedAbsent: true });
+  assert.equal(res.status, 409, 'a WO Adobe acknowledged can never be marked absent');
+});
+
+test('R7 #1: release-absent REFUSES when the reservation is already accepted (defensive)', async () => {
+  const jobId = insertJob();
+  const woId = insertWorkOrder(jobId, 'submitting');
+  reserveFor(woId, 'abs2-org@AcmeOrg');
+  q().markAcceptedReservation.run(woId);                     // accepted=1 (Adobe spent it)
+  const res = await request('POST', `/api/jobs/${jobId}/work-orders/${woId}/release-absent`, { confirmedAbsent: true });
+  assert.equal(res.status, 409);
+  assert.equal(q().getReservation.get(woId).active, 1, 'accepted reservation must NOT be released');
+  assert.equal(q().getAllOrdersForJob.all(jobId).find(w => w.id === woId).status, 'submitting', 'status unchanged');
+});
+
+test('R7 #1: release-absent 404 for an unknown work order', async () => {
+  const jobId = insertJob();
+  const res = await request('POST', `/api/jobs/${jobId}/work-orders/${uuid()}/release-absent`, { confirmedAbsent: true });
+  assert.equal(res.status, 404);
+});
+
 test('DELETE /api/jobs/:id treats planned/deferred/awaiting_approval/completed/failed as safe', async () => {
   const jobId = insertJob();
   insertWorkOrder(jobId, 'planned');

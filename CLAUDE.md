@@ -616,10 +616,15 @@ Avoid:
   `err.originalMessage`. Tests in `test/adobeClient.test.js`.
 - Validation errors throw `WorkOrderValidationError` (in `hygiene.js`) —
   these are pre-network and safe.
-- Runtime errors from the Adobe API bubble up; the runner catches them,
-  marks the work order `failed`, stores the error message, and releases
-  the quota reservation (passing the job's `monthly_limit` so monthly
-  decrement is gated correctly — see I5).
+- Runtime errors from the Adobe submit are split by certainty (CLAUDE.md I11,
+  reviews R5/R6): a **4xx** (Adobe definitively rejected) marks the WO `failed`
+  and calls `release(woId)` — guarded `WHERE accepted=0`, so only un-acked work
+  is refunded. A **5xx / timeout / network** error is UNCERTAIN (Adobe may have
+  processed it); the WO stays `submitting` with its reservation **HELD** (NOT
+  released) for orphan recovery — releasing here would risk over-ship + a
+  duplicate on retry. Recovery never auto-rolls-back an uncertain orphan (R6 #1);
+  the operator resolves a confirmed-absent one via
+  `POST /api/jobs/:id/work-orders/:woId/release-absent` (R7 #1).
 
 ### Logging
 
@@ -768,8 +773,8 @@ which require `https://platform-{region}.adobe.io` (region ∈ `va7`, `nld2`,
 7. Run `npm test` before suggesting a change is done (use `npm test`, NOT
    `node --test test` — on Node ≥23 the bare `test` arg is treated as a test
    name and silently runs nothing; `npm test` → `scripts/run-tests.mjs` which
-   enumerates `test/*.test.js`). **242 tests should pass** (as of the 2026-05-31
-   R6 recovery-safety session — UUID-first displayName + indeterminate-on-no-match).
+   enumerates `test/*.test.js`). **247 tests should pass** (as of the 2026-05-31
+   R7 operator-workflow session — per-WO release-absent action + UI/doc fixes).
 8. **After your change**, append a bullet to the current session in
    `docs/CHANGELOG.md` describing what + why. If you changed the module map,
    data flow, Adobe contract, or DB schema, also update `docs/ARCHITECTURE.md`.

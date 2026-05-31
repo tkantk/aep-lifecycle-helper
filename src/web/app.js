@@ -1614,14 +1614,40 @@ async function renderSubmit() {
     const reconcilable = wos.filter(w =>
       !w.adobe_workorder_id && (w.status === 'failed' || w.status === 'submitting'));
     if (reconcilable.length > 0) {
+      // The EXACT name Adobe stored (persisted before the POST, review R6 #2) so
+      // the operator can search for it in Adobe's UI. Legacy rows (no stored
+      // name) fall back to the reconstruction recovery itself uses.
+      const lookupName = (w) => w.display_name || `Delete ${state.job.name} - WO ${w.id}`;
+      // Only an uncertain 'submitting' orphan is eligible for the manual
+      // "confirmed absent → retry" action (a 'failed' WO was a 4xx rejection or
+      // is matched by Reconcile, not stuck).
+      const submittingOrphans = reconcilable.filter(w => w.status === 'submitting');
       const banner = document.createElement('div');
-      banner.style.cssText = 'margin: 14px 0; padding: 12px 14px; background: rgba(255,193,7,0.08); border: 1px solid rgba(255,193,7,0.4); border-radius: 6px; display: flex; gap: 12px; align-items: center; justify-content: space-between';
+      banner.style.cssText = 'margin: 14px 0; padding: 12px 14px; background: rgba(255,193,7,0.08); border: 1px solid rgba(255,193,7,0.4); border-radius: 6px';
       banner.innerHTML = `
-        <div style="font-size: 13px; line-height: 1.5">
-          <b>${reconcilable.length} work order(s) are unreconciled.</b><br>
-          They may show as <b>Failed</b> here but actually exist in Adobe's Data Lifecycle UI (60-second submit timeouts can leave Adobe processing the request after we give up). Click <b>Reconcile</b> to look them up by displayName and correct the local records.
+        <div style="display: flex; gap: 12px; align-items: center; justify-content: space-between">
+          <div style="font-size: 13px; line-height: 1.5">
+            <b>${reconcilable.length} work order(s) are unreconciled.</b><br>
+            A submit can time out <i>after</i> Adobe already received the request, leaving the local
+            record uncertain. <b>Step 1:</b> click <b>Reconcile</b> — we look each one up in Adobe by its
+            exact name and auto-record any that exist (no duplicate risk).
+          </div>
+          <button class="btn btn-secondary" id="btn-reconcile" style="white-space: nowrap">↻ Reconcile</button>
         </div>
-        <button class="btn btn-secondary" id="btn-reconcile" style="white-space: nowrap">↻ Reconcile</button>
+        ${submittingOrphans.length ? `
+        <div style="margin-top: 11px; border-top: 1px solid rgba(255,193,7,0.35); padding-top: 10px; font-size: 12.5px; line-height: 1.5">
+          <b>Step 2 — only if Reconcile can't find one.</b> It may be genuinely absent in Adobe, or
+          Adobe's list may just be lagging. Search Adobe's Data Lifecycle UI for the exact name shown.
+          <b>Only if you confirm it does NOT exist there</b>, release it to retry — releasing one Adobe
+          actually processed would create a <b>duplicate irreversible delete</b>.
+          <div style="margin-top: 8px; display: flex; flex-direction: column; gap: 6px">
+            ${submittingOrphans.map(w => `
+              <div style="display: flex; gap: 8px; align-items: center; justify-content: space-between; background: rgba(0,0,0,0.03); padding: 6px 8px; border-radius: 5px">
+                <code style="font-size: 11.5px; word-break: break-all">${escape(lookupName(w))}</code>
+                <button class="btn btn-secondary" data-release-absent="${escape(w.id)}" style="white-space: nowrap; flex: 0 0 auto">Confirmed absent → retry</button>
+              </div>`).join('')}
+          </div>
+        </div>` : ''}
       `;
       $('#submit-body').insertBefore(banner, $('#submit-body').querySelector('.progress-head'));
       onClickGuarded(banner.querySelector('#btn-reconcile'), async () => {
@@ -1629,9 +1655,8 @@ async function renderSubmit() {
           const r = await http('POST', `/jobs/${state.job.id}/reconcile`);
           const parts = [];
           if (r.matched > 0)        parts.push(`${r.matched} matched in Adobe`);
-          if (r.rolledBack > 0)     parts.push(`${r.rolledBack} rolled back to planned`);
           if (r.stillFailed > 0)    parts.push(`${r.stillFailed} confirmed failed`);
-          if (r.indeterminate > 0)  parts.push(`${r.indeterminate} indeterminate (retry later)`);
+          if (r.indeterminate > 0)  parts.push(`${r.indeterminate} still unconfirmed — verify in Adobe, then use “Confirmed absent → retry” below`);
           if (r.perWoError > 0)     parts.push(`${r.perWoError} errored`);
           showToast(parts.length ? `Reconcile: ${parts.join(', ')}.` : 'Nothing to reconcile.', { kind: 'success' });
           // Re-fetch WOs and re-render.
@@ -1641,6 +1666,32 @@ async function renderSubmit() {
           showToast(`Reconcile failed: ${err.message}`, { kind: 'error' });
         }
       }, { loadingText: 'Reconciling…' });
+      // Per-WO "confirmed absent → retry" — strongly confirmed (the operator must
+      // have verified absence in Adobe's UI). Releases the held reservation and
+      // resets the WO to 'planned'; the server refuses any WO Adobe acked.
+      banner.querySelectorAll('[data-release-absent]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const woId = btn.dataset.releaseAbsent;
+          const wo = reconcilable.find(w => w.id === woId);
+          const nm = wo ? lookupName(wo) : woId;
+          if (!confirm(
+            `Release this work order for retry?\n\n` +
+            `Name in Adobe:\n${nm}\n\n` +
+            `Do this ONLY after searching Adobe's Data Lifecycle UI and confirming this work order ` +
+            `does NOT exist there.\n\nIf it DOES exist, releasing it will create a DUPLICATE, ` +
+            `IRREVERSIBLE delete when you re-submit.`)) return;
+          btn.disabled = true;
+          try {
+            await http('POST', `/jobs/${state.job.id}/work-orders/${woId}/release-absent`, { confirmedAbsent: true });
+            showToast('Released and reset to planned — submit again to retry it.', { kind: 'success' });
+            state.workOrders = await http('GET', `/jobs/${state.job.id}/work-orders`);
+            await refresh();
+          } catch (err) {
+            btn.disabled = false;
+            showToast(`Could not release: ${err.message}`, { kind: 'error' });
+          }
+        });
+      });
     }
 
     // Day is "done" only when no work order is still planned OR deferred.
@@ -2225,12 +2276,12 @@ function renderWorkOrderCard(w, job) {
   const updated = w.updated_at;
   const ended   = (status === 'completed' || status === 'failed') ? w.completed_at : null;
 
-  // The displayName + description we sent at submission time. We don't store
-  // them separately, so rebuild from job + WO — kept in sync with the values
-  // in runner/submission.js. AEP's detail page surfaces these prominently.
+  // The EXACT displayName Adobe stored is persisted on the row (review R6 #2) —
+  // show it so the operator can search Adobe's UI by it. Fall back to the legacy
+  // reconstruction for pre-R6 rows that have no stored name. The description is
+  // not persisted; rebuild it (kept in sync with runner/submission.js).
   const jobShortId = (job?.id || '').slice(0, 8);
-  const woShortId  = w.id.slice(0, 8);
-  const displayName = `Delete ${job?.name || jobShortId} - WO ${woShortId}`;
+  const displayName = w.display_name || `Delete ${job?.name || jobShortId} - WO ${w.id}`;
   const description = `Bulk delete (Job ${jobShortId}, Day ${w.day_index})`;
 
   // Profile-only mode: when targetServices is set, AEP routes through

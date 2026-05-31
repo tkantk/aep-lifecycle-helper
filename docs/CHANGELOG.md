@@ -9,6 +9,53 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-05-31 (R7) — Seventh-round review: operator-workflow completeness
+
+The sixth review confirmed the core safety redesign is sound (no remaining
+duplicate/over-ship path). This round closes four operator-workflow gaps it
+flagged before destructive production use. Suite **242 → 247** pass, audit clean.
+
+### #1 (high) — a precise operator-resolution action for stuck orphans
+
+R6 correctly leaves an uncertain orphan in `submitting` (never auto-rolls-back),
+but a *genuinely absent* POST then had no escape but force-deleting the whole job.
+Added `POST /api/jobs/:id/work-orders/:woId/release-absent` (`recovery.js::
+releaseAbsentOrphan`): requires `{ confirmedAbsent: true }`, releases the held
+reservation, and resets the WO to `planned` for retry. Fail-closed — 409 if the
+WO has an Adobe ID or an `accepted` reservation; only a `submitting` orphan is
+eligible. The Submit-tab reconcile banner now lists each orphan's persisted
+Adobe lookup name with a strongly-confirmed per-WO "Confirmed absent → retry"
+button (native confirm quoting the name + duplicate-delete warning).
+`routes/jobs.js`, `runner/recovery.js`, `db.js`, `web/app.js`.
+
+### #2 (medium) — UI showed the obsolete reconstructed work-order name
+
+The Monitor work-order card rebuilt the pre-R6 `Delete <job> - WO <short-id>`
+name. Now renders the escaped persisted `display_name` (UUID-first `WO <full-id>
+- Delete <job>`) with a legacy fallback, so manual Adobe lookup uses the real
+stored name. `web/app.js`.
+
+### #3 (medium) — stale rollback/release docs across the doc set
+
+Fixed `CLAUDE.md` (runtime-error handling: 4xx releases / uncertain HOLDS),
+`DESIGN_DOC.md`, `REVIEW.md` (reconcile outcomes + the new endpoint), and
+regenerated the two reconciliation Mermaid diagrams (`03-work-order-state-machine`,
+`08-submit-reconcile-flow`) off the removed auto-rollback.
+
+### #4 (medium) — QUOTA_SAFETY_BUFFER was undocumented for operators
+
+Added `QUOTA_SAFETY_BUFFER` to the README config block + a prominent
+external-writer caveat (org-wide quota; default 0 valid only with operational
+exclusivity; the buffer is a mitigation, not a proof). `README.md`.
+
+### Tests
+
+5 new route tests in `jobsRoutes.test.js` (release-absent: confirmation required,
+happy path, refuses Adobe-acked/accepted, 404). Playwright console smoke confirms
+the UI loads clean.
+
+---
+
 ## 2026-05-31 (R6) — Sixth-round review: recovery duplicate-submission safety
 
 R5 fixed the quota lifecycle structurally, but a sixth review found two

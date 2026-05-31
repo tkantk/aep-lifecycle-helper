@@ -226,6 +226,13 @@ MAX_IDS_PER_WORK_ORDER=100000
 DAILY_IDENTIFIER_LIMIT=1000000        # FALLBACK ONLY — live /quota wins
 MONTHLY_IDENTIFIER_LIMIT=3000000      # FALLBACK ONLY — live /quota wins
 
+# Headroom (0..0.95) held back from each Adobe quota for CONCURRENT EXTERNAL
+# writers. Adobe's /quota is ORG-WIDE and we snapshot it once per submit run, so
+# another UI user / API client / second instance in the same org can consume
+# quota between our snapshot and our submit. Default 0 is correct ONLY if this
+# tool is the sole writer; otherwise set e.g. 0.1 to reserve 10% as a margin.
+QUOTA_SAFETY_BUFFER=0
+
 # SQLite page cache (MB). Larger cache = fewer disk reads during expansion
 # and planning. Each MB covers ~256 4 KB B-tree pages.
 # Recommended values:
@@ -272,6 +279,16 @@ against the same org-wide pool between our plan and our submit), the
 redistributor re-buckets un-shipped work into a later window instead of
 shipping and being rejected by Adobe.
 
+> **External-writer caveat.** The local ledger guarantees *this tool* never
+> over-ships **its own** accounting, but Adobe's quotas are **org-wide and apply
+> to UI and API requests alike**, and we only snapshot `/quota` once per submit
+> run. A concurrent external writer (another operator's UI session, an
+> independent API client, or a second instance of this tool) can consume quota
+> between our snapshot and our submit — which the local ledger cannot see. Treat
+> this tool as the **sole writer** during a run, or set `QUOTA_SAFETY_BUFFER`
+> (e.g. `0.1`) to hold back headroom. The buffer is a mitigation, not a proof
+> against unbounded external consumption.
+
 ---
 
 ## API endpoints (for scripting)
@@ -310,6 +327,8 @@ All under `/api/` on `http://127.0.0.1:3000`.
 | POST | `/api/jobs/:id/approve-month` | Approve Month N for submission. Body: `{monthIndex}` (≥ 2) |
 | POST | `/api/jobs/:id/submit` | Submit work orders. Body: `{dayIndex?, monthIndex?}` |
 | GET | `/api/jobs/:id/work-orders` | All work orders + per-service status |
+| POST | `/api/jobs/:id/reconcile` | Look up uncertain orphans in Adobe by name; record any that exist |
+| POST | `/api/jobs/:id/work-orders/:woId/release-absent` | Operator-confirmed: release a verified-absent orphan for retry. Body `{confirmedAbsent: true}` required |
 | GET | `/api/jobs/:id/export` | Download expanded identities CSV (formula-injection sanitized) |
 
 ### Settings

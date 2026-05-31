@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { q, prepareStreamIdentitiesBySource } from '../db.js';
 import { planWorkOrders, runSubmission } from '../runner/submission.js';
-import { reconcileJobOrphans } from '../runner/recovery.js';
+import { reconcileJobOrphans, releaseAbsentOrphan } from '../runner/recovery.js';
 import { peek as peekQuota } from '../services/quotaManager.js';
 import { getOrgQuota } from '../services/quotaApi.js';
 import { decryptCreds } from '../utils/crypto.js';
@@ -253,6 +253,24 @@ router.post('/:id/reconcile', async (req, res, next) => {
     const result = await reconcileJobOrphans(job.id);
     logger.info({ jobId: job.id, ...result }, 'reconcile complete');
     res.json({ ok: true, ...result });
+  } catch (err) { next(err); }
+});
+
+/** Operator-confirmed resolution for an indeterminate orphan (review R7 #1).
+ *  The operator must have VERIFIED in Adobe's Data Lifecycle UI (by the WO's
+ *  persisted displayName) that the work order does not exist there. Requires
+ *  `{ confirmedAbsent: true }`. Releases the held reservation and resets the WO
+ *  to 'planned' for a clean retry. Fail-closed: refuses any WO Adobe acked
+ *  (has an Adobe ID, or an accepted reservation) — see releaseAbsentOrphan. */
+router.post('/:id/work-orders/:woId/release-absent', (req, res, next) => {
+  try {
+    if (req.body?.confirmedAbsent !== true) {
+      const err = new Error('confirmedAbsent: true is required — verify in Adobe that this work order does not exist before releasing it for retry (releasing a WO Adobe actually processed would create a duplicate delete)');
+      err.status = 400; err.code = 'confirmation_required'; err.publicMessage = err.message;
+      return next(err);
+    }
+    const result = releaseAbsentOrphan(req.params.id, req.params.woId);
+    res.json(result);
   } catch (err) { next(err); }
 });
 

@@ -384,9 +384,9 @@ its `displayName` prefix and apply one of four outcomes:
 
 | Outcome | Action |
 |---|---|
-| **Match found** — Adobe has the WO under our `displayName` | Record `adobe_workorder_id` → flip to `submitted`. If the WO had previously been mis-marked `failed`, also re-reserve the quota that the old buggy catch-block released. |
-| **Confirmed absent** — Adobe returned 200, our `displayName` is not in the list | If status was `submitting`, roll back to `planned` and release quota (next submit retries cleanly). If status was `failed`, leave it as failed (confirmed). |
-| **Indeterminate** — Adobe rejected the lookup with 4xx | Leave the WO alone; the next reconcile attempt retries. Never roll back on ambiguity (would risk duplicate destructive submits if the original POST had actually been processed). |
+| **Match found** — Adobe has the WO under our persisted `display_name` (R6 #2) | Record `adobe_workorder_id` → flip to `submitted` + `markAccepted` (or `reactivate` if it was `failed`). |
+| **No match** — Adobe returned 200 but our `display_name` is not in the list | INDETERMINATE — a no-match does NOT prove absence (work-order creation is async, no read-after-write guarantee). If status was `submitting`, **leave it in `submitting` with its reservation HELD** — never auto-roll-back (R6 #1), which would risk a duplicate on retry. The operator confirms absence in Adobe's UI, then uses the per-WO **release-absent** action (R7 #1) to release + retry. If status was `failed` (a 4xx rejection), leave as failed. |
+| **Indeterminate** — Adobe rejected the lookup with 4xx | Leave the WO alone; the next reconcile attempt retries. Never roll back on ambiguity. |
 | **Transient lookup error** — network failure during reconcile | Leave the WO alone; retry on next boot or next manual reconcile click. |
 
 The UI shows a yellow banner on the Submit tab whenever any WO is in

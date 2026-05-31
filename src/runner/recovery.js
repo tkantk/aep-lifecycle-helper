@@ -4,7 +4,7 @@ import { logger } from '../utils/logger.js';
 import { runExpansion } from './expansion.js';
 import { getWorkOrder } from '../services/hygiene.js';
 import { decryptCreds } from '../utils/crypto.js';
-import { reactivate, markAccepted } from '../services/quotaManager.js';
+import { reactivate, markAccepted, release } from '../services/quotaManager.js';
 
 /**
  * Startup reconciliation for jobs and work orders left in flight when the
@@ -344,6 +344,50 @@ export async function reconcileJobOrphans(jobId) {
   }
 
   return { total: orphans.length, matched, rolledBack, indeterminate, stillFailed, perWoError };
+}
+
+/**
+ * OPERATOR-CONFIRMED resolution for an indeterminate orphan (review R7 #1).
+ *
+ * Recovery deliberately NEVER auto-rolls-back an uncertain 'submitting' WO (a
+ * no-match doesn't prove Adobe absence — R6 #1). That leaves a genuinely-absent
+ * WO stuck until a HUMAN verifies, in Adobe's Data Lifecycle UI, that the work
+ * order really does not exist there. This function is that human's escape hatch:
+ * once they've confirmed absence, release the held reservation and reset the WO
+ * to 'planned' so the next submit retries it cleanly.
+ *
+ * It is fail-closed against acting on work Adobe actually processed:
+ *   - 404 if the WO doesn't belong to this job.
+ *   - refuses (409) if the WO already has an adobe_workorder_id (Adobe acked it).
+ *   - refuses (409) if its reservation is `accepted` (Adobe spent the quota) —
+ *     `release()` is itself guarded WHERE accepted=0, but we reject loudly rather
+ *     than silently no-op so the operator isn't misled.
+ *   - only a 'submitting' orphan is eligible.
+ * The caller (route) additionally requires an explicit confirmation flag.
+ */
+export function releaseAbsentOrphan(jobId, woId) {
+  const wo = q().getWorkOrderByIdAndJob.get(woId, jobId);
+  if (!wo) {
+    const e = new Error('work order not found for this job');
+    e.status = 404; e.code = 'not_found'; e.publicMessage = e.message; throw e;
+  }
+  if (wo.adobe_workorder_id) {
+    const e = new Error('this work order has an Adobe work-order ID — Adobe accepted it, so it cannot be marked absent');
+    e.status = 409; e.code = 'already_accepted'; e.publicMessage = e.message; throw e;
+  }
+  if (wo.status !== 'submitting') {
+    const e = new Error(`only an unconfirmed 'submitting' work order can be marked absent (this one is '${wo.status}')`);
+    e.status = 409; e.code = 'bad_state'; e.publicMessage = e.message; throw e;
+  }
+  const resv = q().getReservation.get(woId);
+  if (resv && resv.accepted === 1) {
+    const e = new Error('this work order\'s reservation is marked accepted (Adobe spent the quota) — it cannot be released');
+    e.status = 409; e.code = 'accepted'; e.publicMessage = e.message; throw e;
+  }
+  release(woId);                                   // guarded WHERE accepted=0
+  q().updateWorkOrderStatus.run('planned', null, woId);
+  logger.info({ jobId, woId }, 'operator confirmed orphan absent in Adobe → released + reset to planned for retry');
+  return { ok: true, woId, status: 'planned' };
 }
 
 /** Top-level entrypoint called by src/index.js after the DB is ready. */
