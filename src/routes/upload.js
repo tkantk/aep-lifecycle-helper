@@ -134,6 +134,11 @@ router.post('/', uploadMiddleware, async (req, res, next) => {
       totalSourceIds,
     });
 
+    // Persist the chosen source column so crash-recovery resumes against the
+    // same column (review blocker #4). Stored as the raw value (index or
+    // header name); recovery re-applies the same isNaN/Number coercion.
+    q().setJobSourceColumn.run(String(column), jobId);
+
     // Kick off expansion in-process (fire-and-forget). Progress via /progress.
     runExpansion({
       jobId,

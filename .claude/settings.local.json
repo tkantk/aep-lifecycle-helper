@@ -33,7 +33,9 @@
       "Bash(git commit -m ' *)",
       "Bash(node --test test/quotaApi.test.js)",
       "Bash(node --test test/redistributor.test.js)",
-      "Bash(node --test test/scheduler.test.js)"
+      "Bash(node --test test/scheduler.test.js)",
+      "Bash(ENCRYPTION_KEY=0000000000000000000000000000000000000000000000000000000000000000 node --test test/recoveryColumn.test.js test/recovery.test.js test/integration.test.js)",
+      "Bash(ENCRYPTION_KEY=0000000000000000000000000000000000000000000000000000000000000000 node --test)"
     ]
   }
 }

@@ -78,6 +78,7 @@ export function initDb() {
       target_services_json TEXT,
       source_namespace    TEXT NOT NULL DEFAULT 'hashedKocid',
       source_namespace_id INTEGER,                      -- numeric nsid if known
+      source_column       TEXT NOT NULL DEFAULT '0',    -- CSV column (0-based index OR header name) chosen at upload
       daily_limit         INTEGER NOT NULL DEFAULT 1000000,
       upload_path         TEXT,
       total_source_ids    INTEGER NOT NULL DEFAULT 0,
@@ -197,6 +198,12 @@ export function initDb() {
     //   (≤1mo) or a modal (≥2mo). Nullable until the first redistribute runs.
     { table: 'work_orders', column: 'month_index', type: 'INTEGER' },
     { table: 'jobs',        column: 'projected_months', type: 'INTEGER' },
+    // Review blocker #4 (2026-05-31): persist the CSV source column chosen at
+    // upload so crash-recovery resumes against the SAME column. Without this,
+    // recovery hardcoded column 0 and could expand identifiers the operator
+    // never selected. Default '0' keeps legacy rows (and the single-column
+    // common case) correct.
+    { table: 'jobs',        column: 'source_column', type: "TEXT NOT NULL DEFAULT '0'" },
   ];
   for (const { table, column, type } of additiveColumns) {
     try {
@@ -294,6 +301,10 @@ function prepared() {
               @sourceNamespace, @sourceNamespaceId, @dailyLimit, @monthlyLimit,
               @uploadPath, @totalSourceIds)
     `),
+    // Persist the upload-time source column separately so insertJob's param
+    // contract (and its many call sites) stays untouched. Stored as TEXT
+    // because the column may be a 0-based index OR a header name.
+    setJobSourceColumn: db.prepare('UPDATE jobs SET source_column = ? WHERE id = ?'),
     getJob: db.prepare('SELECT * FROM jobs WHERE id = ?'),
     listJobs: db.prepare('SELECT * FROM jobs ORDER BY created_at DESC LIMIT ? OFFSET ?'),
     // Monitor-tab feed: jobs that have at least one Adobe-acked work order,
@@ -427,7 +438,12 @@ function prepared() {
       VALUES (@id, @jobId, @dayIndex, @datasetIds, @targetServicesJson,
               @namespacesIdentities, @identifierCount, @status)
     `),
-    deletePlannedOrders: db.prepare(`DELETE FROM work_orders WHERE job_id = ? AND status IN ('planned', 'awaiting_approval')`),
+    // Clears every un-shipped status before a re-plan. MUST include 'deferred':
+    // a deferred WO that survives a re-plan plus the freshly re-emitted planned
+    // WO both cover the same identities, so the next submit would ship BOTH —
+    // a duplicate irreversible delete (review blocker #1). Deferred orders
+    // never went to Adobe, so deleting + re-creating them is safe.
+    deletePlannedOrders: db.prepare(`DELETE FROM work_orders WHERE job_id = ? AND status IN ('planned', 'awaiting_approval', 'deferred')`),
     // Mark WOs in Month 2+ as awaiting_approval after planning. These require
     // explicit operator sign-off before they become eligible for submission.
     // Month 1 (or NULL legacy rows) stays 'planned' and ships immediately on Submit.

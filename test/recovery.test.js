@@ -130,6 +130,70 @@ test('reconcile: Adobe finds matching work order → record Adobe ID', async () 
   assert.equal(wo.adobe_workorder_id, 'DI-recovered-abc-123');
 });
 
+test('reconcile: Adobe\'s documented {results:[...]} shape is matched (not rolled back)', async () => {
+  // Adobe's live Data Hygiene list endpoint returns the matches under a
+  // top-level `results` array (plus `total`/`count`/`_links`), NOT
+  // `workorders`/`items`. The pre-fix code only looked for the latter two,
+  // so a genuinely-processed work order was reported ABSENT and rolled
+  // back → next submit duplicated the irreversible delete.
+  const { jobId } = seedCredAndJob({ name: 'results-shape' });
+  const localId = `wo-results-${seq}`;
+  seedOrphanWorkOrder(jobId, localId);
+
+  const displayName = `Delete results-shape - WO ${localId}`;
+
+  mockIms();
+  nock(GATEWAY)
+    .get(/\/data\/core\/hygiene\/workorder/)
+    .query(true)
+    .reply(200, {
+      results: [{
+        workorderId: 'DI-results-shape-1',
+        displayName,
+        status: 'received',
+        bundleId: 'BN-results',
+        createdAt: '2026-05-31T10:00:00Z',
+      }],
+      total: 1,
+      count: 1,
+      _links: {},
+    });
+
+  const count = await reconcileOrphanWorkOrders();
+  assert.equal(count, 1);
+
+  const wo = q().getAllOrdersForJob.all(jobId)[0];
+  assert.equal(wo.status, 'submitted', 'WO present in Adobe under `results` must be recorded, never rolled back');
+  assert.equal(wo.adobe_workorder_id, 'DI-results-shape-1');
+});
+
+test('reconcile: unrecognized 200 response shape is indeterminate (fail closed, no rollback)', async () => {
+  // If Adobe returns a 200 whose shape we DON'T recognize (future API change,
+  // a renamed container, an error envelope with HTTP 200), we must NOT
+  // conclude the order is absent — that would roll back + release quota and
+  // risk a duplicate on the next submit. Unknown shape → leave it submitting.
+  const { jobId } = seedCredAndJob({ name: 'unknown-shape' });
+  const localId = `wo-unknown-${seq}`;
+  seedOrphanWorkOrder(jobId, localId);
+
+  mockIms();
+  nock(GATEWAY)
+    .get(/\/data\/core\/hygiene\/workorder/)
+    .query(true)
+    .reply(200, { somethingElse: 'we do not understand this', data: { nested: true } });
+
+  const count = await reconcileOrphanWorkOrders();
+  assert.equal(count, 1);
+
+  const wo = q().getAllOrdersForJob.all(jobId)[0];
+  assert.equal(wo.status, 'submitting',
+    'unrecognized 200 shape must stay submitting (fail closed) so we never risk a duplicate');
+  assert.equal(wo.adobe_workorder_id, null);
+
+  // Cleanup so it doesn't pollute later whole-DB orphan counts.
+  q().updateWorkOrderStatus.run('failed', 'test cleanup', wo.id);
+});
+
 test('reconcile: Adobe 400 on lookup leaves orphan in submitting (no roll-back, no quota release)', async () => {
   // Regression: the lookup returning null on 400 used to roll the orphan
   // back to planned, which on next submit could create a duplicate Adobe

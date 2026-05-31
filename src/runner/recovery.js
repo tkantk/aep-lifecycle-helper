@@ -57,7 +57,13 @@ export async function resumeExpandingJobs() {
       sourceNamespaceId: job.source_namespace_id,
       credsId: job.creds_id,
       sandboxName: job.sandbox_name,
-      column: 0,
+      // Resume against the SAME column the operator chose at upload (review
+      // blocker #4). source_column is stored as TEXT (index or header name);
+      // re-apply the upload route's isNaN/Number coercion.
+      column: (() => {
+        const c = job.source_column ?? '0';
+        return isNaN(c) ? c : Number(c);
+      })(),
       skipSourceIds,
     }).catch(err => {
       logger.error({ jobId: job.id, err: err.message }, 'recovery: resume failed');
@@ -133,6 +139,26 @@ export async function reconcileOrphanWorkOrders() {
 const LOOKUP_INDETERMINATE = Symbol('lookup-indeterminate');
 
 /**
+ * Extract the work-order array from Adobe's list-endpoint response.
+ *
+ * Adobe's documented (2026-05) shape is `{ results: [...], total, count,
+ * _links }`. We also accept a bare array and the legacy `workorders` / `items`
+ * containers for forward/backward compatibility. Returns:
+ *   - the array (possibly empty)  → recognized shape; absence of a match is
+ *                                   a TRUSTWORTHY "not found"
+ *   - null                        → shape NOT recognized; the caller must
+ *                                   treat this as indeterminate and NOT roll
+ *                                   back (we can't prove absence).
+ */
+function extractWorkOrderList(data) {
+  if (Array.isArray(data)) return data;
+  for (const key of ['results', 'workorders', 'items', 'children']) {
+    if (Array.isArray(data?.[key])) return data[key];
+  }
+  return null;
+}
+
+/**
  * Best-effort lookup of an existing Adobe work order by exact displayName.
  * Uses the list endpoint (GET /data/core/hygiene/workorder).
  *
@@ -155,7 +181,14 @@ async function findAdobeWorkOrderByDisplayNamePrefix({ creds, sandboxName, prefi
   const url = `${config.aep.gateway}/data/core/hygiene/workorder?displayName=${encodeURIComponent(prefix)}&limit=20`;
   try {
     const { data } = await client.get(url);
-    const list = Array.isArray(data) ? data : (data?.workorders || data?.items || []);
+    const list = extractWorkOrderList(data);
+    // CRITICAL (fail closed): if we don't recognize the response shape we
+    // CANNOT conclude the order is absent. Returning null here would roll the
+    // orphan back to 'planned' and re-submit — a duplicate irreversible
+    // delete if Adobe had actually processed the original POST. Adobe's live
+    // list endpoint returns matches under `results`; older/other shapes used
+    // `workorders`/`items`/a bare array. Anything else → INDETERMINATE.
+    if (list === null) return LOOKUP_INDETERMINATE;
     // Use exact match now that the full UUID is embedded in the displayName
     // (F-009). The API filter may return approximate results; we re-check here.
     const match = list.find(w => (w.displayName || '') === prefix);

@@ -303,12 +303,31 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
     // jobs default to month_index 1).
     const useMonth = Number(monthIndex) || null;
     const useDay   = Number(dayIndex)   || null;
-    const orders = (useMonth && useDay)
-      ? q().getOrdersByMonthAndDay.all(jobId, useMonth, useDay)
-          .filter(o => ['planned', 'deferred'].includes(o.status))
-      : useDay
-        ? q().getOrdersByDay.all(jobId, useDay).filter(o => ['planned', 'deferred'].includes(o.status))
-        : q().getPlannedOrders.all(jobId);
+    let orders;
+    if (useMonth && useDay) {
+      orders = q().getOrdersByMonthAndDay.all(jobId, useMonth, useDay)
+        .filter(o => ['planned', 'deferred'].includes(o.status));
+    } else if (useDay) {
+      orders = q().getOrdersByDay.all(jobId, useDay).filter(o => ['planned', 'deferred'].includes(o.status));
+    } else {
+      // No explicit bucket (the auto-resume scheduler, and the default UI
+      // "Submit" click). Ship ONLY the current window — the lowest
+      // (month_index, day_index) bucket among un-shipped orders. After the
+      // redistribute() above, that bucket is sized to Adobe's live daily
+      // `remaining`. Shipping every planned order here (the old behavior)
+      // ignored the bucketing and over-submitted beyond Adobe's remaining
+      // for today — review blocker #3. The next run (next scheduler tick /
+      // next UTC day) re-buckets and ships the following window.
+      const unshipped = q().getPlannedOrders.all(jobId); // sorted month,day,rowid
+      if (unshipped.length === 0) {
+        orders = [];
+      } else {
+        const first = unshipped[0];
+        const m = first.month_index ?? 1;
+        const d = first.day_index ?? 1;
+        orders = unshipped.filter(o => (o.month_index ?? 1) === m && (o.day_index ?? 1) === d);
+      }
+    }
 
     // Use live quota cap values for the local reserve() ledger so the safety
     // net is consistent with what Adobe will actually enforce (F-003). Fall
