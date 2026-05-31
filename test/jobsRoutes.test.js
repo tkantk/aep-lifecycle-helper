@@ -294,6 +294,13 @@ test('R7 #1: release-absent 404 for an unknown work order', async () => {
   assert.equal(res.status, 404);
 });
 
+test('R7 #1: release-absent rejects a malformed (non-UUID) woId with 400', async () => {
+  const jobId = insertJob();
+  const res = await request('POST', `/api/jobs/${jobId}/work-orders/not-a-uuid/release-absent`, { confirmedAbsent: true });
+  assert.equal(res.status, 400);
+  assert.equal(res.body.error, 'invalid_id');
+});
+
 test('DELETE /api/jobs/:id treats planned/deferred/awaiting_approval/completed/failed as safe', async () => {
   const jobId = insertJob();
   insertWorkOrder(jobId, 'planned');

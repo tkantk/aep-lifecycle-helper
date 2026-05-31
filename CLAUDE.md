@@ -240,10 +240,12 @@ The flow is:
    per-WO reservation.
 2. If `granted === false`, the work order is marked `deferred`. Daily
    denials clear at UTC midnight; monthly denials clear at UTC first-of-month.
-3. If the subsequent Adobe submission **fails (4xx)** or is rolled back, we call
-   `release(workOrderId)` — deactivating that WO's reservation. `release` is
+3. If the subsequent Adobe submission **fails (4xx)** — or the operator
+   confirms an uncertain orphan is absent in Adobe (R7 #1) — we call
+   `release(workOrderId)`, deactivating that WO's reservation. `release` is
    GUARDED (`WHERE accepted = 0`): once Adobe has acked a WO it can NEVER be
-   refunded (see the lifecycle below). Without release, a 4xx would waste quota.
+   refunded (see the lifecycle below). An UNCERTAIN failure (5xx/timeout/network)
+   does NOT release — the reservation is HELD for recovery (R5/R6).
 
 **Per-work-order reservation model (review R4 #1) under the HOLD-UNTIL-ROLLOVER
 lifecycle (review R5, 2026-05-31).** The ledger separates Adobe's observed usage
@@ -702,23 +704,24 @@ These are NOT yet implemented but are worth flagging if the user asks:
 3. **Audit export.** We have `api_audit` in the schema but no write path
    yet. If the client needs SOC-style audit logs, wire logging in
    `adobeClient.js` to insert one row per Adobe call.
-4. **Operator-resolution UI for indeterminate orphans.** Recovery NEVER
-   auto-rolls-back an uncertain orphan (review R6 #1): on ANY no-match
-   (recognized-empty list, 400, or transient error) the WO is LEFT in
-   `submitting` with its reservation HELD, because Adobe's async work-order
-   creation gives no read-after-write guarantee — a missing list entry does
-   not prove absence, and rolling back would risk a duplicate irreversible
-   delete on retry. Today the operator resolves these by checking Adobe's UI
-   and either force-deleting (tombstone kept) or letting a later reconcile
-   match once Adobe's list catches up. A future enhancement: an explicit
-   "I confirmed this is absent in Adobe — roll back & retry" operator action,
-   and/or the list-without-filter fallback (match recent orders client-side)
-   for when Adobe's displayName filter itself 400s.
+4. **List-without-filter recovery fallback.** Recovery NEVER auto-rolls-back an
+   uncertain orphan (review R6 #1): on ANY no-match (recognized-empty list, 400,
+   or transient error) the WO is LEFT in `submitting` with its reservation HELD,
+   because Adobe's async work-order creation gives no read-after-write guarantee.
+   The operator-confirmed escape hatch IS implemented (see "Already done" below).
+   The remaining future enhancement: when Adobe's `displayName` filter itself
+   400s, fall back to listing recent orders WITHOUT the filter and matching
+   client-side, so reconciliation still works rather than going indeterminate.
 
 **Already done (don't ask again):**
 - Resume a job across restarts — `runner/recovery.js::resumeExpandingJobs`
   rebuilds `expanded_identities` source-ID set and resumes via
   `runExpansion(... skipSourceIds)`. Tests in `test/recovery.test.js`.
+- Operator-confirmed resolution for a stuck indeterminate orphan (review R7 #1)
+  — `POST /api/jobs/:id/work-orders/:woId/release-absent` (`recovery.js::
+  releaseAbsentOrphan`) + the per-WO "Confirmed absent → retry" button in the
+  Submit-tab reconcile banner. Fail-closed; requires `{confirmedAbsent:true}`.
+  Tests in `test/jobsRoutes.test.js`.
 
 ---
 
@@ -773,7 +776,7 @@ which require `https://platform-{region}.adobe.io` (region ∈ `va7`, `nld2`,
 7. Run `npm test` before suggesting a change is done (use `npm test`, NOT
    `node --test test` — on Node ≥23 the bare `test` arg is treated as a test
    name and silently runs nothing; `npm test` → `scripts/run-tests.mjs` which
-   enumerates `test/*.test.js`). **247 tests should pass** (as of the 2026-05-31
+   enumerates `test/*.test.js`). **248 tests should pass** (as of the 2026-05-31
    R7 operator-workflow session — per-WO release-absent action + UI/doc fixes).
 8. **After your change**, append a bullet to the current session in
    `docs/CHANGELOG.md` describing what + why. If you changed the module map,

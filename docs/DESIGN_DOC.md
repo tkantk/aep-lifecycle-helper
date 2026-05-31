@@ -632,10 +632,12 @@ approval gate, UI-level debounce on every destructive button). Source:
      automatically. Prevents re-emitting identities already deleted.
 
   4. Orphan recovery — if the process crashes between quota reservation
-     and Adobe's ACK, startup recovery looks up the work order by
-     displayName prefix. Confirmed-absent → roll back. Indeterminate
-     (Adobe returned 400 or network error) → leave as-is; retry next boot.
-     Never roll back when the answer is ambiguous.
+     and Adobe's ACK, startup recovery looks up the work order by its
+     persisted displayName (R6 #2). Match → record the Adobe ID + markAccepted.
+     No-match or indeterminate (400 / network) → leave in `submitting` with the
+     reservation HELD; NEVER auto-roll-back (R6 #1) — a no-match doesn't prove
+     Adobe absence. The operator resolves a confirmed-absent one via the
+     release-absent action (R7 #1).
 ```
 
 ---
@@ -846,10 +848,14 @@ On startup, `runStartupRecovery()` automatically:
 - **Reconciles orphan work orders.** For each work order stuck in `submitting`
   with no Adobe ID (the crash window), looks up the order in Adobe by its
   `displayName` prefix:
-  - **Match found** — records the Adobe ID and hands off to the monitor.
-  - **Confirmed absent** — rolls back to `planned` and releases quota.
+  - **Match found** — records the Adobe ID + markAccepted; hands off to the monitor.
+  - **No match** — INDETERMINATE: leaves the orphan in `submitting` with its
+    reservation HELD. NEVER auto-rolls-back (R6 #1) — a no-match doesn't prove
+    Adobe absence (async creation, no read-after-write guarantee). The operator
+    confirms absence in Adobe's UI and releases it via the release-absent action
+    (R7 #1).
   - **Indeterminate** (Adobe returned 400, network error) — leaves the orphan
-    for the next startup to retry. Never rolls back ambiguous cases.
+    for the next startup to retry.
 
 ### 9.5 Rotating Credentials
 

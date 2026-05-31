@@ -788,8 +788,9 @@ Full DDL in `src/db.js::initDb()`. Summary:
   succeeds", the work order is left in `submitting` with no Adobe ID.
   `runner/recovery.js::reconcileOrphanWorkOrders()` runs at startup and
   reconciles via `GET /hygiene/workorder?displayName=...`:
-    - On match → record the Adobe ID and let the monitor take over.
-    - On confirmed no-match → roll back to `planned` and `release` quota.
+    - On match → record the Adobe ID + markAccepted; let the monitor take over.
+    - On no-match → leave in `submitting`, reservation HELD; NEVER auto-roll-back
+      (R6 #1 — absence unproven). Operator resolves via release-absent (R7 #1).
     - On 400 (filter not supported) OR transient 5xx/network error →
       leave the row alone for next-startup retry. Never roll back when
       the answer is indeterminate — that would risk a duplicate Adobe
@@ -945,8 +946,9 @@ before fast-csv runs.
   client_name / region, never touches the encrypted secret or the
   identity-key fields (`credentialsRoutes.test.js`).
 - Recovery reconciliation — orphan work orders without an Adobe ID are
-  matched, rolled back, or left alone depending on the Adobe response
-  (`recovery.test.js`).
+  matched (→ submitted) or left in `submitting` (no-match / indeterminate →
+  reservation held, never auto-rolled-back, R6 #1) depending on the Adobe
+  response (`recovery.test.js`).
 
 **Phase 1 — live quota (`quotaApi.test.js`, 8 tests)**
 - Cache miss → fresh Adobe fetch, result returned.

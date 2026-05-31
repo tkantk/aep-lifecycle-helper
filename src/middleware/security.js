@@ -124,6 +124,11 @@ export function registerUuidParamGuards(router) {
     if (!UUID_RE.test(val)) return reject(res, 'credsId');
     next();
   });
+  // Work-order id (e.g. POST /jobs/:id/work-orders/:woId/release-absent, R7 #1).
+  router.param('woId', (req, res, next, val) => {
+    if (!UUID_RE.test(val)) return reject(res, 'woId');
+    next();
+  });
 }
 
 export { UUID_RE };
