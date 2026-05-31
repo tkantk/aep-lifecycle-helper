@@ -139,7 +139,7 @@ export async function runExpansion({
 
   // ─── Per-batch timing instrumentation ─────────────────────────────────
   // Tracks rolling p50/p95 of `adobeMs` (Identity Graph round-trip) and
-  // `sqliteMs` (bulkInsertIdentities) over a 50-batch window so we can
+  // `sqliteMs` (insertIdentitiesAndCount) over a 50-batch window so we can
   // spot a slowdown the moment it starts. Every BATCHES_PER_SUMMARY
   // batches the runner emits an aggregate log line — a flat
   // sustained p95 means the bottleneck is environmental (Adobe rate
