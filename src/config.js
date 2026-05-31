@@ -7,6 +7,23 @@ import path from 'node:path';
 
 const cwd = process.cwd();
 
+// DATA_DIR is the single root for ALL runtime state. db/uploads/output derive
+// from it so that pointing DATA_DIR outside a cloud-sync path (the documented
+// OneDrive mitigation) actually relocates the SQLite DB too — not just the
+// encryption key (review finding #5). Each sub-path still has its own explicit
+// override for advanced setups.
+const dataDir = process.env.DATA_DIR || path.join(cwd, 'data');
+
+// Resolve a numeric env var, PRESERVING an explicit 0 (e.g.
+// MONTHLY_IDENTIFIER_LIMIT=0 means "disable monthly tracking"). `|| default`
+// wrongly turned 0 back into the default. Empty/unset/NaN → fallback.
+function numEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : fallback;
+}
+
 /**
  * Detect when `dataDir` lives inside a cloud-sync path (OneDrive, Dropbox,
  * Google Drive, iCloud). The encryption key + encrypted client secrets live
@@ -36,10 +53,10 @@ export const config = {
   openBrowser: process.env.OPEN_BROWSER !== '0',
 
   // ─── Paths ─────────────────────────────────────────────────────────
-  dataDir: process.env.DATA_DIR || path.join(cwd, 'data'),
-  dbPath: process.env.DB_PATH || path.join(cwd, 'data', 'state.db'),
-  uploadDir: process.env.UPLOAD_DIR || path.join(cwd, 'data', 'uploads'),
-  outputDir: process.env.OUTPUT_DIR || path.join(cwd, 'data', 'output'),
+  dataDir,
+  dbPath: process.env.DB_PATH || path.join(dataDir, 'state.db'),
+  uploadDir: process.env.UPLOAD_DIR || path.join(dataDir, 'uploads'),
+  outputDir: process.env.OUTPUT_DIR || path.join(dataDir, 'output'),
 
   // ─── Adobe endpoints ───────────────────────────────────────────────
   ims: {
@@ -73,7 +90,7 @@ export const config = {
   // Monthly identifier cap is contract-dependent. Default 3M/month matches
   // the typical base Data Hygiene entitlement; override via env or the Config
   // tab to match your contract. Set to 0 to disable monthly tracking.
-  monthlyIdentifierLimit: Number(process.env.MONTHLY_IDENTIFIER_LIMIT) || 3_000_000,
+  monthlyIdentifierLimit: numEnv('MONTHLY_IDENTIFIER_LIMIT', 3_000_000),
   requestTimeoutMs: Number(process.env.REQUEST_TIMEOUT_MS) || 60_000,
 
   // ─── Security ──────────────────────────────────────────────────────

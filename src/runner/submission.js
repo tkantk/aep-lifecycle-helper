@@ -291,6 +291,18 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
       }
       throw err;
     }
+    // Fail CLOSED on an unrecognized entitlement (review finding #6). A 200
+    // whose shape we don't understand leaves quotaSnapshot.daily = null; the
+    // old code then silently fell back to the static job.daily_limit and
+    // shipped. For an irreversible delete we must refuse rather than guess.
+    // (A stale-but-recognized cache within the 24h floor is fine — it still
+    // carries a real daily.quota.)
+    if (!quotaSnapshot?.daily || !(Number(quotaSnapshot.daily.quota) > 0)) {
+      const e = new Error('Cannot submit: Adobe /quota returned no recognized daily entitlement.');
+      e.code = 'quota_unavailable';
+      throw e;
+    }
+
     const distribution = redistributeUnshippedOrders(jobId, quotaSnapshot);
     const shifted = previousMonths != null && distribution.months > previousMonths;
 

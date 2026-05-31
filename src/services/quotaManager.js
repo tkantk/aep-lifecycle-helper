@@ -1,4 +1,4 @@
-import { q } from '../db.js';
+import { db, q } from '../db.js';
 
 /**
  * Two-dimension quota ledger stored in SQLite.
@@ -91,8 +91,15 @@ export function reserve(imsOrgId, count, dailyLimit, monthlyLimit) {
     };
   }
 
-  q().upsertQuota.run(imsOrgId, today, count);
-  if (monthlyLimit != null) q().upsertMonthlyQuota.run(imsOrgId, month, count);
+  // Increment BOTH ledgers atomically. Without the transaction the comment
+  // above was aspirational: a crash between the two .run() calls (with
+  // synchronous=NORMAL) could durably persist the daily increment but not the
+  // monthly one, permanently under-counting the monthly ledger (review
+  // finding #7).
+  db.transaction(() => {
+    q().upsertQuota.run(imsOrgId, today, count);
+    if (monthlyLimit != null) q().upsertMonthlyQuota.run(imsOrgId, month, count);
+  })();
 
   return {
     granted: true,
@@ -122,8 +129,10 @@ export function reserve(imsOrgId, count, dailyLimit, monthlyLimit) {
  * edge case documented in docs/ARCHITECTURE.md §8.
  */
 export function release(imsOrgId, count, monthlyLimit) {
-  q().decQuota.run(count, imsOrgId, utcToday());
-  if (monthlyLimit != null) {
-    q().decMonthlyQuota.run(count, imsOrgId, utcYearMonth());
-  }
+  db.transaction(() => {
+    q().decQuota.run(count, imsOrgId, utcToday());
+    if (monthlyLimit != null) {
+      q().decMonthlyQuota.run(count, imsOrgId, utcYearMonth());
+    }
+  })();
 }

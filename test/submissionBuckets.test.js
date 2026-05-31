@@ -85,6 +85,28 @@ function mockOrgQuota({ dailyRemaining, monthlyRemaining = 3_000_000 }) {
   });
 }
 
+test('runSubmission fails closed when /quota has no recognized daily entitlement', async () => {
+  // Review finding #6: a 200 whose shape we don't recognize (no daily quota
+  // entry) used to leave quotaSnapshot.daily = null, and submission silently
+  // fell back to the static job.daily_limit and shipped anyway. A destructive
+  // submit must STOP on an unrecognized entitlement, not guess.
+  const { jobId } = seedJobWithOrders([100_000]);
+
+  mockIms();
+  nock(GATEWAY).persist().get('/data/core/hygiene/quota').reply(200, { quotas: [] });
+  let posts = 0;
+  nock(GATEWAY).persist().post('/data/core/hygiene/workorder').reply(200, () => {
+    posts++;
+    return { workorderId: 'DI-x', status: 'received', createdAt: '2026-05-31T00:00:00Z' };
+  });
+
+  await assert.rejects(
+    () => runSubmission({ jobId }),
+    err => { assert.equal(err.code, 'quota_unavailable'); return true; },
+  );
+  assert.equal(posts, 0, 'no work order may ship when the daily entitlement is unrecognized');
+});
+
 test('runSubmission with no bucket ships only the current day window (not all planned)', async () => {
   // 3 work orders of 100k each. Adobe says only 100k remains today, so the
   // redistributor packs WO0 into (month 1, day 1) and WO1+WO2 into day 2.
