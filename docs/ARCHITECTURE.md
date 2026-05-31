@@ -497,7 +497,7 @@ src/
 
 test/                       node --test (via `npm test` → scripts/run-tests.mjs,
                             which enumerates test/*.test.js and sets a stable
-                            test ENCRYPTION_KEY). 230 tests covering hygiene
+                            test ENCRYPTION_KEY). 237 tests covering hygiene
                             validators,
                             namespace canonicalization, IMS token cache, quota
                             atomicity (incl. monthly-disabled release gating),
@@ -579,14 +579,15 @@ data/                       Runtime state; in .gitignore.
 | `jobs` | One per upload. Status: created → expanding → expanded → ready → submitting → submitted/partial/failed. `projected_months` (Phase 2) tracks the redistributor's max month_index for shift detection. `source_column` (2026-05-31, default `'0'`) persists the upload-time CSV column so crash-recovery resumes against the same column. | FK creds_id |
 | `expanded_identities` | One row per (cluster member, source). No unique index — dedup deferred to planning via `GROUP BY` in `streamIdentitiesBySource`. Only `idx_ei_job_source(job_id, source_id)` remains; `idx_ei_job_ns` was dropped 2026-05-29 (proven via EXPLAIN QUERY PLAN to be redundant — every reader falls back to `idx_ei_job_source` with an identical plan). | FK job_id |
 | `work_orders` | One per Adobe work order. Statuses: planned → submitting → submitted → completed/failed/deferred. `month_index` (Phase 2) + `day_index` form the bucket label assigned by the redistributor on un-shipped WOs only. `last_polled_at` (2026-05-31) is the monitor's fairness cursor so >100 open WOs all get polled (no starvation). (R2's `reserved_monthly` column was removed in R4 — the per-WO `quota_reservations` table records each WO's own period/count, so recovery releases exactly what was reserved.) | FK job_id, ordered by rowid |
-| `quota_usage` | Per-period **adobe_floor** = Adobe's observed consumed (R4: `used` is now vestigial). Raised ONLY by `seedFloor` (MAX with live /quota). `complete()` does NOT bump it — a finished WO is already in `/quota`, so the next `seedFloor` MAX picks it up; an additive bump would double-count or (under lag) over-ship (R4.1 fix). | PK(ims_org_id, utc_date) |
+| `quota_usage` | Per-period **adobe_floor** = Adobe's observed consumed (R4: `used` is vestigial; an R5 boot backfill folds any legacy `used` into `adobe_floor`). Raised ONLY by `seedFloor` (MAX with live /quota). Nothing else touches the floor — an accepted WO is held as an active reservation, never folded in, so there is no double-count vs the MAX (R5). | PK(ims_org_id, utc_date) |
 | `quota_usage_monthly` | Monthly counterpart of `quota_usage`'s `adobe_floor`. | PK(ims_org_id, utc_year_month) |
-| `quota_reservations` | **Per-work-order quota reservation** (2026-05-31 R4 #1): (work_order_id) → count + utc_date + utc_year_month + active. `effective_used(period) = adobe_floor(period) + Σ active reservations(period)`. reserve/release/complete are keyed by WO id → exact + period-correct (fixes same-day ownership, cross-day, multi-month double-count). | PK(work_order_id) |
+| `quota_reservations` | **Per-work-order quota reservation** (R4 #1; R5 lifecycle): (work_order_id) → count + utc_date + utc_year_month + active + **accepted**. `effective_used(period) = adobe_floor(period) + Σ active reservations(period)`. `reserve`→pending(accepted=0); `markAccepted`→accepted=1 (Adobe acked); `release` deactivates IFF accepted=0; `reactivate`→active+accepted. **HOLD-UNTIL-ROLLOVER (R5):** an accepted reservation is NEVER dropped mid-period (no `complete()`, no timer/floor-delta drop — all over-ship under a concurrent external consumer); it's held until the period-keyed SUM stops matching it at UTC day/month rollover. | PK(work_order_id) |
 | `app_settings` | Generic key/value bag (Phase 3). First users: `auto_resume_*` keys for the scheduler. | PK(key) |
 
-`reserve()` records an active per-WO row in `quota_reservations` atomically;
-`release()`/`complete()` deactivate the WO's own row. `effective_used = adobe_floor
-+ Σ active reservations` (R4 #1). The `jobs` table has `daily_limit` and
+`reserve()` records a pending per-WO row in `quota_reservations` atomically;
+`markAccepted()` promotes it when Adobe acks; `release()` deactivates it only
+while un-accepted (R5). `effective_used = adobe_floor + Σ active reservations`
+(R4 #1). The `jobs` table has `daily_limit` and
 `monthly_limit` columns — FALLBACK ONLY; the live Adobe `/quota` is the runtime
 source of truth (CLAUDE.md I15), and monthly is ALWAYS tracked (R4 #4 removed the
 "null = don't track monthly" mode).

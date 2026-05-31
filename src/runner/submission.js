@@ -1,7 +1,7 @@
 import pLimit from 'p-limit';
 import { v4 as uuid } from 'uuid';
 import { submitWorkOrder } from '../services/hygiene.js';
-import { reserve, release, seedFloor } from '../services/quotaManager.js';
+import { reserve, release, markAccepted, seedFloor } from '../services/quotaManager.js';
 import { getOrgQuota } from '../services/quotaApi.js';
 import { redistributeUnshippedOrders } from './redistributor.js';
 import { q, db, prepareStreamIdentitiesBySource, setWorkOrderSubmittingDurable } from '../db.js';
@@ -425,6 +425,11 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
           bundleId: result.bundleId,
           submittedAt: result.createdAt,
         });
+        // Adobe ACKED this POST (2xx) — promote the reservation to accepted so
+        // it can never be released and is HELD until period rollover (review
+        // R5). It must NOT be dropped on terminal status (the monitor no longer
+        // touches quota) nor refunded by a later release/delete.
+        markAccepted(wo.id);
         submitted++;
         logger.info({
           localId: wo.id, adobeId: result.workorderId, count: result.operationCount,

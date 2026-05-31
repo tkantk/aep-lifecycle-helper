@@ -329,9 +329,12 @@ router.delete('/:id', async (req, res, next) => {
     }
 
     // Drop this job's quota reservations FIRST (while its work_orders still
-    // exist for the subquery) — quota_reservations isn't cascaded, and a left-
-    // behind ACTIVE reservation would keep consuming the org's cap (review R4.1).
-    q().deleteReservationsForJob.run(jobId);
+    // exist for the status subquery). STATUS-AWARE (review R5 #2): never-sent
+    // (planned/deferred/awaiting_approval) and already-inactive reservations are
+    // refunded; an ACTIVE reservation for a WO that WAS sent to Adobe is KEPT as
+    // a tombstone (Adobe spent that quota — refunding it would over-ship). The
+    // tombstone survives the cascade (no FK) and expires at period rollover.
+    q().deleteReservationsForJob.run({ jobId });
     // CASCADE FK constraints on expanded_identities + work_orders collapse all
     // dependent rows in this single statement (the deletion is atomic).
     q().deleteJob.run(jobId);

@@ -9,6 +9,75 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-05-31 (R5) — Fifth-round review: hold-until-rollover quota lifecycle
+
+A fifth review found the R4.1 quota model still had three over-ship paths plus an
+operational leak. Root cause: R4.1 deactivated an accepted WO's reservation on
+terminal status, assuming the floor had assimilated it — but Adobe's `/quota` is
+org-wide, eventually-consistent, and has NO per-tool attribution, so a floor rise
+never proves OUR work entered it. **Before writing any code, a 5-agent adversarial
+design review stress-tested the proposed redesign** and proved that EVERY
+mid-period drop heuristic (24h timer AND evidence-based floor-credit) still
+over-ships under a concurrent external Adobe consumer. The maintainer chose the
+provably-safe option: **hold-until-rollover** — an accepted reservation is never
+dropped mid-period; it expires when the UTC day/month rolls over (Adobe's counter
+resets then too). Over-defer is the SAFE direction and self-corrects at rollover.
+Suite **230 → 237** pass, audit clean, fresh + legacy-DB migration boots verified.
+
+### #1 (blocker) — `complete()`/deactivate-on-terminal reopened capacity → over-ship
+
+`quota_reservations` gains an **`accepted`** flag (0=pending, 1=Adobe-acked).
+`reserve`→pending; `markAccepted` (wired into a 2xx submit + recovery orphan
+match)→accepted; `release` is GUARDED (`WHERE accepted=0`) so Adobe-acked work can
+never be refunded; `reactivate`→active+accepted. **`complete()` is removed**; the
+monitor updates DISPLAY status only and never touches quota. An accepted
+reservation is HELD (counts in `effective = adobe_floor + Σ active`) until the
+period-keyed SUM stops matching it at rollover. `quotaManager.js`, `db.js`,
+`submission.js`, `monitor.js`, `recovery.js`.
+
+### #2 (blocker) — force-delete / GC refunded active Adobe work
+
+`db.deleteReservationsForJob` is now STATUS-AWARE: it refunds only inactive or
+never-sent (`planned`/`deferred`/`awaiting_approval`) reservations and KEEPS an
+active reservation for a sent WO as a tombstone (survives the cascade — no FK).
+`db.gcOrphanReservations` now deletes only non-counting orphans (inactive, or a
+prior-month tombstone); a current-month active tombstone is kept. `routes/jobs.js`,
+`runner/recovery.js`.
+
+### #3 (blocker for upgrades) — pre-R4 held usage was dropped on upgrade
+
+`initDb` runs idempotent boot backfills: folds a pre-R4 `quota_usage.used` into
+`adobe_floor` (preserve a conservative hold across the upgrade), and stamps
+`accepted=1` on any pre-R5 active reservation whose WO had already reached Adobe
+(so `release`'s guard can't refund work Adobe is processing). `db.js`.
+
+### #4 (high) — terminal monitor updates could strand reservations
+
+Dissolved by #1: with `complete()` gone there is no separate post-terminal quota
+step to strand. A still-active reservation on a terminal WO is now CORRECT (held
+until rollover), not a leak.
+
+### #5 (low) — stale comments
+
+`quotaManager.js`, `monitor.js`, `db.js`, CLAUDE.md I5, ARCHITECTURE updated off
+the removed `complete()`/additive-floor model.
+
+### #6 (low) — shutdown unlinked the lock without ownership verification
+
+`index.js` hoists the acquisition token to module scope; shutdown unlinks the lock
+file only if it still holds OUR token (so we never delete a successor's reclaimed
+lock). Deterministic regression test in `lockConcurrent.test.js`.
+
+### Tests
+
+`quotaManager.test.js` rewritten for the hold-until-rollover lifecycle (15 tests:
+accept/release-guard/reactivate, finding-#1 hold-on-terminal, period auto-expiry,
+status-aware delete + GC tombstones, migration backfill). Plus `submissionBuckets`
+(2xx→accepted wiring), `jobsRoutes` (force-delete tombstone), `lockConcurrent`
+(shutdown ownership).
+
+---
+
 ## 2026-05-31 (R4.1) — Adversarial review of the R4 quota rebuild
 
 An adversarial review (parallel-agent workflow) of the R4 per-WO reservation

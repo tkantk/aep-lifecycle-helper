@@ -185,6 +185,32 @@ test('runSubmission fails closed when /quota has no recognized daily entitlement
   assert.equal(posts, 0, 'no work order may ship when the daily entitlement is unrecognized');
 });
 
+test('R5 finding #1: a successfully-submitted WO has an ACCEPTED, held reservation (not released on terminal)', async () => {
+  // The over-ship fix (R5): submission.js must call markAccepted on a 2xx, so the
+  // reservation is accepted=1. An accepted reservation can never be released and
+  // is HELD until period rollover — so the monitor reaching a terminal status (no
+  // longer touching quota) cannot reopen capacity before the org-wide /quota floor
+  // catches up.
+  const { jobId } = seedJobWithOrders([100_000]);
+  mockIms();
+  mockOrgQuota({ dailyRemaining: 1_000_000 });
+  nock(GATEWAY).persist().post('/data/core/hygiene/workorder').reply(200,
+    { workorderId: 'DI-acc', status: 'received', createdAt: '2026-05-31T00:00:00Z' });
+
+  await runSubmission({ jobId });
+
+  const r = q().getReservation.get(`${jobId}-wo-0`);
+  assert.ok(r, 'a reservation row exists for the submitted WO');
+  assert.equal(r.accepted, 1, 'a 2xx submit must mark the reservation accepted (held until rollover)');
+  assert.equal(r.active, 1, 'the accepted reservation stays active');
+
+  // And release() must refuse to refund it (Adobe spent that quota).
+  const { release } = await import('../src/services/quotaManager.js');
+  release(`${jobId}-wo-0`);
+  assert.equal(q().getReservation.get(`${jobId}-wo-0`).active, 1,
+    'release() is a no-op on an accepted reservation — no refund, no over-ship');
+});
+
 test('runSubmission with no bucket ships only the current day window (not all planned)', async () => {
   // 3 work orders of 100k each. Adobe says only 100k remains today, so the
   // redistributor packs WO0 into (month 1, day 1) and WO1+WO2 into day 2.

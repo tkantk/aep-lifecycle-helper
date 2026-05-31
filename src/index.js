@@ -46,6 +46,10 @@ fs.mkdirSync(path.dirname(config.dbPath), { recursive: true });
 // never opened while another instance holds the lock. Reclaim only a stale
 // lock whose recorded pid is no longer alive. Released on shutdown.
 const lockPath = config.dbPath === ':memory:' ? null : path.resolve(config.dbPath) + '.lock';
+// The token THIS process wrote into the lock file (set on acquire). Shutdown
+// verifies the lock still holds OUR token before unlinking, so we never remove
+// a lock a successor reclaimed after we were declared stale (review R5 #6).
+let lockToken = null;
 
 // Synchronous sleep — startup runs synchronously before the server. Atomics.wait
 // blocks the thread without a busy-loop.
@@ -80,7 +84,7 @@ function acquireSingleProcessLock() {
     if (linked) {
       // Ownership verification — confirm the lock holds OUR token (defends
       // against a racing reclaim+rewrite). If not, back off and retry.
-      if (readLockHolder(lockPath) === myToken) return;
+      if (readLockHolder(lockPath) === myToken) { lockToken = myToken; return; }
       sleepSync(25);
       continue;
     }
@@ -322,7 +326,14 @@ function shutdown(sig) {
     if (err) logger.error({ err: err.message }, 'server close error');
     try { db.pragma('wal_checkpoint(TRUNCATE)'); } catch (e) { logger.warn({ err: e.message }, 'wal_checkpoint failed'); }
     try { db.close(); } catch (e) { logger.warn({ err: e.message }, 'db close failed'); }
-    if (lockPath) { try { fs.unlinkSync(lockPath); } catch { /* best-effort lock release */ } }
+    // Release the lock ONLY if it still holds OUR token. If we were wrongly
+    // declared stale and a successor reclaimed it, blindly unlinking would
+    // delete the successor's live lock and let a third instance in (review R5
+    // #6). Verify-then-unlink narrows (doesn't fully close) the TOCTOU window;
+    // that's acceptable for a best-effort local advisory lock.
+    if (lockPath && lockToken && readLockHolder(lockPath) === lockToken) {
+      try { fs.unlinkSync(lockPath); } catch { /* best-effort lock release */ }
+    }
     clearTimeout(timer);
     logger.info('shutdown complete');
     process.exit(0);

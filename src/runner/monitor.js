@@ -3,12 +3,6 @@ import { getWorkOrder } from '../services/hygiene.js';
 import { q } from '../db.js';
 import { logger } from '../utils/logger.js';
 import { decryptCreds } from '../utils/crypto.js';
-import { complete as completeReservation } from '../services/quotaManager.js';
-
-// Adobe terminal states. 'completed' and 'failed' both mean the request was
-// ACCEPTED (it has an adobe_workorder_id) and thus counts toward quota, so we
-// move its reservation into adobe_floor either way (review R4 #1).
-const TERMINAL_ADOBE_STATUSES = new Set(['completed', 'failed']);
 
 /**
  * In-process status monitor.
@@ -112,14 +106,12 @@ async function tick() {
           adobe.status,
           wo.id
         );
-        // On reaching a terminal Adobe state, move this WO's reservation into
-        // adobe_floor (atomic, effective-preserving) so it isn't double-counted
-        // once Adobe's /quota reflects it (review R4 #1). Idempotent: a no-op
-        // once the reservation is already inactive.
-        if (TERMINAL_ADOBE_STATUSES.has(adobe.status)) {
-          try { completeReservation(wo.id); }
-          catch (e) { logger.warn({ workOrderId: wo.id, err: e.message }, 'reservation complete() failed'); }
-        }
+        // The monitor updates DISPLAY status only — it deliberately does NOT
+        // touch the quota ledger (review R5). An Adobe-accepted reservation is
+        // HELD until period rollover; deactivating it on terminal status (the
+        // R4.1 behaviour) reopened capacity before the org-wide /quota floor
+        // caught up → over-ship. There is no per-tool attribution that proves a
+        // terminal WO's count is already in the floor, so we never drop it here.
         succeeded++;
       } catch (err) {
         failed++;

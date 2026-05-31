@@ -3,25 +3,34 @@ import { db, q } from '../db.js';
 /**
  * Two-dimension (daily + monthly) quota safety-net, per-work-order.
  *
- * MODEL (review R4 #1 — replaces the aggregate `used` counter that conflated
- * our reservations with Adobe's observed usage and lost reservation ownership):
+ * MODEL (review R4 #1 + R5 hold-until-rollover lifecycle):
  *
  *   effective_used(period) = adobe_floor(period) + Σ active reservations(period)
  *
  *   • adobe_floor — Adobe's org-wide observed consumed for the period. Raised
- *     by seedFloor (MAX with live /quota consumed) and, when one of OUR work
- *     orders completes, by complete() (additive += that WO's count, moving it
- *     out of active reservations and into the floor). MAX and += compose: MAX
- *     never lowers, so once Adobe's /quota reflects a completed WO the floor
- *     stays the same (no double-count).
+ *     ONLY by seedFloor (MAX with live /quota consumed). Tracked SEPARATELY from
+ *     our reservations so it can never absorb/lose them.
  *   • reservations — ONE row per work order (count + its own utc_date /
- *     utc_year_month). reserve() inserts an active row; release() deactivates
- *     it (Adobe didn't process it) using the WO's OWN period (so a cross-day
- *     release frees the right period); complete() moves it into the floor.
+ *     utc_year_month + an `accepted` flag).
+ *       reserve()      → active=1, accepted=0  (pending: committed locally, not acked)
+ *       markAccepted() → accepted=1            (Adobe acked the POST; quota spent)
+ *       release()      → active=0 IFF accepted=0  (refund un-accepted work only)
+ *       reactivate()   → active=1, accepted=1  (a 'failed' WO Adobe DID process)
  *
- * This makes reserve() enforce Adobe's true remaining (cap - effective_used)
- * and keeps every release/complete exact and period-correct. Monthly is ALWAYS
- * tracked (review R4 #4 removed the "0 = disable monthly" option).
+ * R5 CRITICAL — why there is NO mid-period drop / no complete():
+ *   Adobe's /quota is org-wide and eventually-consistent with NO per-tool
+ *   attribution. A floor RISE is never proof that OUR specific accepted work
+ *   entered it — a concurrent external hygiene job in the same org can push the
+ *   floor up while ours still lags. So every timer-based or floor-delta
+ *   "assimilation drop" (and the R4.1 deactivate-on-terminal) can deactivate a
+ *   reservation whose count is NOT yet in the floor → effective understates true
+ *   consumption → the next reserve OVER-SHIPS an irreversible delete. A 5-agent
+ *   adversarial design review (2026-05-31) reproduced this for every drop
+ *   heuristic. The only provably-safe rule: HOLD an accepted reservation until
+ *   the UTC day/month ROLLS OVER (Adobe's period counter resets then too), at
+ *   which point the period-keyed SUM simply stops matching it. Over-defer
+ *   (holding slightly too long) is SAFE and self-corrects at rollover; over-ship
+ *   is irreversible. Monthly is ALWAYS tracked (review R4 #4).
  */
 
 function utcToday() {
@@ -81,6 +90,12 @@ export function seedFloor(imsOrgId, dailyConsumed, monthlyConsumed) {
  * the same WO (e.g. a deferred WO retried) re-activates its row with the new
  * period/count. monthlyLimit may be null only when monthly tracking is off.
  */
+// IMPORTANT (review R5): this function MUST stay fully synchronous. better-
+// sqlite3 is synchronous, so the effective-sum reads below and upsertReservation
+// run as one atomic span — Node cannot schedule another p-limit submit task's
+// reserve() in between, so two concurrent reserves can't both read a stale sum
+// and both grant. Introducing ANY `await` between the dailyEffective/monthly
+// reads and upsertReservation would reintroduce a TOCTOU over-ship race.
 export function reserve({ workOrderId, imsOrgId, count, dailyLimit, monthlyLimit }) {
   const today = utcToday();
   const month = utcYearMonth();
@@ -107,36 +122,30 @@ export function reserve({ workOrderId, imsOrgId, count, dailyLimit, monthlyLimit
 }
 
 /**
- * Release a work order's reservation — Adobe did NOT process it (rollback /
- * 4xx rejection / orphan-not-found). Deactivates the row by WO id, so it frees
- * the reservation's OWN period (no cross-day mis-decrement). Idempotent.
+ * Adobe ACKED the POST for this work order (2xx) — it has spent the quota.
+ * Promote the reservation to accepted so it can never be released and is HELD
+ * until period rollover (review R5). Called after a successful submit and when
+ * recovery matches an orphan to an existing Adobe work order. Idempotent.
  */
-export function release(workOrderId) {
-  q().deactivateReservation.run(workOrderId);
-}
-
-/** Re-activate a previously-released reservation (recovery: a 'failed' WO was
- *  actually processed by Adobe). Keeps the original period/count. */
-export function reactivate(workOrderId) {
-  q().reactivateReservation.run(workOrderId);
+export function markAccepted(workOrderId) {
+  q().markAcceptedReservation.run(workOrderId);
 }
 
 /**
- * A work order reached a terminal Adobe state. Adobe has long since counted it
- * (a 'completed'/'failed' terminal is days after the request was accepted, and
- * accepted requests count immediately), so it is already reflected in Adobe's
- * `/quota` — i.e. in `adobe_floor` once the next `seedFloor` runs. We therefore
- * just DEACTIVATE its reservation, removing it from the active sum so it isn't
- * counted twice (once via adobe_floor, once via the active reservation).
- *
- * We deliberately do NOT additively bump adobe_floor here: seedFloor sets the
- * floor to Adobe's ABSOLUTE consumed via MAX, and an additive bump would either
- * be swallowed by a later MAX (losing the count → over-ship) or stack on top of
- * a MAX that already included this WO (permanent double-count → over-defer).
- * Deactivate-only keeps `effective = adobe_floor + Σ active` exact in steady
- * state; the only residual is a SAFE transient over-defer for a WO that Adobe
- * has counted but that we haven't deactivated yet (it never over-ships).
+ * Release a work order's reservation — Adobe did NOT process it (4xx rejection /
+ * orphan-not-found rollback). GUARDED (review R5 #2): the underlying statement
+ * only deactivates a reservation with accepted=0, so a reservation Adobe has
+ * acked can NEVER be refunded (refunding it would over-ship). Keyed by WO id,
+ * so it frees the reservation's OWN period (no cross-day mis-decrement).
+ * Idempotent; a no-op on an accepted reservation.
  */
-export function complete(workOrderId) {
-  q().deactivateReservation.run(workOrderId);
+export function release(workOrderId) {
+  q().releaseReservation.run(workOrderId);
+}
+
+/** Re-activate a previously-released reservation AS accepted (recovery: a
+ *  'failed' WO was actually processed by Adobe, so it spent the quota and must
+ *  be held). Keeps the original period/count. */
+export function reactivate(workOrderId) {
+  q().reactivateReservation.run(workOrderId);
 }

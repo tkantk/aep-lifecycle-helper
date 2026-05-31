@@ -173,16 +173,26 @@ export function initDb() {
       PRIMARY KEY (ims_org_id, utc_year_month)
     );
 
-    -- ─── Per-work-order quota reservations (review R4 #1) ─────────────────
+    -- ─── Per-work-order quota reservations (review R4 #1, R5 lifecycle) ───
     -- The aggregate quota_usage.used counter conflated OUR reservations with
     -- Adobe's observed floor, so a delayed release could mis-account (lose
     -- ownership / cross-day). This table records ONE row per reserved work
-    -- order with its own period keys, so release/complete are exact and
-    -- period-correct. effective_used(period) = adobe_floor(period)
+    -- order with its own period keys. effective_used(period) = adobe_floor(period)
     --   + SUM(count) of ACTIVE reservations in that period.
-    --   active=1: reserved / in-flight (counts toward effective).
-    --   active=0: released (Adobe didn't process) OR completed (moved into
-    --             adobe_floor — see quotaManager.complete()).
+    --   active=1: reserved / held (counts toward effective).
+    --   active=0: released — Adobe did NOT process it (4xx / orphan-not-found).
+    --
+    -- accepted (R5): 0 = pending (committed locally, Adobe has not acked); 1 =
+    -- Adobe ACKED the POST and has spent the quota. An accepted reservation is
+    -- NEVER released (release() is guarded WHERE accepted=0) and is NEVER dropped
+    -- mid-period — it is HELD until the UTC day/month rolls over (Adobe's counter
+    -- resets then too), at which point it auto-expires because the period-keyed
+    -- SUM no longer matches it. The R4.1 deactivate-on-terminal and every
+    -- timer/floor-delta "assimilation drop" were proven to over-ship under a
+    -- concurrent external Adobe consumer (the org-wide /quota gives no per-tool
+    -- attribution), so there is deliberately NO mid-period drop. Over-defer
+    -- (holding slightly too long) is the SAFE direction and self-corrects at
+    -- rollover; over-ship is irreversible.
     CREATE TABLE IF NOT EXISTS quota_reservations (
       work_order_id   TEXT PRIMARY KEY,
       ims_org_id      TEXT NOT NULL,
@@ -190,6 +200,7 @@ export function initDb() {
       utc_year_month  TEXT NOT NULL,
       count           INTEGER NOT NULL,
       active          INTEGER NOT NULL DEFAULT 1,
+      accepted        INTEGER NOT NULL DEFAULT 0,
       created_at      TEXT NOT NULL DEFAULT (datetime('now'))
     );
     CREATE INDEX IF NOT EXISTS idx_qr_org_date  ON quota_reservations(ims_org_id, utc_date, active);
@@ -246,6 +257,10 @@ export function initDb() {
     // Review #3 (R3): Adobe's observed floor, tracked separately from `used`.
     { table: 'quota_usage',         column: 'adobe_floor', type: 'INTEGER NOT NULL DEFAULT 0' },
     { table: 'quota_usage_monthly', column: 'adobe_floor', type: 'INTEGER NOT NULL DEFAULT 0' },
+    // Review R5: pending(0) vs Adobe-accepted(1). A pre-R5 quota_reservations
+    // row gets DEFAULT 0, then the backfill below promotes legacy in-flight rows
+    // to accepted=1 so release()'s guard can't refund Adobe-processed work.
+    { table: 'quota_reservations',  column: 'accepted', type: 'INTEGER NOT NULL DEFAULT 0' },
   ];
   for (const { table, column, type } of additiveColumns) {
     try {
@@ -255,6 +270,27 @@ export function initDb() {
       if (!/duplicate column/i.test(err.message)) throw err;
     }
   }
+
+  // ─── One-time conservative quota backfills (idempotent; review R5) ──────
+  // (1) Finding #3 — preserve a pre-R4 DB's held usage. The old aggregate model
+  //     stored consumption in `used` (now vestigial) with adobe_floor=0; the R5
+  //     model reads ONLY adobe_floor. Fold used→adobe_floor (MAX-equivalent via
+  //     the WHERE guard; the floor only ever rises) so an upgrade can't silently
+  //     drop a conservative hold during Adobe's /quota lag window.
+  db.exec(`UPDATE quota_usage         SET adobe_floor = used WHERE used > adobe_floor`);
+  db.exec(`UPDATE quota_usage_monthly SET adobe_floor = used WHERE used > adobe_floor`);
+  // (2) Synthesis must-fix — a pre-R5 active reservation whose work order had
+  //     already reached Adobe (status past the never-sent set) must be marked
+  //     accepted=1; otherwise release()'s `WHERE accepted=0` guard would refund
+  //     a reservation Adobe is actively processing → over-ship + duplicate.
+  db.exec(`
+    UPDATE quota_reservations SET accepted = 1
+     WHERE active = 1 AND accepted = 0
+       AND work_order_id IN (
+         SELECT id FROM work_orders
+          WHERE status NOT IN ('planned','deferred','awaiting_approval')
+       )
+  `);
 
   // Drop the old unique index on expanded_identities if it still exists on an
   // existing DB. Dedup is now deferred to planning time (GROUP BY in
@@ -588,26 +624,39 @@ function prepared() {
     deleteJob: db.prepare('DELETE FROM jobs WHERE id = ?'),
     // quota_reservations is keyed by work_order_id but NOT cascaded from jobs
     // (it has no job_id). Delete a job's reservations explicitly BEFORE the job
-    // (the job-delete cascades the work_orders away). An ACTIVE reservation left
-    // behind would keep counting toward the org's cap forever (review R4.1).
+    // (the job-delete cascades the work_orders away). STATUS-AWARE (review R5 #2):
+    // refund ONLY reservations that are already inactive OR whose WO never
+    // reached Adobe (planned/deferred/awaiting_approval). An ACTIVE reservation
+    // for a WO that WAS sent (submitting/submitted/terminal) is KEPT as a
+    // tombstone — Adobe spent that quota, so refunding it would over-ship. The
+    // tombstone survives the cascade (no FK) and expires at period rollover.
     deleteReservationsForJob: db.prepare(`
       DELETE FROM quota_reservations
-       WHERE work_order_id IN (SELECT id FROM work_orders WHERE job_id = ?)
+       WHERE work_order_id IN (SELECT id FROM work_orders WHERE job_id = @jobId)
+         AND ( active = 0
+            OR work_order_id IN (
+                 SELECT id FROM work_orders
+                  WHERE job_id = @jobId AND status IN ('planned','deferred','awaiting_approval')
+               ) )
     `),
-    // Startup GC: drop reservations whose work order no longer exists (covers a
-    // force-delete, a pre-FK DB, or any other orphan).
+    // Startup GC: drop ORPHAN reservations (no surviving work order) that no
+    // longer count — inactive, OR whose monthly period has already rolled over
+    // (a prior-month tombstone is already excluded from the current-month SUM,
+    // so deleting it changes nothing). A CURRENT-month active tombstone is KEPT
+    // (Adobe spent it; it must keep counting until rollover) (review R5 #2).
     gcOrphanReservations: db.prepare(`
       DELETE FROM quota_reservations
        WHERE work_order_id NOT IN (SELECT id FROM work_orders)
+         AND (active = 0 OR utc_year_month < ?)
     `),
 
     // ─── Quota: Adobe-observed floor (per period) ─────────────────────
-    // adobe_floor = org-wide consumed as observed by Adobe. Raised two ways:
+    // adobe_floor = org-wide consumed as observed by Adobe. Raised ONE way:
     //   • seedFloor → MAX(floor, live /quota consumed) — Adobe's ABSOLUTE
-    //     observed value. This is the ONLY way the floor rises: a completed WO
-    //     is already in Adobe's /quota, so complete() merely deactivates its
-    //     reservation (no additive bump — that would double-count vs the MAX).
-    //     (`used` column is vestigial post-R4 — reservations replace it; 0.)
+    //     observed value. Nothing else touches the floor: an accepted WO is held
+    //     as an active reservation (NOT folded into the floor) until period
+    //     rollover, so there is no additive bump and no double-count vs the MAX
+    //     (review R5). (`used` is vestigial post-R4; reservations replace it.)
     getDailyFloor:   db.prepare(`SELECT adobe_floor FROM quota_usage WHERE ims_org_id = ? AND utc_date = ?`),
     getMonthlyFloor: db.prepare(`SELECT adobe_floor FROM quota_usage_monthly WHERE ims_org_id = ? AND utc_year_month = ?`),
     maxDailyFloor: db.prepare(`
@@ -619,16 +668,25 @@ function prepared() {
       ON CONFLICT(ims_org_id, utc_year_month) DO UPDATE SET adobe_floor = MAX(adobe_floor, excluded.adobe_floor)
     `),
 
-    // ─── Quota: per-work-order reservations (review R4 #1) ─────────────
+    // ─── Quota: per-work-order reservations (review R4 #1, R5 lifecycle) ──
+    // A (re-)reserve inserts/reactivates as PENDING (accepted=0): a deferred WO
+    // retried, or a new WO, has not yet been acked by Adobe.
     upsertReservation: db.prepare(`
-      INSERT INTO quota_reservations (work_order_id, ims_org_id, utc_date, utc_year_month, count, active)
-        VALUES (@workOrderId, @imsOrgId, @utcDate, @utcMonth, @count, 1)
+      INSERT INTO quota_reservations (work_order_id, ims_org_id, utc_date, utc_year_month, count, active, accepted)
+        VALUES (@workOrderId, @imsOrgId, @utcDate, @utcMonth, @count, 1, 0)
       ON CONFLICT(work_order_id) DO UPDATE SET
         ims_org_id = excluded.ims_org_id, utc_date = excluded.utc_date,
-        utc_year_month = excluded.utc_year_month, count = excluded.count, active = 1
+        utc_year_month = excluded.utc_year_month, count = excluded.count, active = 1, accepted = 0
     `),
-    deactivateReservation: db.prepare(`UPDATE quota_reservations SET active = 0 WHERE work_order_id = ?`),
-    reactivateReservation: db.prepare(`UPDATE quota_reservations SET active = 1 WHERE work_order_id = ?`),
+    // Adobe ACKED the POST — promote to accepted so it can never be released
+    // and is held until period rollover (review R5).
+    markAcceptedReservation: db.prepare(`UPDATE quota_reservations SET accepted = 1 WHERE work_order_id = ?`),
+    // Release is GUARDED: only an un-accepted (pending) reservation can be
+    // deactivated. Adobe-accepted work must never be refunded (review R5 #2).
+    releaseReservation:    db.prepare(`UPDATE quota_reservations SET active = 0 WHERE work_order_id = ? AND accepted = 0`),
+    // Recovery: a 'failed' WO that Adobe ACTUALLY processed → restore it AS
+    // accepted (it spent quota and is held until rollover).
+    reactivateReservation: db.prepare(`UPDATE quota_reservations SET active = 1, accepted = 1 WHERE work_order_id = ?`),
     getReservation: db.prepare(`SELECT * FROM quota_reservations WHERE work_order_id = ?`),
     sumActiveDaily: db.prepare(`
       SELECT COALESCE(SUM(count), 0) AS s FROM quota_reservations

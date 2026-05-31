@@ -240,14 +240,14 @@ The flow is:
    per-WO reservation.
 2. If `granted === false`, the work order is marked `deferred`. Daily
    denials clear at UTC midnight; monthly denials clear at UTC first-of-month.
-3. If the subsequent Adobe submission **fails** (4xx) or is rolled back, we call
-   `release(workOrderId)` — deactivating that WO's reservation (both dimensions,
-   its own period). Without this, a transient failure would waste quota.
+3. If the subsequent Adobe submission **fails (4xx)** or is rolled back, we call
+   `release(workOrderId)` — deactivating that WO's reservation. `release` is
+   GUARDED (`WHERE accepted = 0`): once Adobe has acked a WO it can NEVER be
+   refunded (see the lifecycle below). Without release, a 4xx would waste quota.
 
-**Per-work-order reservation model (review R4 #1, 2026-05-31 — supersedes the
-earlier aggregate-`used`/`reserved_monthly` design).** The local ledger now
-separates Adobe's observed usage from our reservations, so a release can never
-mis-account:
+**Per-work-order reservation model (review R4 #1) under the HOLD-UNTIL-ROLLOVER
+lifecycle (review R5, 2026-05-31).** The ledger separates Adobe's observed usage
+from our reservations:
 
 ```
 effective_used(period) = adobe_floor(period) + Σ active reservations(period)
@@ -255,27 +255,52 @@ effective_used(period) = adobe_floor(period) + Σ active reservations(period)
 
 - **`adobe_floor`** (per period, in `quota_usage`/`_monthly`) = Adobe's observed
   org-wide consumed. Raised in exactly ONE way: `seedFloor(org, daily.consumed,
-  monthly.consumed)` (MAX with live `/quota`, called at the top of every submit
-  run; MAX never lowers it). It is tracked SEPARATELY from our reservations, so
-  `seedFloor` can never absorb/lose them. **`complete(woId)` does NOT bump the
-  floor** (review R4.1 fix): a finished WO is already counted in Adobe's `/quota`,
-  so the next `seedFloor` picks it up via MAX. An additive bump on top of that
-  MAX would double-count it permanently (MEDIUM finding), and — when Adobe lags
-  on our WO but leads on external usage — MAX would swallow our completed count
-  and we'd over-ship (HIGH finding). So completion is deactivate-only.
+  monthly.consumed)` (MAX with live `/quota`, at the top of every submit run; MAX
+  never lowers it). Tracked SEPARATELY from our reservations so `seedFloor` can
+  never absorb/lose them. **Nothing else touches the floor.**
 - **`quota_reservations`** — one row per WO (`count`, its own `utc_date` +
-  `utc_year_month`, `active`). `reserve({workOrderId,…})` grants iff
-  `effective_used + count` stays within BOTH caps, then records an active row.
-  `release(woId)` deactivates it (Adobe didn't process it) using the WO's OWN
-  period (no cross-day mis-decrement). `reactivate(woId)` restores it (a 'failed'
-  WO that Adobe actually processed). `complete(woId)` deactivates it (Adobe HAS
-  processed it; it's now reflected in `/quota` and seeded into `adobe_floor`).
+  `utc_year_month`, `active`, **`accepted`**). Lifecycle:
+  - `reserve({workOrderId,…})` → `active=1, accepted=0` (PENDING). Grants iff
+    `effective_used + count` stays within BOTH caps.
+  - `markAccepted(woId)` → `accepted=1`. Adobe ACKED the POST (2xx) — or recovery
+    matched the orphan in Adobe — so Adobe has spent the quota.
+  - `release(woId)` → `active=0` **IFF `accepted=0`** (refund only un-acked work).
+  - `reactivate(woId)` → `active=1, accepted=1` (a 'failed' WO Adobe DID process).
 
-Monthly is **ALWAYS** tracked (review R4 #4 removed "0 = disable monthly" —
-Adobe always enforces a monthly cap). Live `/quota` caps win; `job.monthly_limit`
-+ config are fallbacks. Submission requires a FRESH `/quota` (refuses `stale`,
-review R4 #2). Any code that submits MUST pair `reserve(woId,…)` with
-`release(woId)`/`complete(woId)`.
+**R5 critical — why there is NO mid-period drop and NO `complete()`:** Adobe's
+`/quota` is org-wide and eventually-consistent with NO per-tool attribution. A
+floor RISE is never proof that OUR specific accepted work entered it — a
+concurrent external hygiene job in the same org can push the floor up while ours
+still lags. So R4.1's deactivate-on-terminal, AND every timer/floor-delta
+"assimilation drop", can deactivate a reservation whose count is NOT yet in the
+floor → `effective_used` understates true consumption → the next `reserve`
+OVER-SHIPS an irreversible delete. A 5-agent adversarial design review
+(2026-05-31) reproduced this for every drop heuristic. The ONLY provably-safe
+rule: an accepted reservation is **HELD until the UTC day/month rolls over**
+(Adobe's period counter resets then too), at which point the period-keyed SUM
+simply stops matching it. The monitor updates DISPLAY status only — it never
+touches quota. Over-defer (holding slightly too long; the floor + held reservation
+transiently double-count) is the SAFE direction and self-corrects at rollover;
+over-ship is irreversible. **Do not add any mid-period drop — `complete()` was
+removed for this reason. Do not un-guard `release()`.**
+
+**Force-delete + GC must not refund accepted work (review R5 #2):**
+`db.deleteReservationsForJob` is STATUS-AWARE — it refunds only inactive or
+never-sent (`planned`/`deferred`/`awaiting_approval`) reservations and KEEPS an
+active reservation whose WO was sent to Adobe as a TOMBSTONE (survives the cascade
+— no FK — and counts until period rollover). `db.gcOrphanReservations` deletes
+only orphans that no longer count (inactive, or a prior-month tombstone); a
+current-month active tombstone is kept.
+
+**Upgrade safety (review R5 #3):** `initDb` runs idempotent backfills — folds a
+pre-R4 `quota_usage.used` into `adobe_floor` (so a conservative hold survives the
+upgrade), and stamps `accepted=1` on any pre-R5 active reservation whose WO had
+already reached Adobe (so `release`'s `accepted=0` guard can't refund it).
+
+Monthly is **ALWAYS** tracked (review R4 #4 removed "0 = disable monthly"). Live
+`/quota` caps win; `job.monthly_limit` + config are fallbacks. Submission requires
+a FRESH `/quota` (refuses `stale`, review R4 #2). Any code that submits MUST pair
+`reserve(woId,…)` with `markAccepted(woId)` on a 2xx and `release(woId)` on a 4xx.
 
 Any code that submits a work order MUST pair `reserve` with `release`
 in a try/catch. **Exception**: on network timeout we don't know if Adobe
@@ -727,8 +752,8 @@ which require `https://platform-{region}.adobe.io` (region ∈ `va7`, `nld2`,
 7. Run `npm test` before suggesting a change is done (use `npm test`, NOT
    `node --test test` — on Node ≥23 the bare `test` arg is treated as a test
    name and silently runs nothing; `npm test` → `scripts/run-tests.mjs` which
-   enumerates `test/*.test.js`). **230 tests should pass** (as of the 2026-05-31
-   R4.1 quota-rebuild adversarial-review session).
+   enumerates `test/*.test.js`). **237 tests should pass** (as of the 2026-05-31
+   R5 hold-until-rollover quota-lifecycle session).
 8. **After your change**, append a bullet to the current session in
    `docs/CHANGELOG.md` describing what + why. If you changed the module map,
    data flow, Adobe contract, or DB schema, also update `docs/ARCHITECTURE.md`.

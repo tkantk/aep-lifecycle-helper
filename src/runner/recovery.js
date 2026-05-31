@@ -4,7 +4,7 @@ import { logger } from '../utils/logger.js';
 import { runExpansion } from './expansion.js';
 import { getWorkOrder } from '../services/hygiene.js';
 import { decryptCreds } from '../utils/crypto.js';
-import { release, reactivate } from '../services/quotaManager.js';
+import { release, reactivate, markAccepted } from '../services/quotaManager.js';
 
 /**
  * Startup reconciliation for jobs and work orders left in flight when the
@@ -112,6 +112,10 @@ export async function reconcileOrphanWorkOrders() {
           bundleId: found.bundleId,
           submittedAt: found.createdAt,
         });
+        // Adobe HAS this WO (the POST went through before the crash) → promote
+        // the still-pending reservation to accepted so it's held, not refunded
+        // by a later release (review R5).
+        markAccepted(wo.id);
         logger.info({ localId: wo.id, adobeId: found.workorderId },
           'recovery: matched orphan to existing Adobe work order');
       } else {
@@ -275,12 +279,15 @@ export async function reconcileJobOrphans(jobId) {
         // not reserving fresh capacity.
         if (wo.status === 'failed') {
           // The WO was marked 'failed' (its reservation deactivated) but Adobe
-          // actually processed it — re-activate the WO's reservation so the
-          // ledger reflects the real spend (review R4 #1). The next seedFloor
-          // (reading live /quota) and the monitor's complete() then move it into
-          // adobe_floor. If there's no reservation row (legacy), this is a no-op
-          // and the floor still picks it up via /quota on the next submit.
+          // actually processed it — re-activate the reservation AS accepted so
+          // the ledger reflects the real spend and it's HELD until rollover
+          // (review R5). If there's no reservation row (legacy), this is a no-op
+          // and the floor still picks it up via /quota on the next seedFloor.
           reactivate(wo.id);
+        } else {
+          // status 'submitting' found in Adobe → the POST went through; promote
+          // the still-pending reservation to accepted so it isn't refunded.
+          markAccepted(wo.id);
         }
         q().updateWorkOrderSubmitted.run({
           id: wo.id,
@@ -323,11 +330,14 @@ export async function reconcileJobOrphans(jobId) {
 /** Top-level entrypoint called by src/index.js after the DB is ready. */
 export async function runStartupRecovery() {
   try {
-    // GC quota reservations whose work order no longer exists (force-deleted
-    // job, etc.) so a stale ACTIVE reservation can't keep consuming the org's
-    // cap (review R4.1).
-    const gced = q().gcOrphanReservations.run().changes;
-    if (gced > 0) logger.info({ orphanReservations: gced }, 'startup: GC\'d orphan quota reservations');
+    // GC orphan quota reservations (no surviving work order) that no longer
+    // count: inactive ones, OR prior-month tombstones (already excluded from the
+    // current-month SUM). A CURRENT-month active tombstone from a force-deleted
+    // in-flight job is KEPT — Adobe spent it; it must keep counting until
+    // rollover (review R5 #2).
+    const currentMonth = new Date().toISOString().slice(0, 7);
+    const gced = q().gcOrphanReservations.run(currentMonth).changes;
+    if (gced > 0) logger.info({ orphanReservations: gced }, 'startup: GC\'d non-counting orphan quota reservations');
 
     const [expanded, reconciled] = await Promise.all([
       resumeExpandingJobs(),

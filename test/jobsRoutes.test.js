@@ -219,6 +219,27 @@ test('DELETE /api/jobs/:id?force=true deletes anyway when WOs are in flight', as
   assert.equal(q().getJob.get(jobId), undefined);
 });
 
+test('R5 finding #2: force-delete keeps a sent WO\'s accepted reservation (tombstone) but refunds a never-sent one', async () => {
+  const jobId = insertJob();
+  const sentWo    = insertWorkOrder(jobId, 'submitted');   // reached Adobe — quota spent
+  const plannedWo = insertWorkOrder(jobId, 'planned');     // never sent
+  const today = new Date().toISOString().slice(0, 10);
+  const month = new Date().toISOString().slice(0, 7);
+  q().upsertReservation.run({ workOrderId: sentWo, imsOrgId: 'fd-org@AcmeOrg', utcDate: today, utcMonth: month, count: 100_000 });
+  q().markAcceptedReservation.run(sentWo);                 // Adobe acked it
+  q().upsertReservation.run({ workOrderId: plannedWo, imsOrgId: 'fd-org@AcmeOrg', utcDate: today, utcMonth: month, count: 50_000 });
+
+  const res = await request('DELETE', `/api/jobs/${jobId}?force=true`);
+  assert.equal(res.status, 200);
+  assert.equal(q().getJob.get(jobId), undefined, 'job is gone');
+
+  const sentRes = q().getReservation.get(sentWo);
+  assert.ok(sentRes && sentRes.active === 1,
+    'accepted/sent reservation survives force-delete as a tombstone (refunding it would over-ship)');
+  assert.equal(q().getReservation.get(plannedWo), undefined,
+    'never-sent reservation is refunded — Adobe never received it');
+});
+
 test('DELETE /api/jobs/:id treats planned/deferred/awaiting_approval/completed/failed as safe', async () => {
   const jobId = insertJob();
   insertWorkOrder(jobId, 'planned');
