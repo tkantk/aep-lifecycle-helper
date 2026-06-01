@@ -1,17 +1,19 @@
 import pLimit from 'p-limit';
 import { v4 as uuid } from 'uuid';
-import { submitWorkOrder } from '../services/hygiene.js';
-import { reserve, release } from '../services/quotaManager.js';
+import { submitWorkOrder, normalizeDisplayName } from '../services/hygiene.js';
+import { reserve, release, markAccepted, seedFloor } from '../services/quotaManager.js';
 import { getOrgQuota } from '../services/quotaApi.js';
 import { redistributeUnshippedOrders } from './redistributor.js';
-import { q, db, prepareStreamIdentitiesBySource } from '../db.js';
+import { q, db, prepareStreamIdentitiesBySource, setWorkOrderSubmittingDurable } from '../db.js';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { decryptCreds } from '../utils/crypto.js';
+import { markPosting, unmarkPosting } from './postingState.js';
 
 // Module-level set guards against two concurrent runSubmission calls for the
 // same job in the same process (e.g. user double-clicks the Submit button).
 const inFlight = new Set();
+
 
 /**
  * Work-order planning and submission.
@@ -291,6 +293,38 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
       }
       throw err;
     }
+    // Fail CLOSED on an unrecognized entitlement (review finding #6). A 200
+    // whose shape we don't understand leaves quotaSnapshot.daily = null; the
+    // old code then silently fell back to the static job.daily_limit and
+    // shipped. For an irreversible delete we must refuse rather than guess.
+    // (A stale-but-recognized cache within the 24h floor is fine — it still
+    // carries a real daily.quota.)
+    if (!quotaSnapshot?.daily || !(Number(quotaSnapshot.daily.quota) > 0)) {
+      const e = new Error('Cannot submit: Adobe /quota returned no recognized daily entitlement.');
+      e.code = 'quota_unavailable';
+      throw e;
+    }
+
+    // Adobe ALWAYS enforces a monthly cap (review R4 #4 removed the
+    // "0 = disable monthly" option), so a valid monthly entitlement is REQUIRED
+    // before any destructive submit.
+    if (!quotaSnapshot?.monthly || !(Number(quotaSnapshot.monthly.quota) > 0)) {
+      const e = new Error('Cannot submit: Adobe /quota returned no recognized monthly entitlement.');
+      e.code = 'quota_unavailable';
+      throw e;
+    }
+
+    // The destructive boundary requires a FRESH /quota (review R4 #2). A stale
+    // snapshot (served from cache after a failed live refresh) is fine for the
+    // UI banner and for planning, but org-wide EXTERNAL usage can advance during
+    // an Adobe outage — shipping against an obsolete snapshot risks
+    // over-consuming a cap the operator can't see. Refuse and retry later.
+    if (quotaSnapshot.stale) {
+      const e = new Error('Cannot submit: Adobe /quota is unreachable; refusing to ship against a stale (cached) snapshot.');
+      e.code = 'quota_unavailable';
+      throw e;
+    }
+
     const distribution = redistributeUnshippedOrders(jobId, quotaSnapshot);
     const shifted = previousMonths != null && distribution.months > previousMonths;
 
@@ -303,27 +337,62 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
     // jobs default to month_index 1).
     const useMonth = Number(monthIndex) || null;
     const useDay   = Number(dayIndex)   || null;
-    const orders = (useMonth && useDay)
-      ? q().getOrdersByMonthAndDay.all(jobId, useMonth, useDay)
-          .filter(o => ['planned', 'deferred'].includes(o.status))
-      : useDay
-        ? q().getOrdersByDay.all(jobId, useDay).filter(o => ['planned', 'deferred'].includes(o.status))
-        : q().getPlannedOrders.all(jobId);
+    let orders;
+    if (useMonth && useDay) {
+      orders = q().getOrdersByMonthAndDay.all(jobId, useMonth, useDay)
+        .filter(o => ['planned', 'deferred'].includes(o.status));
+    } else if (useDay) {
+      orders = q().getOrdersByDay.all(jobId, useDay).filter(o => ['planned', 'deferred'].includes(o.status));
+    } else {
+      // No explicit bucket (the auto-resume scheduler, and the default UI
+      // "Submit" click). Ship ONLY the current window — the lowest
+      // (month_index, day_index) bucket among un-shipped orders. After the
+      // redistribute() above, that bucket is sized to Adobe's live daily
+      // `remaining`. Shipping every planned order here (the old behavior)
+      // ignored the bucketing and over-submitted beyond Adobe's remaining
+      // for today — review blocker #3. The next run (next scheduler tick /
+      // next UTC day) re-buckets and ships the following window.
+      const unshipped = q().getPlannedOrders.all(jobId); // sorted month,day,rowid
+      if (unshipped.length === 0) {
+        orders = [];
+      } else {
+        const first = unshipped[0];
+        const m = first.month_index ?? 1;
+        const d = first.day_index ?? 1;
+        orders = unshipped.filter(o => (o.month_index ?? 1) === m && (o.day_index ?? 1) === d);
+      }
+    }
 
-    // Use live quota cap values for the local reserve() ledger so the safety
-    // net is consistent with what Adobe will actually enforce (F-003). Fall
-    // back to job-row values only when the live snapshot is unavailable.
-    const liveDailyLimit   = quotaSnapshot?.daily?.quota   || job.daily_limit;
-    const liveMonthlyLimit = job.monthly_limit === null || job.monthly_limit === 0
-      ? (quotaSnapshot?.monthly?.quota ? quotaSnapshot.monthly.quota : null)
-      : (quotaSnapshot?.monthly?.quota || job.monthly_limit);
+    // Live caps from the (fresh, validated-above) /quota snapshot. Both
+    // dimensions are guaranteed present by the guards above. The optional safety
+    // buffer (review R6 #3) holds back a fraction as headroom for concurrent
+    // EXTERNAL writers we can't see between this once-per-run snapshot and our
+    // submit — our zero-over-ship guarantee otherwise assumes exclusive access.
+    const buffer = config.quotaSafetyBuffer || 0;
+    const liveDailyLimit   = Math.floor(quotaSnapshot.daily.quota   * (1 - buffer));
+    const liveMonthlyLimit = Math.floor(quotaSnapshot.monthly.quota * (1 - buffer));
+    if (buffer > 0) {
+      logger.info({ jobId, buffer, liveDailyLimit, liveMonthlyLimit },
+        'applying quota safety buffer for external writers');
+    }
+
+    // Raise the Adobe-observed floor (MAX) to the live consumed numbers BEFORE
+    // any reserve, so reserve() enforces Adobe's true remaining. The floor is
+    // tracked SEPARATELY from our per-WO reservations (review R4 #1), so it can
+    // never absorb/lose them.
+    seedFloor(creds.imsOrgId, quotaSnapshot.daily.consumed, quotaSnapshot.monthly.consumed);
 
     q().updateJobStatus.run('submitting', null, jobId);
 
     let submitted = 0, deferred = 0, failed = 0;
 
     const tasks = orders.map(wo => limit(async () => {
-      const res = reserve(creds.imsOrgId, wo.identifier_count, liveDailyLimit, liveMonthlyLimit);
+      // Per-WO reservation (review R4 #1, R5 lifecycle): keyed by wo.id so
+      // reserve/markAccepted/release are exact and period-correct.
+      const res = reserve({
+        workOrderId: wo.id, imsOrgId: creds.imsOrgId, count: wo.identifier_count,
+        dailyLimit: liveDailyLimit, monthlyLimit: liveMonthlyLimit,
+      });
       if (!res.granted) {
         const reason = res.reason === 'monthly'
           ? `monthly quota: ${res.monthlyUsed}/${res.monthlyLimit} used`
@@ -334,7 +403,32 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
       }
 
       try {
-        q().updateWorkOrderStatus.run('submitting', null, wo.id);
+        // The EXACT displayName Adobe will store. UUID FIRST so the unique key
+        // survives Adobe's 255-char truncation even for a long job name — orphan
+        // recovery matches on this value (review R6 #2). normalizeDisplayName is
+        // the SHARED, idempotent transform submitWorkOrder also applies, so the
+        // stored copy byte-equals what Adobe receives (incl. trailing-whitespace).
+        const displayName = normalizeDisplayName(`WO ${wo.id} - Delete ${job.name}`);
+
+        // Durably commit the reserve + 'submitting' intent + the exact
+        // displayName before the non-idempotent POST (review #8 + R6 #2), via a
+        // synchronous=FULL commit rather than a (reader-blocking) wal_checkpoint
+        // (review #6). Fail CLOSED: if the durable write errors, do NOT POST —
+        // release and defer for retry.
+        if (!setWorkOrderSubmittingDurable(wo.id, displayName)) {
+          release(wo.id);
+          q().updateWorkOrderStatus.run(
+            'deferred', 'durability not confirmed; will retry next run', wo.id);
+          deferred++;
+          return;
+        }
+
+        // Mark the in-flight window OPEN (review R8 #1): from here until the POST
+        // settles (success or error, see the finally below), release-absent must
+        // refuse to touch this WO. The catch + settlement run synchronously after
+        // the await returns, so the WO stays guarded through markAccepted / the
+        // uncertain-error write with no interleaving release possible.
+        markPosting(wo.id);
 
         const namespacesIdentities = JSON.parse(wo.namespaces_identities);
         const targetServices = wo.target_services_json ? JSON.parse(wo.target_services_json) : undefined;
@@ -343,7 +437,7 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
           creds,
           sandboxName: job.sandbox_name,
           datasetId: wo.dataset_ids || job.dataset_ids,
-          displayName: `Delete ${job.name} - WO ${wo.id}`,
+          displayName,
           description: `Bulk delete (Job ${jobId.slice(0, 8)}, Day ${wo.day_index})`,
           targetServices,
           namespacesIdentities,
@@ -356,6 +450,11 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
           bundleId: result.bundleId,
           submittedAt: result.createdAt,
         });
+        // Adobe ACKED this POST (2xx) — promote the reservation to accepted so
+        // it can never be released and is HELD until period rollover (review
+        // R5). It must NOT be dropped on terminal status (the monitor no longer
+        // touches quota) nor refunded by a later release/delete.
+        markAccepted(wo.id);
         submitted++;
         logger.info({
           localId: wo.id, adobeId: result.workorderId, count: result.operationCount,
@@ -389,8 +488,11 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
         const isAdobeRejection = status != null && status >= 400 && status < 500;
 
         if (isAdobeRejection) {
-          release(creds.imsOrgId, wo.identifier_count, liveMonthlyLimit);
-          q().updateWorkOrderStatus.run('failed', err.message, wo.id);
+          release(wo.id);
+          // Mark DEFINITIVE (review R11 #1): a 4xx means Adobe never created the
+          // WO (no quota spent), so it's unambiguously safe to delete later —
+          // unlike an uncertain timeout (kept 'submitting') or a legacy 'failed'.
+          q().markWorkOrderFailedDefinitive.run(err.message, wo.id);
           failed++;
           logger.error({ localId: wo.id, status, err: err.message },
             'submission failed (Adobe rejected — 4xx)');
@@ -403,6 +505,13 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
           logger.warn({ localId: wo.id, status: status ?? '(no response)', err: err.message },
             'submission UNCERTAIN (timeout/network/5xx) — Adobe may have processed it. Left in submitting status; orphan-reconcile will check Adobe via displayName on next startup or via POST /api/jobs/:id/reconcile.');
         }
+      } finally {
+        // In-flight window CLOSED — the POST has settled (2xx → markAccepted, or
+        // error → catch handled it, all synchronously above). The WO is now in a
+        // settled state and release-absent may act on it if it's an uncertain
+        // orphan (review R8 #1). unmark is a no-op if it was never marked
+        // (deferred / durability-failed paths return before markPosting()).
+        unmarkPosting(wo.id);
       }
     }));
 

@@ -9,6 +9,700 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-06-01 (R11.1) — R11 review follow-up: operator UI + wording (no safety logic)
+
+The R11 review verdict: **"R11 closes the destructive blocker… I did not find
+another silent duplicate-delete or over-ship path. Push d5025ae and open the PR."**
+The remaining items were UI/doc cleanup so the operator isn't stranded when the new
+fail-closed protection activates. No backend logic changed; suite stays 267/267.
+
+- **(medium) UI resolves the `unsettled` 409.** The Delete-Job flow handled only
+  `in_flight` (offered a force confirm); an `unsettled` 409 (R11 — a WO reconciling
+  or an ambiguous failed) just toasted with no action. It now offers the same
+  verified force path, with a STRONGER confirm: force only after verifying absence
+  in Adobe's UI; forcing may lose quota tracking → next batch could over-count.
+  `web/app.js`.
+- **(low) reconcile toast wording.** `${stillFailed} confirmed failed` →
+  `… failed locally, still unconfirmed in Adobe (verify before deleting)` — a
+  no-match doesn't confirm failure/absence. `web/app.js`.
+- **(low) doc sweep.** Corrected the last comments/docs that called a failed
+  no-match "confirmed absent": `routes/jobs.js`, `ARCHITECTURE.md`, `DESIGN_DOC.md`,
+  `REVIEW.md` now say it stays AMBIGUOUS (absence unproven, fail-closed on delete).
+
+---
+
+## 2026-06-01 (R11) — Eleventh-round review: job-delete vs. reconcile over-ship
+
+The R10 consolidated audit surfaced one more over-ship path. Suite **262 → 266**
+pass, audit clean.
+
+### #1 (blocker) — ordinary job-delete could erase tracking for real Adobe work
+
+A legacy/timeout `failed` WO (no Adobe ID, an INACTIVE reservation) might actually
+have been processed by Adobe. Ordinary `DELETE /api/jobs/:id` treated every
+`failed` row as safe and deleted it + its inactive reservation. Racing a
+concurrent reconcile (whose lookup would find the WO + re-reserve the quota), the
+delete removed the row first; the R10 CAS correctly discarded the stale lookup —
+but the quota was now untracked, so a later `reserve` over-shipped. **Fix:**
+ordinary delete now fails closed (409 `unsettled`, unless `?force=true`) when any
+WO is (a) currently being reconciled (`isWorkOrderReconciling`) or (b) an
+AMBIGUOUS `failed` — no Adobe ID and not a definitive 4xx. The check + cascade are
+synchronous so no reconcile can interleave. A new `work_orders.failure_definitive`
+column (set on a 4xx, which Adobe never created → consumed no quota) distinguishes
+a settled rejection (safe to delete) from a legacy/ambiguous outcome; legacy rows
+default to ambiguous (fail-closed). `routes/jobs.js`, `db.js`, `submission.js`.
+
+### #2 (medium) — documented the queued-row reconcile over-defer
+
+With `p-limit(5)`, a WO queued behind the limit is guarded (release-absent → 409)
+before its own lookup starts — safe over-defer. Marking each WO only right before
+its lookup would reopen the duplicate-delete window (mark-all-upfront is required;
+the CAS can't un-create an Adobe delete), so this is documented as intentional.
+
+### #3 (low) — no misleading INDETERMINATE on a CAS discard
+
+A stale no-match that the CAS discarded (a concurrent op resolved the WO) no
+longer increments the reconcile `indeterminate` counter or logs INDETERMINATE; it
+logs a "stale discarded" note instead.
+
+### Tests
+
++4: ambiguous-`failed` delete refused (409), `?force` override, delete refused
+while reconciling, and an end-to-end legacy-failed reconcile (guarded during the
+lookup + quota re-reserved when Adobe has it). 266 pass / 0 fail.
+
+---
+
+## 2026-06-01 (R10) — Tenth-round review: recovery-state correctness (consolidated audit)
+
+R9 closed the duplicate-delete race; a consolidated recovery audit then found two
+reproducible state-corruption bugs (no over-ship/duplicate) plus an over-block and
+a doc gap. Suite **256 → 262** pass, audit clean.
+
+### #1 (high) — concurrent reconcile results were not monotonic
+
+`applyIfUnchanged` checked only `attempt`, which TWO concurrent reconciles share
+(neither bumps it). So a fast FOUND (→ submitted) could be overwritten by a slow
+NO-MATCH (→ submitting), leaving `adobe_workorder_id` set but status `submitting`.
+**Fix:** the CAS (`applyIfStillUnresolved`) now also requires the WO to still be
+UNRESOLVED — `attempt` unchanged AND `adobe_workorder_id IS NULL` AND status in
+('submitting','failed'). Once a WO is matched, no concurrent reconcile write
+applies → results are monotonic. Mixed-result tests (found→empty, empty→found,
+terminal-found→empty).
+
+### #2 (high) — recovery couldn't finalise an already-terminal Adobe WO
+
+A reconcile match always wrote local status='submitted' (`updateWorkOrderSubmitted`).
+If Adobe returned a TERMINAL status (completed/failed), the row was stuck
+`submitted` + `completed_at` NULL — the monitor excludes terminal `adobe_status`
+so never repaired it, and job-delete treats `submitted` as in-flight (blocked).
+**Fix:** reconcile matches now use `updateWorkOrderReconciledMatch`, which
+normalises a terminal Adobe status to the local terminal status + stamps
+`completed_at` (mirrors the monitor); non-terminal stays 'submitted'. Startup +
+manual-route tests for completed and failed.
+
+### #3 (medium) — startup reconciliation could over-block operator recovery
+
+Both reconcilers marked every orphan up front then processed SEQUENTIALLY, so one
+slow lookup (a 60s GET timeout + retries) held the reconcile guard for every later
+orphan for minutes (release-absent → 409). **Fix:** the lookups now run in BOUNDED
+PARALLEL (`p-limit` 5); each WO is unguarded as soon as ITS OWN lookup settles.
+Mark-all-upfront is kept (mark-before-own-lookup would reopen the duplicate race —
+the CAS protects local state but can't un-create an Adobe duplicate). Test asserts
+a slow orphan doesn't hold the guard for a fast one.
+
+### #4 (low) — doc sweep
+
+REVIEW/CLAUDE/ARCHITECTURE release-absent guard descriptions now include the R9
+reconciliation guard + the R10 CAS/terminal behaviour.
+
+### Tests
+
++6: three mixed-result monotonicity, two terminal-finalisation (startup + route),
+one parallel non-block. 262 pass / 0 fail.
+
+---
+
+## 2026-06-01 (R9) — Ninth-round review: release-absent vs. reconcile-lookup duplicate race
+
+R8 closed the live-POST race, but a ninth review found a DISTINCT duplicate-delete
+race: release-absent (and its retry) could race an outstanding reconciliation
+LOOKUP. `'submitting'` is ambiguous, and the R8 guard only covered an active POST,
+not an active Adobe lookup. Repro: a reconcile snapshots the orphan and awaits the
+Adobe GET; during the await the operator releases + retries; the stale GET returns
+`DI-original` (Adobe HAD it) while the retry creates `DI-retry` → Adobe holds BOTH
+→ duplicate irreversible delete. The same class exists at startup (recovery runs
+async while the HTTP server is up). Suite **251 → 256** pass, audit clean (refcount fix + concurrent-reconcile test added per the R9 review).
+
+### #1 (blocker) — two complementary defenses
+
+- **Reconcile-in-flight guard (REFCOUNTED).** `postingState.js` gains a
+  `reconciling` refcount (`Map<woId, count>`). Both `reconcileOrphanWorkOrders`
+  (startup) and `reconcileJobOrphans` (route) mark EVERY snapshotted orphan
+  reconciling UP FRONT (synchronously, before the first `await`) and unmark each
+  exactly once via a per-run `marked` set — so `release-absent` is refused (409
+  `reconciling`) for any orphan from the moment a reconcile run starts until that
+  WO is resolved. **The refcount is essential** (caught by the R9 adversarial
+  review): two reconcile runs can overlap on the same WO (startup recovery is
+  fire-and-forget while the server accepts a manual `POST /reconcile`); a plain
+  Set let the first run to finish a WO tear the shared guard out from under the
+  second run's still-in-flight lookup, reopening the duplicate window. The count
+  keeps the WO guarded until the LAST reconcile for it settles. They also skip a
+  WO whose POST is in flight (let it settle).
+- **Attempt-CAS (defense-in-depth).** New `work_orders.attempt` counter. A
+  reconcile snapshots it before the lookup and applies its result only if it's
+  unchanged (`applyIfUnchanged` transaction); `release-absent` bumps it. So even
+  if a mutation slipped through, a stale lookup result can never clobber a
+  released/retried WO — it's discarded and logged.
+- **UI.** The Reconcile button disables every per-WO "Confirmed absent → retry"
+  control while the lookup is in flight (matches the server 409).
+
+### #2 (low) — doc precision
+
+`postingState.js` no longer overstates that a restart "kills a live POST" (it
+ends the LOCAL task; whether Adobe accepted the request is unknowable locally —
+which is why release-absent is operator-confirmed). The work-order state-machine
+diagram (`03-`) now shows the POST/reconcile guards on the SUBMITTING→PLANNED edge.
+
+### Tests
+
++4: reconciling-guard 409, attempt-bump on release, and two delayed-lookup CAS
+integration tests (a slow Adobe lookup with a concurrent attempt bump → the stale
+FOUND and NO-MATCH writes are both discarded). 255 pass / 0 fail.
+
+---
+
+## 2026-06-01 (R8) — Eighth-round review: release-absent reopened an over-ship path
+
+The seventh review confirmed R7's escape hatch was XSS-safe and fail-closed for
+already-acked work, but an eighth review found the new operator action reopened an
+over-ship path plus an atomicity gap and stale docs. Suite **248 → 251** pass.
+
+### #1 (blocker) — release-absent could release a LIVE in-flight POST
+
+`'submitting'` means BOTH "POST in flight right now" AND "settled uncertain", and
+release-absent only checked `status === 'submitting'`. Repro: operator releases
+while the WO's POST is mid-flight → reservation active=0; the delayed Adobe 2xx
+then calls `markAccepted`, which (pre-R8) only set `accepted=1`, NOT `active=1` —
+so the spend stayed uncounted and the next reserve over-ships. **Fixes (two
+layers):** (a) new `runner/postingState.js` — an in-memory set of work orders
+whose POST is in flight; `submission.js` marks a WO before the POST and unmarks it
+in a `finally`; `releaseAbsentOrphan` refuses (409 `posting`) while a WO is in it.
+No race window — the mark and the first `await` are separated by no yield point.
+In-memory is correct: a crash kills any live POST, so a recovered crash-orphan is
+(rightly) resolvable. (b) `markAccepted` now sets `active=1, accepted=1`
+defensively, so an Adobe-acked WO is never left uncounted even if a release
+slipped through.
+
+### #2 (high) — release + status-reset were not atomic
+
+`releaseAbsentOrphan` deactivated the reservation and reset status in two separate
+statements; a failure between them left the reservation released but the WO still
+`submitting`. Wrapped the validation + guarded release + status reset in one
+`db.transaction` — a write failure now rolls the release back. Regression test
+injects a status-write failure and asserts the reservation survives.
+
+### #3 (medium) — a hardcoded test date broke at UTC month rollover
+
+`quotaManager.test.js` hardcoded `2026-06-01` as a "prior day"; it began failing
+when UTC reached 2026-06-01. Replaced with a relative `otherDayThisMonth()` helper
+(a day in the current month that isn't today; rollover-proof). Swept all tests for
+other hardcoded near-dates — none remain.
+
+### #4 (medium) — finished the stale-doc sweep
+
+Corrected the remaining passages describing timeout undercount / auto-rollback /
+obsolete `release(count,...)` signatures: `CLAUDE.md` I5 exception, `ARCHITECTURE`
+recovery callout, `REVIEW.md` (submit flow + error-handling §12 + endpoint), the
+`release` docstring, and the `quota_reservations` schema comment.
+
+### Tests
+
++3 regression tests (in-flight guard 409, atomic-rollback, markAccepted
+re-activation). 251 pass / 0 fail; audit clean.
+
+---
+
+## 2026-05-31 (R7) — Seventh-round review: operator-workflow completeness
+
+The sixth review confirmed the core safety redesign is sound (no remaining
+duplicate/over-ship path). This round closes four operator-workflow gaps it
+flagged before destructive production use. Suite **242 → 247** pass, audit clean.
+
+### #1 (high) — a precise operator-resolution action for stuck orphans
+
+R6 correctly leaves an uncertain orphan in `submitting` (never auto-rolls-back),
+but a *genuinely absent* POST then had no escape but force-deleting the whole job.
+Added `POST /api/jobs/:id/work-orders/:woId/release-absent` (`recovery.js::
+releaseAbsentOrphan`): requires `{ confirmedAbsent: true }`, releases the held
+reservation, and resets the WO to `planned` for retry. Fail-closed — 409 if the
+WO has an Adobe ID or an `accepted` reservation; only a `submitting` orphan is
+eligible. The Submit-tab reconcile banner now lists each orphan's persisted
+Adobe lookup name with a strongly-confirmed per-WO "Confirmed absent → retry"
+button (native confirm quoting the name + duplicate-delete warning).
+`routes/jobs.js`, `runner/recovery.js`, `db.js`, `web/app.js`.
+
+### #2 (medium) — UI showed the obsolete reconstructed work-order name
+
+The Monitor work-order card rebuilt the pre-R6 `Delete <job> - WO <short-id>`
+name. Now renders the escaped persisted `display_name` (UUID-first `WO <full-id>
+- Delete <job>`) with a legacy fallback, so manual Adobe lookup uses the real
+stored name. `web/app.js`.
+
+### #3 (medium) — stale rollback/release docs across the doc set
+
+Fixed `CLAUDE.md` (runtime-error handling: 4xx releases / uncertain HOLDS),
+`DESIGN_DOC.md`, `REVIEW.md` (reconcile outcomes + the new endpoint), and
+regenerated the two reconciliation Mermaid diagrams (`03-work-order-state-machine`,
+`08-submit-reconcile-flow`) off the removed auto-rollback.
+
+### #4 (medium) — QUOTA_SAFETY_BUFFER was undocumented for operators
+
+Added `QUOTA_SAFETY_BUFFER` to the README config block + a prominent
+external-writer caveat (org-wide quota; default 0 valid only with operational
+exclusivity; the buffer is a mitigation, not a proof). `README.md`.
+
+### Tests
+
+5 new route tests in `jobsRoutes.test.js` (release-absent: confirmation required,
+happy path, refuses Adobe-acked/accepted, 404). Playwright console smoke confirms
+the UI loads clean.
+
+---
+
+## 2026-05-31 (R6) — Sixth-round review: recovery duplicate-submission safety
+
+R5 fixed the quota lifecycle structurally, but a sixth review found two
+duplicate-submission BLOCKERS in the orphan-recovery path plus a HIGH external-
+writer caveat. All verified against the code and Adobe's docs. Suite **237 →
+241** pass, audit clean, fresh + legacy boots verified.
+
+### #1 (blocker) — a recognized-empty Adobe list refunded an uncertain POST
+
+`reconcileOrphanWorkOrders` (startup) and `reconcileJobOrphans` (manual) rolled a
+'submitting' orphan back to 'planned' + released its quota whenever Adobe's list
+endpoint returned a recognized-but-empty response. But Adobe documents work-order
+creation as ASYNCHRONOUS with NO read-after-write guarantee, so a missing entry
+does NOT prove Adobe never received the (uncertain-POST) work order — the next
+submit would then re-POST a DUPLICATE irreversible delete. **Fix:** a no-match is
+now INDETERMINATE — the WO is held in 'submitting' with its reservation intact and
+surfaced for operator reconciliation; recovery NEVER auto-rolls-back. Removed the
+now-unreachable `rollbackWorkOrderToPlanned` statement. `runner/recovery.js`,
+`db.js`, `routes/jobs.js`.
+
+### #2 (blocker) — long job names made accepted work orders invisible to recovery
+
+The displayName was `Delete <job.name> - WO <uuid>` with the UUID at the END;
+Adobe truncates displayName at 255, so a long job name dropped the UUID, and
+recovery (which reconstructed the untruncated name and required exact equality)
+could never match → false "absent" → duplicate on resubmit. **Fix:** the
+displayName is now UUID-FIRST (`WO <uuid> - Delete <name>`) so the unique key
+always survives truncation, and the EXACT sent value is persisted durably
+(`work_orders.display_name`) BEFORE the POST; recovery matches that stored value
+(falling back to reconstruction for legacy rows). `submission.js`, `db.js`
+(durable checkpoint + column), `runner/recovery.js`.
+
+### #3 (high) — zero-over-ship assumed an exclusive writer
+
+R5's guarantee covers only this tool's own accounting; `/quota` is org-wide and
+snapshotted once per run, so a concurrent external writer can over-consume.
+**Fix:** added `QUOTA_SAFETY_BUFFER` (fraction 0..0.95, default 0) applied as
+`liveCap = floor(quota × (1 − buffer))` in `runSubmission`; documented the
+exclusive-writer assumption (CLAUDE.md I15, ARCHITECTURE). `config.js`,
+`runner/submission.js`.
+
+### #4 (medium) — stale safety docs
+
+Fixed ARCHITECTURE quota signatures, the obsolete release/rollback semantics, and
+the timeout-behavior section; corrected the recovery docs that overstated a single
+200 no-match as proof of absence.
+
+### Tests
+
+`recovery.test.js` rewritten for the indeterminate behavior + the UUID-first
+display_name match + proper per-test isolation; `submissionBuckets.test.js`
+(UUID-first persisted name); new `quotaSafetyBuffer.test.js`.
+
+---
+
+## 2026-05-31 (R5) — Fifth-round review: hold-until-rollover quota lifecycle
+
+A fifth review found the R4.1 quota model still had three over-ship paths plus an
+operational leak. Root cause: R4.1 deactivated an accepted WO's reservation on
+terminal status, assuming the floor had assimilated it — but Adobe's `/quota` is
+org-wide, eventually-consistent, and has NO per-tool attribution, so a floor rise
+never proves OUR work entered it. **Before writing any code, a 5-agent adversarial
+design review stress-tested the proposed redesign** and proved that EVERY
+mid-period drop heuristic (24h timer AND evidence-based floor-credit) still
+over-ships under a concurrent external Adobe consumer. The maintainer chose the
+provably-safe option: **hold-until-rollover** — an accepted reservation is never
+dropped mid-period; it expires when the UTC day/month rolls over (Adobe's counter
+resets then too). Over-defer is the SAFE direction and self-corrects at rollover.
+Suite **230 → 237** pass, audit clean, fresh + legacy-DB migration boots verified.
+
+### #1 (blocker) — `complete()`/deactivate-on-terminal reopened capacity → over-ship
+
+`quota_reservations` gains an **`accepted`** flag (0=pending, 1=Adobe-acked).
+`reserve`→pending; `markAccepted` (wired into a 2xx submit + recovery orphan
+match)→accepted; `release` is GUARDED (`WHERE accepted=0`) so Adobe-acked work can
+never be refunded; `reactivate`→active+accepted. **`complete()` is removed**; the
+monitor updates DISPLAY status only and never touches quota. An accepted
+reservation is HELD (counts in `effective = adobe_floor + Σ active`) until the
+period-keyed SUM stops matching it at rollover. `quotaManager.js`, `db.js`,
+`submission.js`, `monitor.js`, `recovery.js`.
+
+### #2 (blocker) — force-delete / GC refunded active Adobe work
+
+`db.deleteReservationsForJob` is now STATUS-AWARE: it refunds only inactive or
+never-sent (`planned`/`deferred`/`awaiting_approval`) reservations and KEEPS an
+active reservation for a sent WO as a tombstone (survives the cascade — no FK).
+`db.gcOrphanReservations` now deletes only non-counting orphans (inactive, or a
+prior-month tombstone); a current-month active tombstone is kept. `routes/jobs.js`,
+`runner/recovery.js`.
+
+### #3 (blocker for upgrades) — pre-R4 held usage was dropped on upgrade
+
+`initDb` runs idempotent boot backfills: folds a pre-R4 `quota_usage.used` into
+`adobe_floor` (preserve a conservative hold across the upgrade), and stamps
+`accepted=1` on any pre-R5 active reservation whose WO had already reached Adobe
+(so `release`'s guard can't refund work Adobe is processing). `db.js`.
+
+### #4 (high) — terminal monitor updates could strand reservations
+
+Dissolved by #1: with `complete()` gone there is no separate post-terminal quota
+step to strand. A still-active reservation on a terminal WO is now CORRECT (held
+until rollover), not a leak.
+
+### #5 (low) — stale comments
+
+`quotaManager.js`, `monitor.js`, `db.js`, CLAUDE.md I5, ARCHITECTURE updated off
+the removed `complete()`/additive-floor model.
+
+### #6 (low) — shutdown unlinked the lock without ownership verification
+
+`index.js` hoists the acquisition token to module scope; shutdown unlinks the lock
+file only if it still holds OUR token (so we never delete a successor's reclaimed
+lock). Deterministic regression test in `lockConcurrent.test.js`.
+
+### Tests
+
+`quotaManager.test.js` rewritten for the hold-until-rollover lifecycle (15 tests:
+accept/release-guard/reactivate, finding-#1 hold-on-terminal, period auto-expiry,
+status-aware delete + GC tombstones, migration backfill). Plus `submissionBuckets`
+(2xx→accepted wiring), `jobsRoutes` (force-delete tombstone), `lockConcurrent`
+(shutdown ownership).
+
+---
+
+## 2026-05-31 (R4.1) — Adversarial review of the R4 quota rebuild
+
+An adversarial review (parallel-agent workflow) of the R4 per-WO reservation
+model found the "MAX floor + additive `complete()` bump" combination composes
+**unsafely** on a lagging org-wide counter. Both repros were reproduced
+empirically before fixing, and resolved after.
+
+- **(HIGH) over-ship** — `seedFloor` MAX could swallow our just-completed WO.
+  Scenario: reserve+complete WO `a` (300k, bumped into floor), an external tool
+  consumes 600k, Adobe `/quota` reports 900k (it already includes our `a`).
+  `seedFloor(900k)` MAXes against `floor(300k)` → 900k, but our `a`'s 300k is now
+  counted only once even though the bump had also added it — so a new 400k WO
+  saw room for 1.3M and shipped past the 1M cap. **Fix:** `complete(woId)` is
+  now **deactivate-only** (no floor bump). A completed WO is already in Adobe's
+  `/quota`; the next `seedFloor` picks it up via MAX. `src/services/quotaManager.js`,
+  `src/db.js` (removed `bumpDailyFloor`/`bumpMonthlyFloor`).
+- **(MEDIUM) permanent double-count** — if Adobe counted our WO fast, `seedFloor`
+  saw it (floor += via MAX) *and* the additive bump added it again → a permanent
+  2× that under-granted forever. Same deactivate-only fix resolves it; regression
+  tests added to `quotaManager.test.js` (R4 HIGH + MEDIUM cases).
+- **(MEDIUM) job-delete reservation leak** — deleting a job left its active
+  reservations consuming quota forever. `DELETE /api/jobs/:id` now calls
+  `deleteReservationsForJob` before `deleteJob`; startup adds a
+  `gcOrphanReservations` sweep (reservations with no work order). Test added.
+- **(LOW) `MONTHLY_IDENTIFIER_LIMIT=0`** now coerces to the 3M default via a
+  `numEnv` helper (an explicit `0` env was the only remaining "disable monthly"
+  path after R4 #4). Dead code removed: `setReservedMonthly` statement, the
+  `reserved_monthly` migration, and unused `j_monthly_limit`/`j_daily_limit`
+  SELECT aliases in the two recovery queries.
+
+Suite **227 → 230** pass, 0 fail; `npm audit` clean; migration boot smoke clean.
+
+---
+
+## 2026-05-31 (R4) — Fourth-round review: quota model rebuilt + lock/monthly fixes
+
+A fourth review showed the quota safety boundary was still bypassable — the
+aggregate `used` counter (patched twice in R2/R3) conflated OUR reservations
+with Adobe's observed usage, so `seedFloor`'s MAX could absorb-and-lose our
+reservations and a delayed release could mis-account. Rather than patch a 4th
+time, the ledger was rebuilt around **per-work-order reservation ownership**.
+Suite **231 → 227** (the quota test was consolidated; net new coverage added),
+audit clean.
+
+### #1 (blocker) — per-WO reservation quota model
+
+New `quota_reservations` table (one row per WO: count + `utc_date` +
+`utc_year_month` + `active`). `effective_used(period) = adobe_floor(period)
++ Σ active reservations(period)`. `adobe_floor` is tracked SEPARATELY from our
+reservations (so it can never absorb them) and raised by ONE path: `seedFloor`
+(MAX with live `/quota` consumed). `reserve` is keyed by WO id; `release` /
+`reactivate` / `complete` act on the WO's OWN row → exact and period-correct.
+This fixes the same-day ownership loss, the cross-day mis-decrement, AND the
+latent multi-month double-count (which would have halved monthly throughput).
+`quotaManager` API: `reserve({workOrderId,imsOrgId,count,dailyLimit,monthlyLimit})`,
+`release(woId)`, `reactivate(woId)`, `complete(woId)`, `seedFloor`, `peek`.
+Wired through `submission.js`, `recovery.js`, and a new `monitor.js` completion
+hook. Tests in `quotaManager.test.js` (same-day delayed release, cross-day,
+multi-month no-double-count). **See R4.1 below for the `complete()` fix — the
+original additive-floor-bump in this entry was found unsafe by adversarial
+review and removed before merge.**
+
+### #2 (blocker) — submit requires a FRESH /quota
+
+`runSubmission` now refuses a `stale` snapshot (`quota_unavailable`). A cached
+snapshot (served after a failed live refresh, ≤24h) is fine for the UI banner
+and planning, but external org-wide usage can advance during an Adobe outage —
+shipping against an obsolete snapshot could over-consume. Fresh-only at the
+destructive boundary.
+
+### #3 (high) — lock concurrent-start race
+
+The R3 zero-byte fix let a concurrent start observe a mid-publication empty lock
+and reclaim it. Replaced with **link()-based atomic locking**: write a
+pid:token to a temp file, then `linkSync` it onto the lock path — the lock file
+is never observable empty. Plus a grace-retry for legacy empty locks and
+write-then-reread ownership verification. New `lockConcurrent.test.js` (5
+concurrent starts → exactly 1 acquires); 8-way concurrent boot smoke verified.
+
+### #4 (medium) — removed the phantom `MONTHLY=0` control
+
+Adobe always enforces a monthly cap, and the redistributor/submission re-enabled
+it from Adobe anyway, so "0 = disable monthly" was misleading. Removed: monthly
+is ALWAYS tracked (live `/quota` cap, with job-row/config fallbacks). Updated
+`upload.js`, `redistributor.js`, `submission.js`, `config.js`, and the Config UI
+hint (`index.html`/`app.js`).
+
+### #5 (low) — stale graph docs
+
+`identityGraph.js` header, ARCHITECTURE, and REVIEW updated off the
+removed positional fallback.
+
+---
+
+## 2026-05-31 (R3) — Third-round review remediation (3 blockers + 5 findings)
+
+A third review found destructive-path gaps remaining after R2, several in the
+R2 code itself. All 8 were independently verified against the code and Adobe's
+live docs before fixing. Suite **221 → 231**, audit clean, each fix test-first.
+
+### Blockers
+
+- **#1 — Crash-resume could still bypass the empty-graph guard.** Identity rows
+  (`bulkInsertIdentities`) and the job counters (`incrementJobCounters`) were
+  separate transactions; a crash between them committed rows but left
+  `graph_members_seen`/`processed_count` at 0, and a resume skips committed
+  sources — so a source-only job could be marked `expanded`. New
+  `db.js::insertIdentitiesAndCount()` writes rows + counters in ONE transaction
+  (all-or-nothing). Test in `insertAtomic.test.js`.
+- **#2 — Partially-unprocessed Identity Graph batches became partial deletes.**
+  Adobe's response includes `unprocessedXids`/`unprocessedNids` and "one entry
+  per requested XID regardless of cluster association"; `expandBatch` ignored
+  the unprocessed lists and used a positional fallback (`|| clustersArray[i]`),
+  so an unprocessed/unmatched source became source-only. Now fails CLOSED per
+  batch: on a non-empty unprocessed list, an unrecognized shape, OR any source
+  not matched by `compositeXid.id` (positional fallback removed). Tests in
+  `identityGraphNsid.test.js`.
+- **#3 — Quota floor and release shared one counter.** `seedFloor` raised
+  `quota_usage.used` to Adobe's consumed while `release` decremented the same
+  column, so a delayed orphan release could drop the ledger below Adobe's floor
+  and let a later reserve over-ship. New `adobe_floor` column (both ledgers)
+  records Adobe's observed consumption SEPARATELY; `decQuota`/`decMonthlyQuota`
+  clamp at `adobe_floor` (not 0). Tests in `quotaManager.test.js`.
+
+### Other findings
+
+- **#4 — `Number(null)===0` fail-open.** `toNonNegFinite` coerced first, so
+  `{consumed:null}` became 0 (full remaining). Replaced with a strict
+  `typeof === 'number' && Number.isInteger && >= 0` check (rejects
+  null/boolean/array/string/float/negative). Test in `quotaApi.test.js`.
+- **#5 — Registry mismatch bypassed with an explicit nsid.** The code-existence
+  check only ran when no nsid was supplied. Unified validation now requires the
+  source code to EXIST in the registry (whether or not an nsid is given) AND the
+  code/nsid pair to match exactly. Test in `expansionFailClosed.test.js`.
+- **#6 — Durability checkpoint could block the process.** `wal_checkpoint(FULL)`
+  blocks on concurrent readers (a long CSV export held the server ~5s).
+  Replaced with `setWorkOrderSubmittingDurable()` — flips `synchronous=FULL`
+  around the single submit-intent commit (an fsync-on-commit, which does NOT
+  block on readers) then restores NORMAL. Test asserts it doesn't block under a
+  held reader.
+- **#7 — Zero-byte lock file stranded startup.** An empty lock → `Number('')=0`
+  → `process.kill(0,0)` reports alive → refused forever. Now only a POSITIVE
+  INTEGER pid counts as a holder; empty/0/NaN is reclaimed. Boot-verified.
+- **#8 — Stale docs.** DESIGN_DOC/REVIEW updated off `node --test test` / 197.
+
+---
+
+## 2026-05-31 (R2) — Second-round review remediation (2 blockers + 9 findings)
+
+A second external review found that several round-1 fixes were incomplete and
+that a few round-1 changes introduced regressions. All 11 findings were
+independently re-verified (an 8-agent adversarial verification pass plus direct
+reproduction) before fixing. Suite **209 → 221**, `npm audit` clean. Every fix
+is test-first.
+
+### Blockers
+
+- **#1 — Quota reserve still didn't enforce Adobe's remaining.** Round 1 fixed
+  bucket *selection* but `reserve()` still compared against the FULL daily cap,
+  and the local ledger was never seeded from Adobe's org-wide `consumed`. So an
+  explicit future-bucket submit, or a second run while `/quota.consumed` lagged,
+  could ship past today's remaining. Fix: `quotaManager.seedFloor()` raises the
+  ledger to Adobe's `consumed` (MAX, never lower) before every run, so reserve
+  enforces true remaining. `db.js` gained `upsertQuotaFloor` /
+  `upsertMonthlyQuotaFloor` (`ON CONFLICT … SET used = MAX(used, excluded.used)`).
+  Tests: sequential + explicit-bucket over-ship in `submissionBuckets.test.js`.
+- **#2 — All-empty Identity Graph still produced source-only deletes.** Round 1
+  blocked registry-*load* failure, but a 200 `{clusters:[]}` (wrong region /
+  nsid / empty graph) still emitted a source-only plan. Fix: expansion fails
+  CLOSED when a FRESH run processed sources but Adobe returned ZERO linked
+  members across the whole job (the right discriminator — the legitimate
+  source-only case still gets the source echoed back as a member, so it passes;
+  `recoveryColumn.test` stays green). Override via `ALLOW_EMPTY_GRAPH=1`. Test in
+  `expansionFailClosed.test.js`.
+
+### Other findings
+
+- **#3 — Quota shape fail-open.** `normalizeQuotaEntry` coerced a non-finite
+  `consumed`/`quota` to 0 (faking remaining). Now returns null on
+  non-finite/negative (0 stays valid), so the daily guard fails closed.
+  Submission also now requires a valid monthly entitlement when the job tracks
+  monthly. Tests in `submissionBuckets.test.js`.
+- **#4 — Monthly-reservation leak on recovery.** Reserve could use a live
+  monthly limit while recovery released with `job.monthly_limit` (null) →
+  monthly ledger leaked. New `work_orders.reserved_monthly` records the
+  effective monthly limit at reserve time; both recovery paths release/re-reserve
+  using it. Test in `recovery.test.js` (asserts both ledgers return to 0).
+- **#5 — Durable checkpoint wasn't fail-closed.** `durableCheckpoint()` ignored
+  `wal_checkpoint(FULL)`'s `busy` row. It now returns a real durability boolean;
+  submission releases + reverts to planned + defers when durability is
+  unverified, rather than POSTing. Test in `durableCheckpoint.test.js` (forces
+  busy with a concurrent reader).
+- **#6 — Lock keyed on DATA_DIR, not the DB.** Two instances with different
+  `DATA_DIR` but the same `DB_PATH` both ran. Lock is now keyed on the resolved
+  `DB_PATH` (`<dbPath>.lock`) and acquired BEFORE db.js opens the connection
+  (imports reordered in `index.js`). Handles `:memory:`.
+- **#7 — Startup purge could delete unrelated files.** Now only deletes files
+  matching the helper's generated `<epoch>_<uuidv4>.<ext>` pattern.
+- **#8 — Source nsid not validated at ingress.** `upload.js` coerces a
+  non-finite nsid to null (`finiteNsidOrNull`); expansion normalizes
+  `resolvedNsid` and fails closed on a code/nsid registry mismatch;
+  `identityGraph.expandBatch` only templates a finite nsid into the body. Tests
+  in `identityGraphNsid.test.js`.
+- **#9 — Test wrapper recursion (round-1 regression).** `scripts/test.mjs` was
+  named `test.mjs`, matching `node --test`'s default glob → it ran itself
+  recursively and inflated the count to 210. Renamed to
+  `scripts/run-tests.mjs` and now ENUMERATES `test/*.test.js`. Real count: 219.
+  (Also fixed a `*/`-in-a-`**/`-comment that broke the wrapper's own parse.)
+- **#10 — Submit reported false success.** `POST /jobs/:id/submit` returned
+  `{ok:true}` before the async preflight; a `quota_unavailable` failure was only
+  logged. The route now clears and PERSISTS the failure to `job.last_error`
+  (observable via `GET /jobs/:id`) and returns `{ok:true, async:true}`. Test in
+  `submitRouteError.test.js`.
+- **#11 — Docs/settings cleanup.** Reverted machine-local `.claude/settings.local.json`
+  additions; updated ARCHITECTURE's stale "No file lock guard" line and test count.
+
+---
+
+## 2026-05-31 — External review remediation (4 blockers + 7 high-priority + hardening)
+
+Context: an external review flagged four production-blocking paths that could
+duplicate deletions or target unintended identifiers, plus seven high-priority
+correctness/durability findings and a set of hardening items. Each finding was
+independently verified against the code, our own docs, and Adobe's live
+documentation before fixing. All fixes are test-first; regression tests use
+Adobe's **real** response shapes (the old tests mocked the wrong ones, which is
+how blocker #2 hid). Suite: **197 → 210** tests, all passing.
+
+> **Test command changed.** `npm test` now runs `node scripts/test.mjs`
+> (`node --test` discovery + a deterministic test ENCRYPTION_KEY). The old
+> `node --test test` script is broken on Node ≥ 23 (the positional `test` is
+> parsed as a single test name). Works on Node 20 and 23.
+
+### Blockers
+
+- **#1 — Re-plan duplicated deferred deletes.** `db.js::deletePlannedOrders`
+  deleted only `planned` + `awaiting_approval`, but the planner allows re-plan
+  while `deferred` rows exist. A surviving deferred WO plus the freshly
+  re-emitted planned WO covered the same identities → duplicate irreversible
+  delete on the next submit. Fix: `deletePlannedOrders` now also clears
+  `deferred`. (Updated CLAUDE.md I10.) Test in `test/planWorkOrders.test.js`.
+- **#2 — Recovery misread Adobe's list response.**
+  `recovery.js::findAdobeWorkOrderByDisplayNamePrefix` looked for
+  `data.workorders`/`data.items`; Adobe's live endpoint returns matches under
+  **`results`** (`{ results, total, count, _links }`). An accepted-but-
+  uncertain WO was therefore reported ABSENT → rolled back → resubmitted. Fix:
+  parse `results` (plus a bare array / legacy containers) **and fail CLOSED** —
+  any unrecognized 200 shape is now `LOOKUP_INDETERMINATE` (leave the orphan
+  alone), never a rollback. Tests in `test/recovery.test.js` use the real
+  `results` shape + an unrecognized-shape case.
+- **#3 — Scheduled submit ignored quota buckets.** The no-bucket path
+  (`runSubmission` with neither month nor day — used by the auto-resume
+  scheduler and the default Submit) loaded EVERY planned/deferred order and
+  gated only on a local ledger seeded from the full daily cap, not Adobe's live
+  `remaining`. It shipped past today's remaining. Fix: the no-bucket path now
+  ships only the current `(lowest month, lowest day)` window the redistributor
+  sized to live remaining. Test in `test/submissionBuckets.test.js`.
+- **#4 — Expansion recovery could target the wrong CSV column.** The upload-
+  time `column` was never persisted; `recovery.js` hardcoded `column: 0`. Fix:
+  new `jobs.source_column` (migration, default `'0'`), persisted via
+  `setJobSourceColumn` in the upload route, read by recovery. Test in
+  `test/recoveryColumn.test.js`.
+
+### High-priority
+
+- **#5 — `DATA_DIR` only moved the key.** `dbPath`/`uploadDir`/`outputDir` were
+  hardcoded to `<cwd>/data`, so the documented OneDrive mitigation didn't move
+  the SQLite DB. Now all three derive from `dataDir`. Test `test/config.test.js`.
+- **#6 — Quota failed open.** A 200 with an unrecognized shape left
+  `quotaSnapshot.daily = null`, and submission silently fell back to the static
+  `job.daily_limit`. `runSubmission` now fails CLOSED (`quota_unavailable`)
+  when there is no recognized daily entitlement. (`getOrgQuota` stays graceful
+  for the UI banner — fail-closed is enforced at the destructive boundary.)
+- **#7 — Quota bookkeeping wasn't transactional.** `reserve`/`release` wrote
+  the daily and monthly ledgers as two separate statements (the "single
+  transaction" comment was aspirational). Both are now wrapped in
+  `db.transaction()`.
+- **#8 — Local durability weaker than the irreversible action.** Kept
+  `synchronous=NORMAL` globally (expansion throughput), but added a scoped
+  `durableCheckpoint()` (`wal_checkpoint(FULL)`) of the reserve + `submitting`
+  intent immediately before the non-idempotent POST, so power loss can't revert
+  a shipped WO to `planned` and resubmit it.
+- **#9 — Monitor starved orders past the first 100.** `listOpenWorkOrders` used
+  `LIMIT 100` with no ordering. New `work_orders.last_polled_at` cursor +
+  `ORDER BY` (never-polled first); the monitor stamps it on every attempt so
+  every open WO is eventually polled. Test `test/monitorPoll.test.js`.
+- **#10 — Namespace handling too optimistic.** Expansion now fails CLOSED when
+  the namespace registry can't be loaded, or when the source namespace isn't in
+  the registry and no nsid was supplied (previously it warned and expanded
+  blind → empty clusters → silent partial delete). Test
+  `test/expansionFailClosed.test.js`.
+- **#11 — Vulnerable dependencies.** `npm audit fix` (axios high + qs/express
+  moderate) and `uuid → ^11.1.1`. `npm audit` now reports 0 vulnerabilities.
+
+### Additional hardening
+
+- Refuse non-loopback bind unless `ALLOW_NON_LOOPBACK=1` (`config.js` +
+  `index.js`).
+- Single-process advisory lock (`data/.lock`, pid-checked + stale-reclaimed,
+  released on shutdown) — refuses a second instance on one `state.db`.
+- Escape Adobe-derived `adobe_workorder_id`/`status` in the Submit-tab table
+  (`web/app.js`); the detail card already escaped.
+- `canonicalizeNamespace` coerces ids to a finite integer or null (never NaN).
+- Purge orphaned upload CSVs (raw customer identifiers) at startup.
+- `MONTHLY_IDENTIFIER_LIMIT=0` is preserved as "monthly disabled" (was reverted
+  to 3M by `|| default`).
+
+---
+
 ## 2026-05-30 — Rendered diagrams + auto-load tightening + docs refresh
 
 ### Docs (`docs/diagrams/`, `docs/DESIGN_DOC.{md,docx}`)

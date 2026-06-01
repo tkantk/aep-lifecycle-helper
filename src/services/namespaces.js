@@ -103,14 +103,23 @@ export function buildNamespaceIndex(namespaces) {
  * both are populated when possible. If the index has no hit, we fall back
  * to whatever was provided.
  */
+// Coerce to a finite integer or null — never NaN. Number('abc')/Number({}) is
+// NaN, which JSON.stringify renders as `null` inside a namespace.id and would
+// silently corrupt the work-order payload (review hardening).
+function finiteIntOrNull(v) {
+  if (v == null) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
 export function canonicalizeNamespace({ ns, nsid }, index) {
   let code = ns || null;
-  let id   = nsid != null ? Number(nsid) : null;
+  let id   = finiteIntOrNull(nsid);
 
   if (index) {
-    if (code && !id) {
+    if (code && id == null) {
       const hit = index.byCode.get(code);
-      if (hit) id = Number(hit.id);
+      if (hit) id = finiteIntOrNull(hit.id);
     } else if (id != null && !code) {
       const hit = index.byId.get(id);
       if (hit) code = hit.code;

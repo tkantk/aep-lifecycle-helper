@@ -84,6 +84,11 @@ async function tick() {
     let succeeded = 0, failed = 0;
     const limit = pLimit(POLL_CONCURRENCY);
     await Promise.all(open.map(wo => limit(async () => {
+      // Stamp the poll cursor on every ATTEMPT (success or failure) so this WO
+      // rotates to the back of listOpenWorkOrders and can't starve others on
+      // jobs with >100 open orders (review finding #9). A permafailing WO
+      // therefore yields to never-polled ones instead of monopolising the tick.
+      q().stampWorkOrderPolled.run(wo.id);
       try {
         const creds = await getCreds(wo.j_creds_id);
         const adobe = await getWorkOrder({
@@ -101,6 +106,12 @@ async function tick() {
           adobe.status,
           wo.id
         );
+        // The monitor updates DISPLAY status only — it deliberately does NOT
+        // touch the quota ledger (review R5). An Adobe-accepted reservation is
+        // HELD until period rollover; deactivating it on terminal status (the
+        // R4.1 behaviour) reopened capacity before the org-wide /quota floor
+        // caught up → over-ship. There is no per-tool attribution that proves a
+        // terminal WO's count is already in the floor, so we never drop it here.
         succeeded++;
       } catch (err) {
         failed++;

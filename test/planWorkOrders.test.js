@@ -301,6 +301,33 @@ test('planWorkOrders: re-planning is allowed when only deferred orders exist', (
   );
 });
 
+test('planWorkOrders: re-planning REPLACES deferred orders (no duplicate deletes)', () => {
+  // Blocker #1: a deferred WO that survives a re-plan plus the freshly
+  // re-emitted planned WO BOTH cover the same identity. On the next submit
+  // both ship → duplicate irreversible delete. deletePlannedOrders must
+  // clear 'deferred' rows too, so re-planning is a true replace.
+  const jobId = insertJob();
+  seedIdentities(jobId, [
+    { sourceId: 'src1', members: [
+      { ns_code: 'email', ns_id: 6, identity_id: 'a@x.com' },
+    ]},
+  ]);
+
+  planWorkOrders({ jobId, datasetIds: 'ALL', dailyLimit: 1_000_000, targetServices: null });
+  const [wo] = getWorkOrders(jobId);
+  q().updateWorkOrderStatus.run('deferred', 'quota exhausted', wo.id);
+
+  // Re-plan with the SAME expanded identities still in the table.
+  planWorkOrders({ jobId, datasetIds: 'ALL', dailyLimit: 1_000_000, targetServices: null });
+
+  const orders = getWorkOrders(jobId);
+  assert.equal(orders.length, 1,
+    're-plan must replace the deferred order, not leave it alongside a new planned one');
+  // And the single identity appears exactly once across all orders.
+  const totalIds = orders.reduce((n, o) => n + totalIdsInOrder(o), 0);
+  assert.equal(totalIds, 1, 'identity must appear exactly once after re-plan');
+});
+
 test('planWorkOrders: re-planning clears old planned orders (M2 fix)', () => {
   const jobId = insertJob();
   seedIdentities(jobId, [

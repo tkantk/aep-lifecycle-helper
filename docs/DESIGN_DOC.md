@@ -384,9 +384,9 @@ its `displayName` prefix and apply one of four outcomes:
 
 | Outcome | Action |
 |---|---|
-| **Match found** — Adobe has the WO under our `displayName` | Record `adobe_workorder_id` → flip to `submitted`. If the WO had previously been mis-marked `failed`, also re-reserve the quota that the old buggy catch-block released. |
-| **Confirmed absent** — Adobe returned 200, our `displayName` is not in the list | If status was `submitting`, roll back to `planned` and release quota (next submit retries cleanly). If status was `failed`, leave it as failed (confirmed). |
-| **Indeterminate** — Adobe rejected the lookup with 4xx | Leave the WO alone; the next reconcile attempt retries. Never roll back on ambiguity (would risk duplicate destructive submits if the original POST had actually been processed). |
+| **Match found** — Adobe has the WO under our persisted `display_name` (R6 #2) | Record `adobe_workorder_id`; non-terminal Adobe status → `submitted`, terminal (completed/failed) → local completed/failed + `completed_at` (R10 #2); `markAccepted` (or `reactivate` if it was `failed`). The write is CAS-guarded so concurrent reconcile results stay monotonic (R10 #1). |
+| **No match** — Adobe returned 200 but our `display_name` is not in the list | INDETERMINATE — a no-match does NOT prove absence (work-order creation is async, no read-after-write guarantee). If status was `submitting`, **leave it in `submitting` with its reservation HELD** — never auto-roll-back (R6 #1), which would risk a duplicate on retry. The operator confirms absence in Adobe's UI, then uses the per-WO **release-absent** action (R7 #1) to release + retry. If status was `failed`, leave as failed but AMBIGUOUS — a no-match does NOT prove absence (a legacy/timeout `failed` Adobe may actually have processed), so it stays `failure_definitive=0` and ordinary job-delete fail-closes (R11). |
+| **Indeterminate** — Adobe rejected the lookup with 4xx | Leave the WO alone; the next reconcile attempt retries. Never roll back on ambiguity. |
 | **Transient lookup error** — network failure during reconcile | Leave the WO alone; retry on next boot or next manual reconcile click. |
 
 The UI shows a yellow banner on the Submit tab whenever any WO is in
@@ -404,7 +404,7 @@ restart required.
 | `submitting`          | Two meanings: (a) POST to Adobe in flight, (b) UNCERTAIN — POST timed out / network reset / 5xx; Adobe may have processed it, quota still reserved | Recovery / reconcile by `displayName` |
 | `submitted`           | Adobe ACK'd with a work-order ID; monitoring in progress       | Monitor polls 60s      |
 | `completed`           | Adobe confirms deletion complete (terminal)                    | Export results         |
-| `failed`              | Adobe returned 4xx (definitive rejection) and quota was released (terminal) | Review error message; optionally reconcile if you suspect Adobe processed it anyway |
+| `failed`              | Two kinds (R11): **definitive** — a 4xx rejection, `failure_definitive=1`, Adobe never created it so no quota spent → safe to delete; **ambiguous** — a legacy/timeout outcome with no Adobe ID, `failure_definitive=0` → Adobe may have processed it, so ordinary job-delete is blocked (409 `unsettled`) until reconciled (or `?force=true`). A monitor-reported `failed` has an Adobe ID → terminal, not ambiguous. | Review error message; reconcile (settles any Adobe actually has); for ambiguous, verify in Adobe + `?force=true` |
 
 ### 4.4 Submit → reconcile flow
 
@@ -632,10 +632,12 @@ approval gate, UI-level debounce on every destructive button). Source:
      automatically. Prevents re-emitting identities already deleted.
 
   4. Orphan recovery — if the process crashes between quota reservation
-     and Adobe's ACK, startup recovery looks up the work order by
-     displayName prefix. Confirmed-absent → roll back. Indeterminate
-     (Adobe returned 400 or network error) → leave as-is; retry next boot.
-     Never roll back when the answer is ambiguous.
+     and Adobe's ACK, startup recovery looks up the work order by its
+     persisted displayName (R6 #2). Match → record the Adobe ID + markAccepted.
+     No-match or indeterminate (400 / network) → leave in `submitting` with the
+     reservation HELD; NEVER auto-roll-back (R6 #1) — a no-match doesn't prove
+     Adobe absence. The operator resolves a confirmed-absent one via the
+     release-absent action (R7 #1).
 ```
 
 ---
@@ -690,7 +692,7 @@ unreachable and no cache exists.
 | Variable                   | Default       | Description                                                                                                           |
 |----------------------------|---------------|-----------------------------------------------------------------------------------------------------------------------|
 | `DAILY_IDENTIFIER_LIMIT`   | `1000000`     | Fallback daily identifier deletion cap. Match your Adobe contract entitlement. |
-| `MONTHLY_IDENTIFIER_LIMIT` | `3000000`     | Fallback monthly identifier deletion cap. Match your Adobe contract. Set to `0` to disable monthly quota tracking (useful for contracts with no monthly cap). |
+| `MONTHLY_IDENTIFIER_LIMIT` | `3000000`     | FALLBACK monthly identifier cap (live Adobe `/quota` wins). Adobe always enforces a monthly cap, so there is no "disable monthly" option (review R4 #4). |
 
 #### Adobe Endpoints (advanced)
 
@@ -810,10 +812,13 @@ npm start            # starts server, opens browser at http://localhost:3000
 ### 9.3 Running Tests
 
 ```bash
-node --test test
+npm test          # runs scripts/run-tests.mjs (node --test over test/*.test.js)
 ```
 
-All **197 tests** should pass. The suite covers:
+> The historical `node --test test` form is broken on Node ≥ 23 (the positional
+> `test` is parsed as a single test name). Use `npm test`.
+
+All **231 tests** should pass. The suite covers:
 - Work-order payload validators (27 tests)
 - Namespace canonicalization (11 tests)
 - IMS token cache (7 tests)
@@ -843,10 +848,14 @@ On startup, `runStartupRecovery()` automatically:
 - **Reconciles orphan work orders.** For each work order stuck in `submitting`
   with no Adobe ID (the crash window), looks up the order in Adobe by its
   `displayName` prefix:
-  - **Match found** — records the Adobe ID and hands off to the monitor.
-  - **Confirmed absent** — rolls back to `planned` and releases quota.
+  - **Match found** — records the Adobe ID + markAccepted; hands off to the monitor.
+  - **No match** — INDETERMINATE: leaves the orphan in `submitting` with its
+    reservation HELD. NEVER auto-rolls-back (R6 #1) — a no-match doesn't prove
+    Adobe absence (async creation, no read-after-write guarantee). The operator
+    confirms absence in Adobe's UI and releases it via the release-absent action
+    (R7 #1).
   - **Indeterminate** (Adobe returned 400, network error) — leaves the orphan
-    for the next startup to retry. Never rolls back ambiguous cases.
+    for the next startup to retry.
 
 ### 9.5 Rotating Credentials
 

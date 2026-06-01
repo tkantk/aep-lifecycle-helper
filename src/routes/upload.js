@@ -10,6 +10,17 @@ import { logger } from '../utils/logger.js';
 
 const router = Router();
 
+// Coerce a supplied source nsid to a finite non-negative integer, or null.
+// Number("abc") is NaN, which would template into the /clusters/members body
+// as "nsid": null and could mis-target the Identity Graph. null is safe: the
+// expansion runner re-resolves the nsid from the namespace registry (and fails
+// closed if the code isn't registered) — review finding #8.
+function finiteNsidOrNull(v) {
+  if (v == null || v === '') return null;
+  const n = Number(v);
+  return Number.isInteger(n) && n >= 0 ? n : null;
+}
+
 // multer is bounded on every dimension so a malformed multipart stream can't
 // cause unbounded memory growth or fill the disk. fileSize 4 GiB keeps the
 // documented "up to 4 GB CSV" UX; the rest are sized for our single-file
@@ -126,21 +137,27 @@ router.post('/', uploadMiddleware, async (req, res, next) => {
       datasetIds: String(datasetIds).trim() || 'ALL',
       targetServicesJson,
       sourceNamespace: sourceNamespace || 'hashedKocid',
-      sourceNamespaceId: sourceNamespaceId != null && sourceNamespaceId !== ''
-        ? Number(sourceNamespaceId) : null,
+      sourceNamespaceId: finiteNsidOrNull(sourceNamespaceId),
       dailyLimit: Number(dailyLimit) || config.dailyIdentifierLimit,
-      monthlyLimit: Number(monthlyLimit) > 0 ? Number(monthlyLimit) : null,
+      // Adobe always enforces a monthly cap (review R4 #4 removed "0 = disable
+      // monthly"). job.monthly_limit is a FALLBACK only — submission uses
+      // Adobe's live /quota monthly cap. Store a positive value (default config).
+      monthlyLimit: Number(monthlyLimit) > 0 ? Number(monthlyLimit) : config.monthlyIdentifierLimit,
       uploadPath: req.file.path,
       totalSourceIds,
     });
+
+    // Persist the chosen source column so crash-recovery resumes against the
+    // same column (review blocker #4). Stored as the raw value (index or
+    // header name); recovery re-applies the same isNaN/Number coercion.
+    q().setJobSourceColumn.run(String(column), jobId);
 
     // Kick off expansion in-process (fire-and-forget). Progress via /progress.
     runExpansion({
       jobId,
       uploadPath: req.file.path,
       sourceNamespace: sourceNamespace || 'hashedKocid',
-      sourceNamespaceId: sourceNamespaceId != null && sourceNamespaceId !== ''
-        ? Number(sourceNamespaceId) : null,
+      sourceNamespaceId: finiteNsidOrNull(sourceNamespaceId),
       credsId,
       sandboxName,
       column: isNaN(column) ? column : Number(column),

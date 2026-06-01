@@ -189,8 +189,10 @@ demo — never for production. See CLAUDE.md I12.
                           (un-shipped WOs may shift to a later month).
                        c. For each planned OR deferred order in the target
                           (month, day) bucket:
-                            i.   reserve(imsOrgId, count, dailyLimit, monthlyLimit)
-                                 — atomic SQLite UPSERT against both dimensions.
+                            i.   reserve({workOrderId, imsOrgId, count,
+                                 dailyLimit, monthlyLimit}) — per-WO row, pending
+                                 (accepted=0). dailyLimit/monthlyLimit are the
+                                 live /quota caps × (1 − QUOTA_SAFETY_BUFFER) (R6 #3).
                             ii.  if granted: POST /hygiene/workorder
                                  (NON-idempotent; 5xx + network errors do NOT
                                  retry — see I11). Persist Adobe ID + log if
@@ -200,12 +202,14 @@ demo — never for production. See CLAUDE.md I12.
                                  submit run (after UTC daily/monthly rollover)
                                  picks up these rows alongside any new 'planned'
                                  ones.
+                                 On a 2xx: markAccepted(workOrderId) → the
+                                 reservation is held until rollover (R5).
                             iv.  on failure: DISTINGUISH the error class —
                                    • 4xx response (Adobe definitively rejected,
                                      e.g. validation error / auth / forbidden):
-                                     release(count, monthlyLimit), mark 'failed'.
-                                     monthlyLimit gating prevents leakage into
-                                     other jobs.
+                                     release(workOrderId) — guarded WHERE
+                                     accepted=0, so it only refunds un-acked work
+                                     (R5) — mark 'failed'.
                                    • 5xx / timeout / network / no response
                                      (UNCERTAIN — Adobe may have processed it
                                      after our axios call gave up): KEEP status
@@ -213,10 +217,11 @@ demo — never for production. See CLAUDE.md I12.
                                      last_error, DO NOT release quota. The
                                      startup recovery routine (or the operator-
                                      triggered POST /api/jobs/:id/reconcile)
-                                     will look the WO up by displayName and
-                                     either record the real Adobe ID or roll
-                                     back. This is the fix for the 2026-05-29
-                                     "10 in Adobe, 7 in our UI" incident.
+                                     looks the WO up by its persisted displayName
+                                     (R6 #2) and either records the real Adobe ID
+                                     (markAccepted) or, if not yet listed, leaves
+                                     it for operator reconciliation — it NEVER
+                                     auto-rolls-back (R6 #1; absence is unproven).
                      Guarded against concurrent runs via in-process inFlight Set.
 
   5b. RECONCILE      Operator-triggered. POST /api/jobs/:id/reconcile (also
@@ -225,13 +230,18 @@ demo — never for production. See CLAUDE.md I12.
                      adobe_workorder_id). reconcileJobOrphans(jobId) walks
                      every such WO, looks each up via Adobe's list endpoint
                      filtered by the WO's displayName, and applies:
-                       • match found → record Adobe ID + flip to 'submitted'
-                         (if was 'failed', also re-reserve quota via direct
-                         upsertQuota/upsertMonthlyQuota bypassing the cap —
-                         Adobe already spent it, our ledger must mirror reality)
-                       • absent + was submitting → roll back to 'planned' +
-                         release quota
-                       • absent + was failed     → leave as 'failed' (confirmed)
+                       • match found → record Adobe ID; non-terminal → 'submitted',
+                         terminal Adobe status → local completed/failed + completed_at
+                         (R10 #2); markAccepted (or reactivate if was 'failed' →
+                         active+accepted, mirroring the real spend — R5)
+                       • no match + was submitting → INDETERMINATE: hold the
+                         reservation, leave in 'submitting' for operator
+                         reconciliation. NEVER auto-rolls back (R6 #1) — a no-
+                         match doesn't prove absence (async creation may lag).
+                       • no match + was failed   → leave as 'failed', AMBIGUOUS.
+                         A no-match does NOT prove absence (R6 #1); a legacy/
+                         timeout 'failed' Adobe may actually have processed. Stays
+                         failure_definitive=0 so ordinary delete fail-closes (R11).
                        • Adobe 400 / network    → leave as-is, retry next time
                      No restart required; runs in-process against the same
                      adobeClient as the rest of the tool.
@@ -314,10 +324,12 @@ src/
 │   │                       targetServices). Throws WorkOrderValidationError
 │   │                       before touching the wire. POST is DELIBERATELY
 │   │                       non-idempotent — never retries on 5xx/network.
-│   └── quotaManager.js     SQLite-backed two-dimension quota ledger.
-│                           reserve(org, count, dailyLimit, monthlyLimit) and
-│                           release(org, count, monthlyLimit). monthlyLimit=null
-│                           skips the monthly ledger on BOTH operations.
+│   └── quotaManager.js     SQLite-backed two-dimension quota ledger (R5).
+│                           reserve({workOrderId,imsOrgId,count,dailyLimit,
+│                           monthlyLimit})→pending; markAccepted(woId);
+│                           release(woId) (guarded WHERE accepted=0);
+│                           reactivate(woId); seedFloor; peek. Accepted
+│                           reservations are HELD until period rollover.
 │
 ├── runner/                 In-process background work.
 │   ├── expansion.js        CSV stream → Identity Graph → SQLite. Wave-based
@@ -396,16 +408,16 @@ src/
 │                             • reconcileJobOrphans(jobId) — per-job route
 │                               POST /api/jobs/:id/reconcile. Scans status
 │                               IN ('submitting','failed') AND no Adobe ID.
-│                               For previously-'failed' matches, re-reserves
-│                               quota via direct upsertQuota / upsertMonthly
-│                               (bypasses cap — Adobe spent it, ledger must
-│                               mirror reality).
+│                               For previously-'failed' matches, reactivate(woId)
+│                               → active+accepted (Adobe spent it; held until
+│                               rollover — R5).
 │                           All paths share findAdobeWorkOrderByDisplayName
-│                           Prefix. On 400 (filter not supported / indeterminate)
-│                           the orphan is LEFT in 'submitting' so the next call
-│                           retries — never rolled back, because rollback risks
-│                           duplicate
-│                           submission if Adobe actually had received the POST.
+│                           Prefix and match the WO's PERSISTED displayName
+│                           (R6 #2). On ANY no-match (recognized-empty list OR a
+│                           400) the orphan is LEFT in 'submitting' — NEVER rolled
+│                           back (R6 #1), because a no-match doesn't prove absence
+│                           (async creation may lag) and rollback risks a
+│                           duplicate irreversible delete on retry.
 │
 ├── routes/
 │   ├── config.js           Credential CRUD + test.
@@ -438,13 +450,17 @@ src/
 │                             reconciliation. Calls reconcileJobOrphans(id);
 │                             scans WOs with adobe_workorder_id IS NULL AND
 │                             status ∈ submitting/failed; looks each up in
-│                             Adobe by displayName; matched → record ID +
-│                             flip to 'submitted' (re-reserve quota if was
-│                             failed); absent → roll back submitting to
-│                             planned (release quota) OR leave failed as-is;
-│                             indeterminate → leave alone. Returns
+│                             Adobe by its persisted displayName; matched →
+│                             record ID; non-terminal → 'submitted', terminal
+│                             Adobe status → completed/failed + completed_at
+│                             (R10 #2); markAccepted (or reactivate if was
+│                             failed); no-match submitting →
+│                             INDETERMINATE, held in 'submitting' for operator
+│                             (R6 #1, never auto-rolled-back); no-match failed →
+│                             leave failed; 400 → leave alone. Returns
 │                             { matched, rolledBack, stillFailed,
-│                             indeterminate, perWoError, total }.
+│                             indeterminate, perWoError, total } (rolledBack
+│                             is now always 0 — retained for response shape).
 │                           Two list endpoints:
 │                           - GET /api/jobs           — flat list, every status
 │                           - GET /api/jobs/monitor   — active-submissions feed:
@@ -495,7 +511,10 @@ src/
     │                       gradient tile shows it in white.
     └── fonts/              Self-hosted Source Sans 3 woff2 (OFL-licensed, 4 weights).
 
-test/                       node --test. 178 tests covering hygiene validators,
+test/                       node --test (via `npm test` → scripts/run-tests.mjs,
+                            which enumerates test/*.test.js and sets a stable
+                            test ENCRYPTION_KEY). 267 tests covering hygiene
+                            validators,
                             namespace canonicalization, IMS token cache, quota
                             atomicity (incl. monthly-disabled release gating),
                             planWorkOrders cluster packing + day rollover +
@@ -544,7 +563,7 @@ data/                       Runtime state; in .gitignore.
 - Request: `{ compositeXids:[{ns,nsid,id}], "graph-type": "Private Graph" }`
 - **Current response** (AEP v1.1.0, observed): `{ version, clusters:[{compositeXid:{nsid,id}, members:[{nsid,id},...]}] }` — members have no `ns` code; canonicalize via registry.
 - **Legacy response** (older regions may still emit): bare array `[{xid, identities:[{ns,nsid,id}]}]`.
-- Matching: by `compositeXid.id` (preferred) or array position (fallback).
+- Matching: STRICTLY by `compositeXid.id` (no positional fallback, review R4 #2). Fails closed on any unmatched source, on `unprocessedXids`/`unprocessedNids`, or on an unrecognized shape.
 
 **Work order** `POST platform.adobe.io/data/core/hygiene/workorder`
 - See CLAUDE.md I1 for the exact payload contract. Key rules: `action: "delete_identity"`, `datasetId` ∈ `ALL` | single | comma list, `targetServices` iff `datasetId === "ALL"`, total ids ≤ 100k, each namespace group identified by `code` OR `id` OR both.
@@ -573,18 +592,21 @@ data/                       Runtime state; in .gitignore.
 |---|---|---|
 | `credentials` | AES-GCM encrypted secrets | UNIQUE(environment, ims_org_id, client_id) |
 | `sandbox_configs` | Cached sandbox metadata + datasets + namespaces | PK(creds_id, sandbox_name) |
-| `jobs` | One per upload. Status: created → expanding → expanded → ready → submitting → submitted/partial/failed. `projected_months` (Phase 2) tracks the redistributor's max month_index for shift detection. | FK creds_id |
+| `jobs` | One per upload. Status: created → expanding → expanded → ready → submitting → submitted/partial/failed. `projected_months` (Phase 2) tracks the redistributor's max month_index for shift detection. `source_column` (2026-05-31, default `'0'`) persists the upload-time CSV column so crash-recovery resumes against the same column. | FK creds_id |
 | `expanded_identities` | One row per (cluster member, source). No unique index — dedup deferred to planning via `GROUP BY` in `streamIdentitiesBySource`. Only `idx_ei_job_source(job_id, source_id)` remains; `idx_ei_job_ns` was dropped 2026-05-29 (proven via EXPLAIN QUERY PLAN to be redundant — every reader falls back to `idx_ei_job_source` with an identical plan). | FK job_id |
-| `work_orders` | One per Adobe work order. Statuses: planned → submitting → submitted → completed/failed/deferred. `month_index` (Phase 2) + `day_index` form the bucket label assigned by the redistributor on un-shipped WOs only. | FK job_id, ordered by rowid |
-| `quota_usage` | Daily local ledger: (ims_org_id, utc_date) → used | PK |
-| `quota_usage_monthly` | Monthly local ledger: (ims_org_id, utc_year_month) → used | PK |
+| `work_orders` | One per Adobe work order. Statuses: planned → submitting → submitted → completed/failed/deferred. `month_index` (Phase 2) + `day_index` form the bucket label assigned by the redistributor on un-shipped WOs only. `last_polled_at` (2026-05-31) is the monitor's fairness cursor so >100 open WOs all get polled (no starvation). (R2's `reserved_monthly` column was removed in R4 — the per-WO `quota_reservations` table records each WO's own period/count, so recovery releases exactly what was reserved.) | FK job_id, ordered by rowid |
+| `quota_usage` | Per-period **adobe_floor** = Adobe's observed consumed (R4: `used` is vestigial; an R5 boot backfill folds any legacy `used` into `adobe_floor`). Raised ONLY by `seedFloor` (MAX with live /quota). Nothing else touches the floor — an accepted WO is held as an active reservation, never folded in, so there is no double-count vs the MAX (R5). | PK(ims_org_id, utc_date) |
+| `quota_usage_monthly` | Monthly counterpart of `quota_usage`'s `adobe_floor`. | PK(ims_org_id, utc_year_month) |
+| `quota_reservations` | **Per-work-order quota reservation** (R4 #1; R5 lifecycle): (work_order_id) → count + utc_date + utc_year_month + active + **accepted**. `effective_used(period) = adobe_floor(period) + Σ active reservations(period)`. `reserve`→pending(accepted=0); `markAccepted`→accepted=1 (Adobe acked); `release` deactivates IFF accepted=0; `reactivate`→active+accepted. **HOLD-UNTIL-ROLLOVER (R5):** an accepted reservation is NEVER dropped mid-period (no `complete()`, no timer/floor-delta drop — all over-ship under a concurrent external consumer); it's held until the period-keyed SUM stops matching it at UTC day/month rollover. | PK(work_order_id) |
 | `app_settings` | Generic key/value bag (Phase 3). First users: `auto_resume_*` keys for the scheduler. | PK(key) |
 
-Both ledgers are incremented by `reserve()` atomically and decremented by
-`release()` atomically. The `jobs` table has `daily_limit` and `monthly_limit`
-columns (nullable; null monthly = "don't track monthly for this job") — but
-since Phase 1 these are FALLBACK ONLY; the live Adobe `/quota` is the
-runtime source of truth (CLAUDE.md I15).
+`reserve()` records a pending per-WO row in `quota_reservations` atomically;
+`markAccepted()` promotes it when Adobe acks; `release()` deactivates it only
+while un-accepted (R5). `effective_used = adobe_floor + Σ active reservations`
+(R4 #1). The `jobs` table has `daily_limit` and
+`monthly_limit` columns — FALLBACK ONLY; the live Adobe `/quota` is the runtime
+source of truth (CLAUDE.md I15), and monthly is ALWAYS tracked (R4 #4 removed the
+"null = don't track monthly" mode).
 
 ---
 
@@ -650,30 +672,52 @@ runtime source of truth (CLAUDE.md I15).
   skips them when re-reading the CSV. Cost: holds ~50 MB per 1M processed
   sources in memory while resuming.
 - **Crashed submission auto-reconciles** on next boot — `reconcileOrphanWorkOrders()`
-  calls Adobe's list endpoint filtered by displayName prefix. On match →
-  records the Adobe ID. On confirmed no-match (Adobe responded 200, our row
-  not in the list) → rolls back to `planned` and releases quota. On transient
-  error (network / 5xx) OR indeterminate (400 from list endpoint) → leaves
-  the orphan in `submitting` so the next boot retries. **Never rolls back on
-  400** — rolling back would risk a duplicate Adobe work order if the original
-  POST had actually been processed but our listing query happened to fail.
-- **Single-process only** — running two instances against the same `state.db`
-  corrupts the WAL. No file lock guard. Future improvement: advisory lock
-  file in `data/`.
+  calls Adobe's list endpoint filtered by the WO's PERSISTED displayName (R6 #2).
+  On match → records the Adobe ID + markAccepted. On ANY no-match — whether a
+  recognized-empty 200, a 400, or a transient 5xx/network error — the orphan is
+  LEFT in `submitting` with its reservation HELD, surfaced for operator
+  reconciliation (R6 #1). **Recovery NEVER auto-rolls-back an uncertain orphan**:
+  Adobe documents work-order creation as asynchronous with no read-after-write
+  guarantee, so a missing list entry does NOT prove absence — rolling back +
+  releasing would risk a duplicate irreversible delete on the next submit. A
+  genuinely-absent WO is resolved by the operator via the **release-absent**
+  action (R7 #1): after verifying in Adobe's UI (by the persisted displayName)
+  that the WO does not exist, the operator releases its held reservation and
+  resets it to `planned` for retry. The action is fail-closed — it refuses any
+  WO with an Adobe ID, an accepted reservation, a still-in-flight POST (R8 #1),
+  or an in-flight reconciliation lookup (R9 #1, refcounted — a lookup may find
+  the WO in Adobe, so releasing+retrying during it would duplicate), and the
+  release + reset run in one transaction (R8 #2). Reconcile writes are themselves
+  CAS-guarded (apply only while the WO is still an unresolved orphan) so
+  concurrent reconcile results are monotonic and an already-terminal Adobe match
+  is finalised to local completed/failed with completed_at (R10 #1/#2).
+- **Single-process only** — running two instances against the same database
+  corrupts the WAL. Enforced by a single-process advisory lock (`index.js`):
+  a `<dbPath>.lock` file keyed on the canonical resolved `DB_PATH` (not
+  `DATA_DIR`, so two different `DATA_DIR`s sharing one `DB_PATH` still
+  collide), acquired BEFORE the SQLite connection is opened, with stale-pid
+  reclamation and release on shutdown (review finding #6).
 - **OneDrive-hosted state.db** — if `data/` lives inside a OneDrive-synced path
   (the default install location on Windows), OneDrive can transiently lock
   files and cause SQLITE_BUSY. Safer to move the state outside OneDrive, or
   stop OneDrive sync before running heavy jobs.
-- **Quota release on network timeout** — if Adobe accepted the hygiene
+- **Uncertain POST on network timeout** — if Adobe accepted the hygiene
   work-order POST but the response was dropped (timeout / connection reset),
   we don't know if the work order was created. The retry guard in
   `services/adobeClient.js` blocks 5xx and network-error retries on
   non-idempotent requests (CLAUDE.md I11), so the hygiene POST will never
-  silently double-fire. The downside is that a transient blip surfaces as
-  a `failed` work order with quota released — even if Adobe actually did
-  process it. The orphan-recovery routine on next startup attempts to
-  reconcile by listing Adobe orders by displayName prefix; on match it
-  records the Adobe ID without re-submitting.
+  silently double-fire. The WO is KEPT in `submitting` with its reservation
+  HELD (quota is NOT released — R5/R6) precisely because Adobe may have spent
+  it. Orphan recovery on next startup matches the WO's persisted displayName;
+  on match it records the Adobe ID (markAccepted) without re-submitting, and on
+  a no-match it leaves the WO for operator reconciliation rather than risk a
+  duplicate (R6 #1).
+- **Org-wide quota & external writers** — Adobe `/quota` is ORG-WIDE and this
+  tool snapshots it once per submit run, so its zero-over-ship guarantee covers
+  only ITS OWN accounting. A concurrent external writer (another UI user / API
+  client / second helper instance in the same org) can consume quota between our
+  snapshot and our submit. Set `QUOTA_SAFETY_BUFFER` (e.g. 0.1) to hold back
+  headroom, or ensure operational exclusivity (review R6 #3).
 
 ---
 

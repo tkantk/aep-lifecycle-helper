@@ -80,14 +80,23 @@ export function redistributeUnshippedOrders(jobId, quota) {
   // Effective caps. Adobe's /quota is the truth when present; the job-row
   // values are only used when Adobe data is missing (e.g. first-run before
   // a successful /quota call). Both checks tolerate `0`-as-disabled per
-  // the existing convention.
+  // the existing convention. NOTE: these are the RAW caps — QUOTA_SAFETY_BUFFER
+  // (R6 #3) is intentionally NOT applied here. The redistributor only assigns
+  // (month_index, day_index) LABELS; the authoritative quota gate is reserve()
+  // in submission.js, which DOES use the buffered caps. Keeping bucket labels
+  // buffer-independent means a buffer can only DEFER work to a later window
+  // (safe), never over-ship.
   const dailyFresh = safeInt(
     quota?.daily?.quota,
     safeInt(job.daily_limit, config.dailyIdentifierLimit)
   );
-  const monthlyFresh = job.monthly_limit === null || job.monthly_limit === 0
-    ? safeInt(quota?.monthly?.quota, null)
-    : safeInt(quota?.monthly?.quota, safeInt(job.monthly_limit, null));
+  // Monthly is ALWAYS tracked (review R4 #4 removed "0 = disable monthly" —
+  // Adobe always enforces a monthly cap). Live /quota wins; job row + config
+  // are fallbacks.
+  const monthlyFresh = safeInt(
+    quota?.monthly?.quota,
+    safeInt(job.monthly_limit, config.monthlyIdentifierLimit)
+  );
 
   // First-period remainders — live values from Adobe if we have them,
   // otherwise full fresh caps.

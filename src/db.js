@@ -78,11 +78,13 @@ export function initDb() {
       target_services_json TEXT,
       source_namespace    TEXT NOT NULL DEFAULT 'hashedKocid',
       source_namespace_id INTEGER,                      -- numeric nsid if known
+      source_column       TEXT NOT NULL DEFAULT '0',    -- CSV column (0-based index OR header name) chosen at upload
       daily_limit         INTEGER NOT NULL DEFAULT 1000000,
       upload_path         TEXT,
       total_source_ids    INTEGER NOT NULL DEFAULT 0,
       processed_count     INTEGER NOT NULL DEFAULT 0,
       found_count         INTEGER NOT NULL DEFAULT 0,
+      graph_members_seen  INTEGER NOT NULL DEFAULT 0,  -- cumulative linked members Adobe returned (review #2 empty-graph fail-closed; survives crash/resume)
       planned_orders      INTEGER NOT NULL DEFAULT 0,
       last_error          TEXT,
       created_at          TEXT NOT NULL DEFAULT (datetime('now')),
@@ -151,6 +153,11 @@ export function initDb() {
       ims_org_id  TEXT NOT NULL,
       utc_date    TEXT NOT NULL,
       used        INTEGER NOT NULL DEFAULT 0,
+      -- Adobe's observed org-wide consumed (set by seedFloor). Tracked
+      -- SEPARATELY from the used column (our reservations) so a release can
+      -- never drop the ledger below Adobe's reality and let a later reserve
+      -- over-ship (review #3). used is always kept >= adobe_floor.
+      adobe_floor INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (ims_org_id, utc_date)
     );
 
@@ -162,8 +169,43 @@ export function initDb() {
       ims_org_id      TEXT NOT NULL,
       utc_year_month  TEXT NOT NULL,   -- 'YYYY-MM' (e.g. '2026-04')
       used            INTEGER NOT NULL DEFAULT 0,
+      adobe_floor     INTEGER NOT NULL DEFAULT 0,   -- see quota_usage (review #3)
       PRIMARY KEY (ims_org_id, utc_year_month)
     );
+
+    -- ─── Per-work-order quota reservations (review R4 #1, R5 lifecycle) ───
+    -- The aggregate quota_usage.used counter conflated OUR reservations with
+    -- Adobe's observed floor, so a delayed release could mis-account (lose
+    -- ownership / cross-day). This table records ONE row per reserved work
+    -- order with its own period keys. effective_used(period) = adobe_floor(period)
+    --   + SUM(count) of ACTIVE reservations in that period.
+    --   active=1: reserved / held (counts toward effective).
+    --   active=0: released — Adobe did NOT process it (4xx / durability-fail /
+    --             operator release-absent R7 #1; recovery never auto-releases).
+    --
+    -- accepted (R5): 0 = pending (committed locally, Adobe has not acked); 1 =
+    -- Adobe ACKED the POST and has spent the quota. An accepted reservation is
+    -- NEVER released (release() is guarded WHERE accepted=0) and is NEVER dropped
+    -- mid-period — it is HELD until the UTC day/month rolls over (Adobe's counter
+    -- resets then too), at which point it auto-expires because the period-keyed
+    -- SUM no longer matches it. The R4.1 deactivate-on-terminal and every
+    -- timer/floor-delta "assimilation drop" were proven to over-ship under a
+    -- concurrent external Adobe consumer (the org-wide /quota gives no per-tool
+    -- attribution), so there is deliberately NO mid-period drop. Over-defer
+    -- (holding slightly too long) is the SAFE direction and self-corrects at
+    -- rollover; over-ship is irreversible.
+    CREATE TABLE IF NOT EXISTS quota_reservations (
+      work_order_id   TEXT PRIMARY KEY,
+      ims_org_id      TEXT NOT NULL,
+      utc_date        TEXT NOT NULL,
+      utc_year_month  TEXT NOT NULL,
+      count           INTEGER NOT NULL,
+      active          INTEGER NOT NULL DEFAULT 1,
+      accepted        INTEGER NOT NULL DEFAULT 0,
+      created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_qr_org_date  ON quota_reservations(ims_org_id, utc_date, active);
+    CREATE INDEX IF NOT EXISTS idx_qr_org_month ON quota_reservations(ims_org_id, utc_year_month, active);
 
     -- ─── App-global settings (Phase 3, 2026-05-15) ──────────────────
     -- Generic key/value bag for settings that aren't tied to a credential
@@ -197,6 +239,48 @@ export function initDb() {
     //   (≤1mo) or a modal (≥2mo). Nullable until the first redistribute runs.
     { table: 'work_orders', column: 'month_index', type: 'INTEGER' },
     { table: 'jobs',        column: 'projected_months', type: 'INTEGER' },
+    // Review blocker #4 (2026-05-31): persist the CSV source column chosen at
+    // upload so crash-recovery resumes against the SAME column. Without this,
+    // recovery hardcoded column 0 and could expand identifiers the operator
+    // never selected. Default '0' keeps legacy rows (and the single-column
+    // common case) correct.
+    { table: 'jobs',        column: 'source_column', type: "TEXT NOT NULL DEFAULT '0'" },
+    // Review finding #9: a poll cursor so the monitor rotates fairly through
+    // ALL open work orders instead of re-polling the first 100 by rowid every
+    // tick (which starved order #101+ on large jobs). NULL = never polled.
+    { table: 'work_orders', column: 'last_polled_at', type: 'TEXT' },
+    // (R2's work_orders.reserved_monthly migration was removed in R4 — the
+    // per-WO quota_reservations table replaced the reserved_monthly approach.)
+    // Review #2 (R2): cumulative count of linked members the Identity Graph
+    // returned for the job. Persisted (not just run-local) so the empty-graph
+    // fail-closed check is correct across a crash + resume.
+    { table: 'jobs', column: 'graph_members_seen', type: 'INTEGER NOT NULL DEFAULT 0' },
+    // Review #3 (R3): Adobe's observed floor, tracked separately from `used`.
+    { table: 'quota_usage',         column: 'adobe_floor', type: 'INTEGER NOT NULL DEFAULT 0' },
+    { table: 'quota_usage_monthly', column: 'adobe_floor', type: 'INTEGER NOT NULL DEFAULT 0' },
+    // Review R5: pending(0) vs Adobe-accepted(1). A pre-R5 quota_reservations
+    // row gets DEFAULT 0, then the backfill below promotes legacy in-flight rows
+    // to accepted=1 so release()'s guard can't refund Adobe-processed work.
+    { table: 'quota_reservations',  column: 'accepted', type: 'INTEGER NOT NULL DEFAULT 0' },
+    // Review R6 #2: the EXACT displayName sent to Adobe (UUID-first, ≤255),
+    // persisted durably BEFORE the POST so orphan recovery matches Adobe's stored
+    // value exactly instead of reconstructing it (a long job name truncated at
+    // 255 used to drop the trailing UUID → orphan invisible → duplicate on
+    // resubmit). NULL for legacy rows; recovery falls back to reconstruction.
+    { table: 'work_orders', column: 'display_name', type: 'TEXT' },
+    // Review R9 #1: monotonic per-WO attempt counter for compare-and-swap. A
+    // reconcile snapshots `attempt` before its (awaited) Adobe lookup and only
+    // applies the result if `attempt` is unchanged — so a stale lookup response
+    // can never mutate a WO the operator released + retried during the await.
+    // Bumped by release-absent (the WO becomes a fresh attempt).
+    { table: 'work_orders', column: 'attempt', type: 'INTEGER NOT NULL DEFAULT 0' },
+    // Review R11 #1: distinguishes a DEFINITIVE Adobe rejection (a 4xx on the
+    // POST — never created in Adobe, consumed no quota) from an AMBIGUOUS 'failed'
+    // row (a legacy pre-2026-05-29 timeout that Adobe may actually have
+    // processed). Set to 1 only on a 4xx. Existing/legacy 'failed' rows default
+    // to 0 = ambiguous, so ordinary job-delete fails closed on them (they could
+    // represent real Adobe spend; deleting their tracking risks over-ship).
+    { table: 'work_orders', column: 'failure_definitive', type: 'INTEGER NOT NULL DEFAULT 0' },
   ];
   for (const { table, column, type } of additiveColumns) {
     try {
@@ -206,6 +290,27 @@ export function initDb() {
       if (!/duplicate column/i.test(err.message)) throw err;
     }
   }
+
+  // ─── One-time conservative quota backfills (idempotent; review R5) ──────
+  // (1) Finding #3 — preserve a pre-R4 DB's held usage. The old aggregate model
+  //     stored consumption in `used` (now vestigial) with adobe_floor=0; the R5
+  //     model reads ONLY adobe_floor. Fold used→adobe_floor (MAX-equivalent via
+  //     the WHERE guard; the floor only ever rises) so an upgrade can't silently
+  //     drop a conservative hold during Adobe's /quota lag window.
+  db.exec(`UPDATE quota_usage         SET adobe_floor = used WHERE used > adobe_floor`);
+  db.exec(`UPDATE quota_usage_monthly SET adobe_floor = used WHERE used > adobe_floor`);
+  // (2) Synthesis must-fix — a pre-R5 active reservation whose work order had
+  //     already reached Adobe (status past the never-sent set) must be marked
+  //     accepted=1; otherwise release()'s `WHERE accepted=0` guard would refund
+  //     a reservation Adobe is actively processing → over-ship + duplicate.
+  db.exec(`
+    UPDATE quota_reservations SET accepted = 1
+     WHERE active = 1 AND accepted = 0
+       AND work_order_id IN (
+         SELECT id FROM work_orders
+          WHERE status NOT IN ('planned','deferred','awaiting_approval')
+       )
+  `);
 
   // Drop the old unique index on expanded_identities if it still exists on an
   // existing DB. Dedup is now deferred to planning time (GROUP BY in
@@ -294,6 +399,14 @@ function prepared() {
               @sourceNamespace, @sourceNamespaceId, @dailyLimit, @monthlyLimit,
               @uploadPath, @totalSourceIds)
     `),
+    // Persist the upload-time source column separately so insertJob's param
+    // contract (and its many call sites) stays untouched. Stored as TEXT
+    // because the column may be a 0-based index OR a header name.
+    setJobSourceColumn: db.prepare('UPDATE jobs SET source_column = ? WHERE id = ?'),
+    // Persist a submission preflight/run error on the job WITHOUT changing its
+    // status, so a fire-and-forget submit failure (e.g. quota_unavailable) is
+    // observable by the UI instead of only logged (review finding #10).
+    setJobError: db.prepare(`UPDATE jobs SET last_error = ?, updated_at = datetime('now') WHERE id = ?`),
     getJob: db.prepare('SELECT * FROM jobs WHERE id = ?'),
     listJobs: db.prepare('SELECT * FROM jobs ORDER BY created_at DESC LIMIT ? OFFSET ?'),
     // Monitor-tab feed: jobs that have at least one Adobe-acked work order,
@@ -370,9 +483,10 @@ function prepared() {
     `),
     incrementJobCounters: db.prepare(`
       UPDATE jobs
-         SET processed_count = processed_count + ?,
-             found_count     = found_count + ?,
-             updated_at      = datetime('now')
+         SET processed_count    = processed_count + ?,
+             found_count        = found_count + ?,
+             graph_members_seen = graph_members_seen + ?,
+             updated_at         = datetime('now')
        WHERE id = ?
     `),
     setPlannedOrders: db.prepare(`UPDATE jobs SET planned_orders = ?, updated_at = datetime('now') WHERE id = ?`),
@@ -427,7 +541,12 @@ function prepared() {
       VALUES (@id, @jobId, @dayIndex, @datasetIds, @targetServicesJson,
               @namespacesIdentities, @identifierCount, @status)
     `),
-    deletePlannedOrders: db.prepare(`DELETE FROM work_orders WHERE job_id = ? AND status IN ('planned', 'awaiting_approval')`),
+    // Clears every un-shipped status before a re-plan. MUST include 'deferred':
+    // a deferred WO that survives a re-plan plus the freshly re-emitted planned
+    // WO both cover the same identities, so the next submit would ship BOTH —
+    // a duplicate irreversible delete (review blocker #1). Deferred orders
+    // never went to Adobe, so deleting + re-creating them is safe.
+    deletePlannedOrders: db.prepare(`DELETE FROM work_orders WHERE job_id = ? AND status IN ('planned', 'awaiting_approval', 'deferred')`),
     // Mark WOs in Month 2+ as awaiting_approval after planning. These require
     // explicit operator sign-off before they become eligible for submission.
     // Month 1 (or NULL legacy rows) stays 'planned' and ships immediately on Submit.
@@ -467,6 +586,41 @@ function prepared() {
     getAllOrdersForJob: db.prepare(`
       SELECT * FROM work_orders WHERE job_id = ? ORDER BY COALESCE(month_index, 1), day_index, rowid
     `),
+    // Single WO scoped to its job — used by the operator "confirmed absent →
+    // release & retry" action (review R7 #1) so a woId from a different job
+    // can't be acted on.
+    getWorkOrderByIdAndJob: db.prepare(`SELECT * FROM work_orders WHERE id = ? AND job_id = ?`),
+    // Review R9 #1 / R10 #1: compare-and-swap support. release-absent bumps
+    // `attempt` (a fresh attempt). The reconcile CAS itself re-reads via
+    // getWorkOrderReconcileState below (attempt + status + adobe_workorder_id);
+    // getWorkOrderAttempt is the plain attempt read used by direct callers/tests.
+    getWorkOrderAttempt: db.prepare(`SELECT attempt FROM work_orders WHERE id = ?`),
+    bumpWorkOrderAttempt: db.prepare(`UPDATE work_orders SET attempt = attempt + 1 WHERE id = ?`),
+    // Review R10 #1: the reconcile CAS must also require the WO to still be
+    // UNRESOLVED — otherwise two concurrent lookups (same attempt) both write and
+    // a slow no-match overwrites a fast match. A write applies only if attempt is
+    // unchanged AND adobe_workorder_id IS NULL AND status is still an orphan
+    // state. This makes concurrent reconcile results monotonic (a resolved WO is
+    // never reverted).
+    getWorkOrderReconcileState: db.prepare(`SELECT attempt, status, adobe_workorder_id FROM work_orders WHERE id = ?`),
+    // Review R10 #2: a reconcile match may find the WO ALREADY terminal in Adobe
+    // (status completed/failed). updateWorkOrderSubmitted hardcodes 'submitted',
+    // which then the monitor never repairs (it excludes terminal adobe_status) —
+    // leaving status='submitted' + completed_at NULL forever, blocking job delete.
+    // This variant normalises a terminal match to the local terminal status +
+    // stamps completed_at (mirrors updateWorkOrderAdobeStatus); a non-terminal
+    // match becomes 'submitted' as before.
+    updateWorkOrderReconciledMatch: db.prepare(`
+      UPDATE work_orders
+         SET adobe_workorder_id = @adobeWorkorderId,
+             adobe_status = @adobeStatus,
+             bundle_id = @bundleId,
+             submitted_at = @submittedAt,
+             status = CASE WHEN @adobeStatus IN ('completed','failed') THEN @adobeStatus ELSE 'submitted' END,
+             completed_at = CASE WHEN @adobeStatus IN ('completed','failed') THEN datetime('now') ELSE completed_at END,
+             updated_at = datetime('now')
+       WHERE id = @id
+    `),
     // Unshipped (planned + deferred) WOs in deterministic creation order.
     // The redistributor consumes this and updates each row's month/day index.
     getUnshippedOrdersForJob: db.prepare(`
@@ -481,6 +635,22 @@ function prepared() {
     setProjectedMonths: db.prepare(`UPDATE jobs SET projected_months = ?, updated_at = datetime('now') WHERE id = ?`),
     updateWorkOrderStatus: db.prepare(`
       UPDATE work_orders SET status = ?, last_error = ?, updated_at = datetime('now') WHERE id = ?
+    `),
+    // Review R11 #1: a 4xx is a DEFINITIVE rejection — Adobe never created the WO,
+    // so it consumed no quota and is safe to delete. Mark it so ordinary
+    // job-delete can distinguish it from an ambiguous (legacy/timeout) 'failed'.
+    markWorkOrderFailedDefinitive: db.prepare(`
+      UPDATE work_orders SET status = 'failed', last_error = ?, failure_definitive = 1, updated_at = datetime('now') WHERE id = ?
+    `),
+    // Durable pre-POST checkpoint (review R6 #2): set status='submitting' AND the
+    // exact displayName that will be sent to Adobe. COALESCE keeps an existing
+    // display_name when @displayName is null (the legacy/no-name durable path).
+    setWorkOrderSubmittingWithName: db.prepare(`
+      UPDATE work_orders
+         SET status = 'submitting', last_error = NULL,
+             display_name = COALESCE(@displayName, display_name),
+             updated_at = datetime('now')
+       WHERE id = @id
     `),
     updateWorkOrderSubmitted: db.prepare(`
       UPDATE work_orders
@@ -501,13 +671,19 @@ function prepared() {
              updated_at = datetime('now')
        WHERE id = ?
     `),
+    // Oldest-polled (and never-polled) first, so every open WO is eventually
+    // observed even when more than 100 are in flight (review finding #9 —
+    // starvation). The monitor stamps last_polled_at on every attempt, so a
+    // polled WO rotates to the back of the queue.
     listOpenWorkOrders: db.prepare(`
       SELECT w.*, j.creds_id AS j_creds_id, j.sandbox_name AS j_sandbox_name
         FROM work_orders w JOIN jobs j ON j.id = w.job_id
        WHERE w.adobe_workorder_id IS NOT NULL
          AND (w.adobe_status IS NULL OR w.adobe_status NOT IN ('completed','failed'))
+       ORDER BY w.last_polled_at IS NOT NULL, w.last_polled_at, w.rowid
        LIMIT 100
     `),
+    stampWorkOrderPolled: db.prepare(`UPDATE work_orders SET last_polled_at = datetime('now') WHERE id = ?`),
     countWorkOrdersByStatus: db.prepare(`
       SELECT status, COUNT(*) AS count FROM work_orders WHERE job_id = ? GROUP BY status
     `),
@@ -517,25 +693,83 @@ function prepared() {
     // potentially millions of rows. Caller is responsible for cleaning up
     // associated filesystem artefacts (uploaded CSV, exported CSV).
     deleteJob: db.prepare('DELETE FROM jobs WHERE id = ?'),
+    // quota_reservations is keyed by work_order_id but NOT cascaded from jobs
+    // (it has no job_id). Delete a job's reservations explicitly BEFORE the job
+    // (the job-delete cascades the work_orders away). STATUS-AWARE (review R5 #2):
+    // refund ONLY reservations that are already inactive OR whose WO never
+    // reached Adobe (planned/deferred/awaiting_approval). An ACTIVE reservation
+    // for a WO that WAS sent (submitting/submitted/terminal) is KEPT as a
+    // tombstone — Adobe spent that quota, so refunding it would over-ship. The
+    // tombstone survives the cascade (no FK) and expires at period rollover.
+    deleteReservationsForJob: db.prepare(`
+      DELETE FROM quota_reservations
+       WHERE work_order_id IN (SELECT id FROM work_orders WHERE job_id = @jobId)
+         AND ( active = 0
+            OR work_order_id IN (
+                 SELECT id FROM work_orders
+                  WHERE job_id = @jobId AND status IN ('planned','deferred','awaiting_approval')
+               ) )
+    `),
+    // Startup GC: drop ORPHAN reservations (no surviving work order) that no
+    // longer count — inactive, OR whose monthly period has already rolled over
+    // (a prior-month tombstone is already excluded from the current-month SUM,
+    // so deleting it changes nothing). A CURRENT-month active tombstone is KEPT
+    // (Adobe spent it; it must keep counting until rollover) (review R5 #2).
+    gcOrphanReservations: db.prepare(`
+      DELETE FROM quota_reservations
+       WHERE work_order_id NOT IN (SELECT id FROM work_orders)
+         AND (active = 0 OR utc_year_month < ?)
+    `),
 
-    // ─── Quota (daily) ────────────────────────────────────────────────
-    getQuota: db.prepare(`SELECT used FROM quota_usage WHERE ims_org_id = ? AND utc_date = ?`),
-    upsertQuota: db.prepare(`
-      INSERT INTO quota_usage (ims_org_id, utc_date, used) VALUES (?, ?, ?)
-      ON CONFLICT(ims_org_id, utc_date) DO UPDATE SET used = used + excluded.used
+    // ─── Quota: Adobe-observed floor (per period) ─────────────────────
+    // adobe_floor = org-wide consumed as observed by Adobe. Raised ONE way:
+    //   • seedFloor → MAX(floor, live /quota consumed) — Adobe's ABSOLUTE
+    //     observed value. Nothing else touches the floor: an accepted WO is held
+    //     as an active reservation (NOT folded into the floor) until period
+    //     rollover, so there is no additive bump and no double-count vs the MAX
+    //     (review R5). (`used` is vestigial post-R4; reservations replace it.)
+    getDailyFloor:   db.prepare(`SELECT adobe_floor FROM quota_usage WHERE ims_org_id = ? AND utc_date = ?`),
+    getMonthlyFloor: db.prepare(`SELECT adobe_floor FROM quota_usage_monthly WHERE ims_org_id = ? AND utc_year_month = ?`),
+    maxDailyFloor: db.prepare(`
+      INSERT INTO quota_usage (ims_org_id, utc_date, used, adobe_floor) VALUES (?, ?, 0, ?)
+      ON CONFLICT(ims_org_id, utc_date) DO UPDATE SET adobe_floor = MAX(adobe_floor, excluded.adobe_floor)
     `),
-    decQuota: db.prepare(`
-      UPDATE quota_usage SET used = MAX(0, used - ?) WHERE ims_org_id = ? AND utc_date = ?
+    maxMonthlyFloor: db.prepare(`
+      INSERT INTO quota_usage_monthly (ims_org_id, utc_year_month, used, adobe_floor) VALUES (?, ?, 0, ?)
+      ON CONFLICT(ims_org_id, utc_year_month) DO UPDATE SET adobe_floor = MAX(adobe_floor, excluded.adobe_floor)
     `),
 
-    // ─── Quota (monthly) ──────────────────────────────────────────────
-    getMonthlyQuota: db.prepare(`SELECT used FROM quota_usage_monthly WHERE ims_org_id = ? AND utc_year_month = ?`),
-    upsertMonthlyQuota: db.prepare(`
-      INSERT INTO quota_usage_monthly (ims_org_id, utc_year_month, used) VALUES (?, ?, ?)
-      ON CONFLICT(ims_org_id, utc_year_month) DO UPDATE SET used = used + excluded.used
+    // ─── Quota: per-work-order reservations (review R4 #1, R5 lifecycle) ──
+    // A (re-)reserve inserts/reactivates as PENDING (accepted=0): a deferred WO
+    // retried, or a new WO, has not yet been acked by Adobe.
+    upsertReservation: db.prepare(`
+      INSERT INTO quota_reservations (work_order_id, ims_org_id, utc_date, utc_year_month, count, active, accepted)
+        VALUES (@workOrderId, @imsOrgId, @utcDate, @utcMonth, @count, 1, 0)
+      ON CONFLICT(work_order_id) DO UPDATE SET
+        ims_org_id = excluded.ims_org_id, utc_date = excluded.utc_date,
+        utc_year_month = excluded.utc_year_month, count = excluded.count, active = 1, accepted = 0
     `),
-    decMonthlyQuota: db.prepare(`
-      UPDATE quota_usage_monthly SET used = MAX(0, used - ?) WHERE ims_org_id = ? AND utc_year_month = ?
+    // Adobe ACKED the POST — promote to accepted AND active so it can never be
+    // released and is held until period rollover (review R5). active=1 is
+    // defense-in-depth (review R8 #1): if a release somehow slipped in during the
+    // in-flight window, a subsequent markAccepted re-activates the hold so the
+    // ledger reflects the spend Adobe actually made — it never leaves an
+    // Adobe-acked WO uncounted.
+    markAcceptedReservation: db.prepare(`UPDATE quota_reservations SET active = 1, accepted = 1 WHERE work_order_id = ?`),
+    // Release is GUARDED: only an un-accepted (pending) reservation can be
+    // deactivated. Adobe-accepted work must never be refunded (review R5 #2).
+    releaseReservation:    db.prepare(`UPDATE quota_reservations SET active = 0 WHERE work_order_id = ? AND accepted = 0`),
+    // Recovery: a 'failed' WO that Adobe ACTUALLY processed → restore it AS
+    // accepted (it spent quota and is held until rollover).
+    reactivateReservation: db.prepare(`UPDATE quota_reservations SET active = 1, accepted = 1 WHERE work_order_id = ?`),
+    getReservation: db.prepare(`SELECT * FROM quota_reservations WHERE work_order_id = ?`),
+    sumActiveDaily: db.prepare(`
+      SELECT COALESCE(SUM(count), 0) AS s FROM quota_reservations
+       WHERE ims_org_id = ? AND utc_date = ? AND active = 1
+    `),
+    sumActiveMonthly: db.prepare(`
+      SELECT COALESCE(SUM(count), 0) AS s FROM quota_reservations
+       WHERE ims_org_id = ? AND utc_year_month = ? AND active = 1
     `),
 
     // ─── Recovery (startup reconciliation) ────────────────────────────
@@ -553,33 +787,27 @@ function prepared() {
       SELECT w.*,
              j.creds_id      AS j_creds_id,
              j.sandbox_name  AS j_sandbox_name,
-             j.name          AS j_name,
-             j.monthly_limit AS j_monthly_limit
+             j.name          AS j_name
         FROM work_orders w JOIN jobs j ON j.id = w.job_id
        WHERE w.status = 'submitting' AND w.adobe_workorder_id IS NULL
     `),
     // Per-job reconcilable orphans — includes both 'submitting' (uncertain
-    // submit) and 'failed' (e.g. previous-buggy-behaviour where a timeout
-    // marked the WO failed and released quota even though Adobe processed
-    // it). For 'failed' rows the caller needs to re-reserve quota if it
-    // finds the WO in Adobe; for 'submitting' rows the quota was never
-    // released, so no re-reservation is needed.
+    // submit) and 'failed' (a timeout marked the WO failed even though Adobe
+    // processed it). For 'failed' matches the caller re-activates the WO's
+    // reservation (review R4 #1).
     listReconcilableOrphansForJob: db.prepare(`
       SELECT w.*,
              j.creds_id      AS j_creds_id,
              j.sandbox_name  AS j_sandbox_name,
-             j.name          AS j_name,
-             j.monthly_limit AS j_monthly_limit,
-             j.daily_limit   AS j_daily_limit
+             j.name          AS j_name
         FROM work_orders w JOIN jobs j ON j.id = w.job_id
        WHERE w.job_id = ?
          AND w.adobe_workorder_id IS NULL
          AND w.status IN ('submitting', 'failed')
     `),
-    rollbackWorkOrderToPlanned: db.prepare(`
-      UPDATE work_orders SET status = 'planned', last_error = ?, updated_at = datetime('now')
-       WHERE id = ?
-    `),
+    // (rollbackWorkOrderToPlanned was removed in R6 #1 — recovery never auto-rolls
+    //  an uncertain orphan back to 'planned' because that risked a duplicate
+    //  irreversible delete; a no-match is now INDETERMINATE, left in 'submitting'.)
 
     // ─── App settings (Phase 3) ────────────────────────────────────
     listAppSettingsByPrefix: db.prepare(
@@ -647,4 +875,63 @@ export function bulkInsertIdentities(rows) {
   return tx(rows);
 }
 
+/**
+ * Insert a batch of identity rows AND bump the job counters in ONE transaction
+ * (review #1). The empty-graph fail-closed guard reads jobs.graph_members_seen,
+ * and crash-recovery skips sources based on COMMITTED expanded_identities rows.
+ * If the rows committed but the counter increment didn't (separate
+ * transactions, crash in between), a resume would skip those sources, leave the
+ * counter at 0, and the guard would be bypassed — marking a source-only job
+ * 'expanded'. Binding both into one transaction makes that state impossible:
+ * either the rows AND the counters commit, or neither does.
+ *
+ * @param {Array<[job_id, ns_code, ns_id, identity_id, source_id]>} rows
+ * @param {number} sourcesProcessed  source IDs handled in this batch (→ processed_count)
+ * @param {number} membersSeen       linked members Adobe returned (→ graph_members_seen)
+ * @param {string} jobId
+ * @returns {number} rows inserted (= rows.length)
+ */
+export function insertIdentitiesAndCount(rows, sourcesProcessed, membersSeen, jobId) {
+  const p = prepared();
+  const tx = db.transaction(() => {
+    for (const r of rows) p.insertIdentity.run(r[0], r[1], r[2], r[3], r[4]);
+    p.incrementJobCounters.run(sourcesProcessed, rows.length, membersSeen, jobId);
+    return rows.length;
+  });
+  return tx();
+}
+
 export const q = () => prepared();
+
+/**
+ * Durably commit the submit-intent (status='submitting') BEFORE the
+ * non-idempotent hygiene POST. If this write were lost to power loss, the WO
+ * would revert to 'planned' on restart and could be resubmitted — a duplicate
+ * irreversible delete (review #8).
+ *
+ * We keep synchronous=NORMAL globally for expansion throughput, and make ONLY
+ * this one commit durable by flipping synchronous=FULL around it. In WAL mode,
+ * synchronous=FULL fsyncs the WAL on commit, so this transition (and every
+ * un-fsynced frame before it, including the preceding reserve) is flushed to
+ * disk. Crucially this is NOT a wal_checkpoint — a checkpoint blocks on
+ * concurrent readers (busy_timeout) and could freeze the whole single-threaded
+ * server for the duration of a long CSV export (review #6). An fsync-on-commit
+ * does not block on readers.
+ *
+ * Returns true on success; false (caller fails closed, does not POST) only if
+ * the write itself errors.
+ */
+export function setWorkOrderSubmittingDurable(workOrderId, displayName = null) {
+  const prev = db.pragma('synchronous', { simple: true });   // numeric (1 = NORMAL)
+  try {
+    db.pragma('synchronous = FULL');
+    // Persist status='submitting' AND the exact displayName to be POSTed, so
+    // orphan recovery can match Adobe's stored value even after a crash (R6 #2).
+    prepared().setWorkOrderSubmittingWithName.run({ id: workOrderId, displayName });
+    return true;
+  } catch {
+    return false;
+  } finally {
+    try { db.pragma(`synchronous = ${Number(prev) || 1}`); } catch { /* restore best-effort */ }
+  }
+}

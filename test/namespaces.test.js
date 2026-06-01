@@ -62,6 +62,16 @@ test('canonicalizeNamespace: both null inputs return {code:null, id:null}', () =
   assert.equal(result.id, null);
 });
 
+test('canonicalizeNamespace: non-numeric nsid yields id:null, never NaN', () => {
+  // Number('abc') === NaN, which JSON.stringify turns into null and pollutes
+  // the work-order payload's namespace.id. A bad nsid must degrade to null so
+  // we fall back to the code (review hardening: validate ids as finite ints).
+  const result = canonicalizeNamespace({ ns: 'email', nsid: 'not-a-number' });
+  assert.equal(result.id, null);
+  assert.equal(result.code, 'email');
+  assert.ok(!Number.isNaN(result.id));
+});
+
 test('canonicalizeNamespace: code fills in id from index when id missing', () => {
   const idx = buildNamespaceIndex([{ id: 6, code: 'email' }]);
   const result = canonicalizeNamespace({ ns: 'email' }, idx);

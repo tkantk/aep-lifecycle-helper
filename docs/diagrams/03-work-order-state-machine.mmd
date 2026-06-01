@@ -47,8 +47,8 @@ flowchart TB
   MonPoll -->|"status = failed"| Ffinal
 
   SUBing -->|"startup recovery<br/>or POST /reconcile<br/>(found by displayName)"| SUBed
-  F -->|"POST /reconcile<br/>(found in Adobe;<br/>re-reserves quota)"| SUBed
-  SUBing -->|"reconcile:<br/>confirmed absent"| P
+  F -->|"POST /reconcile<br/>(found in Adobe;<br/>reactivates quota)"| SUBed
+  SUBing -->|"OPERATOR confirms absent in Adobe UI →<br/>release-absent (R7 #1).<br/>REFUSED 409 while POST in flight (R8 #1)<br/>or a reconcile lookup is in flight (R9 #1)"| P
 
   classDef start  fill:#FFF4D6,stroke:#F29423,stroke-width:2px,color:#1A1A1A
   classDef gate   fill:#FFF4D6,stroke:#F29423,stroke-width:2px,color:#1A1A1A

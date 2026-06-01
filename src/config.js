@@ -7,6 +7,22 @@ import path from 'node:path';
 
 const cwd = process.cwd();
 
+// DATA_DIR is the single root for ALL runtime state. db/uploads/output derive
+// from it so that pointing DATA_DIR outside a cloud-sync path (the documented
+// OneDrive mitigation) actually relocates the SQLite DB too — not just the
+// encryption key (review finding #5). Each sub-path still has its own explicit
+// override for advanced setups.
+const dataDir = process.env.DATA_DIR || path.join(cwd, 'data');
+
+// Resolve a numeric env var, PRESERVING an explicit 0 (the naive `|| default`
+// wrongly turns 0 back into the default). Empty/unset/NaN → fallback.
+function numEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : fallback;
+}
+
 /**
  * Detect when `dataDir` lives inside a cloud-sync path (OneDrive, Dropbox,
  * Google Drive, iCloud). The encryption key + encrypted client secrets live
@@ -33,13 +49,17 @@ export const config = {
   // endpoints aren't exposed to other hosts on the network. Set HOST=0.0.0.0
   // explicitly only when you intend to expose it (e.g. SSH tunnel demo).
   host: process.env.HOST || '127.0.0.1',
+  // Binding anywhere other than loopback exposes the UNAUTHENTICATED,
+  // destructive API to the network. Require an explicit opt-in so it can
+  // never happen by a stray HOST=0.0.0.0 alone (review hardening).
+  allowNonLoopback: process.env.ALLOW_NON_LOOPBACK === '1',
   openBrowser: process.env.OPEN_BROWSER !== '0',
 
   // ─── Paths ─────────────────────────────────────────────────────────
-  dataDir: process.env.DATA_DIR || path.join(cwd, 'data'),
-  dbPath: process.env.DB_PATH || path.join(cwd, 'data', 'state.db'),
-  uploadDir: process.env.UPLOAD_DIR || path.join(cwd, 'data', 'uploads'),
-  outputDir: process.env.OUTPUT_DIR || path.join(cwd, 'data', 'output'),
+  dataDir,
+  dbPath: process.env.DB_PATH || path.join(dataDir, 'state.db'),
+  uploadDir: process.env.UPLOAD_DIR || path.join(dataDir, 'uploads'),
+  outputDir: process.env.OUTPUT_DIR || path.join(dataDir, 'output'),
 
   // ─── Adobe endpoints ───────────────────────────────────────────────
   ims: {
@@ -70,14 +90,32 @@ export const config = {
   workOrderConcurrency: Number(process.env.WORK_ORDER_CONCURRENCY) || 2,
   maxIdsPerWorkOrder: Number(process.env.MAX_IDS_PER_WORK_ORDER) || 100_000,
   dailyIdentifierLimit: Number(process.env.DAILY_IDENTIFIER_LIMIT) || 1_000_000,
-  // Monthly identifier cap is contract-dependent. Default 3M/month matches
-  // the typical base Data Hygiene entitlement; override via env or the Config
-  // tab to match your contract. Set to 0 to disable monthly tracking.
-  monthlyIdentifierLimit: Number(process.env.MONTHLY_IDENTIFIER_LIMIT) || 3_000_000,
+  // Monthly identifier cap — FALLBACK ONLY (live Adobe /quota wins). Adobe
+  // always enforces a monthly cap, so there is no "disable monthly" option
+  // (review R4 #4); a 0 is coerced to the 3M default, never "unlimited".
+  monthlyIdentifierLimit: numEnv('MONTHLY_IDENTIFIER_LIMIT', 3_000_000) || 3_000_000,
   requestTimeoutMs: Number(process.env.REQUEST_TIMEOUT_MS) || 60_000,
+
+  // Fraction (0..0.95) of each Adobe quota held back as headroom for CONCURRENT
+  // EXTERNAL writers (review R6 #3). This tool's zero-over-ship guarantee covers
+  // only ITS OWN accounting: Adobe `/quota` is ORG-WIDE and we snapshot it once
+  // per submit run, so another UI user / API client / second helper instance in
+  // the same org can consume quota between our snapshot and our submit, and we
+  // can't see it until the next run. If you CANNOT guarantee this tool is the
+  // only writer, set e.g. QUOTA_SAFETY_BUFFER=0.1 to reserve 10% as a margin.
+  // Default 0 assumes operational exclusivity. Clamped to [0, 0.95] so a typo
+  // can never drive the effective cap to zero-or-negative.
+  quotaSafetyBuffer: Math.min(0.95, Math.max(0, numEnv('QUOTA_SAFETY_BUFFER', 0))),
 
   // ─── Security ──────────────────────────────────────────────────────
   // 32-byte hex key used to encrypt client secrets at rest. Auto-generated
   // and stored in data/ on first run if not provided. Don't commit this.
   encryptionKey: process.env.ENCRYPTION_KEY,
+
+  // When the Identity Graph returns ZERO linked members across an ENTIRE fresh
+  // expansion, that is the wrong-region / wrong-nsid / empty-graph fingerprint
+  // and we fail closed (a source-only deletion would silently leave linked
+  // identities alive — review finding #2). Set to 1 only when you have
+  // deliberately confirmed the sources genuinely have no linked identities.
+  allowEmptyGraph: process.env.ALLOW_EMPTY_GRAPH === '1',
 };

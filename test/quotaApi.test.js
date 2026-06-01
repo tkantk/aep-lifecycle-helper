@@ -73,6 +73,20 @@ test('getOrgQuota handles missing quotas gracefully', async () => {
   assert.equal(result.datasetExpiration, null);
 });
 
+test('getOrgQuota rejects null/non-integer consumed (Number(null)===0 fail-open)', async () => {
+  // Review #4: { consumed: null } must NOT become 0 (full remaining). null,
+  // booleans, arrays, strings and non-integers are all malformed → entry null.
+  for (const bad of [null, true, [1], '900', 1.5, -1]) {
+    mockIms();
+    nock(AEP_GATEWAY).get(QUOTA_PATH).reply(200, {
+      quotas: [{ name: 'dailyConsumerDeleteIdentitiesQuota', consumed: bad, quota: 1_000_000 }],
+    });
+    const r = await getOrgQuota(baseCreds(), { refresh: true });
+    assert.equal(r.daily, null, `consumed=${JSON.stringify(bad)} must yield daily=null, not a fake remaining`);
+    nock.cleanAll(); _clearCache();
+  }
+});
+
 test('getOrgQuota handles missing remaining (consumed=0 case)', async () => {
   mockIms();
   nock(AEP_GATEWAY).get(QUOTA_PATH).reply(200, {

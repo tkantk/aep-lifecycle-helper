@@ -44,11 +44,13 @@ flowchart TB
     Boot --> Lookup
     Manual --> Lookup
 
-    Lookup -->|"found in Adobe"| FixIt["record Adobe WO ID<br/>flip to <b>SUBMITTED</b><br/>(re-reserve quota if was failed)"]
-    Lookup -->|"absent + was submitting"| Rollback["<b>roll back to PLANNED</b><br/>release quota<br/>(next submit retries cleanly)"]
-    Lookup -->|"absent + was failed"| Stay["leave as failed<br/>(confirmed)"]
+    Lookup -->|"found in Adobe"| FixIt["record Adobe WO ID<br/>flip to <b>SUBMITTED</b><br/>markAccepted (reactivate if was failed)"]
+    Lookup -->|"no match + was submitting"| Indet["<b>INDETERMINATE</b><br/>leave in SUBMITTING<br/>HOLD reservation<br/>(absence unproven — R6 #1)"]
+    Lookup -->|"no match + was failed"| Stay["leave as failed<br/>(4xx — never processed)"]
     Lookup -->|"Adobe 400 / network"| Leave["leave as-is<br/>(retry on next boot)"]
   end
+
+  Indet -.->|"operator verifies absent in Adobe UI<br/>POST .../release-absent {confirmedAbsent}"| OpRelease["<b>release + reset to PLANNED</b><br/>(operator-confirmed, R7 #1)"]
 
   Uncertain -.->|"next boot"| Boot
   Failed -.->|"operator clicks<br/>↻ Reconcile banner"| Manual
@@ -67,4 +69,4 @@ flowchart TB
   class Submitted,FixIt,Done ok
   class Deferred,Uncertain warn
   class Failed,Stay bad
-  class Quota,Pick,Submit,Boot,Manual,Rollback,Leave,Monitor proc
+  class Quota,Pick,Submit,Boot,Manual,Indet,OpRelease,Leave,Monitor proc

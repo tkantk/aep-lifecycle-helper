@@ -163,15 +163,18 @@ with auto-populated forms and live quota banners.
 │              │      fresh numbers (work may shift to a later month).
 │              │   c. For each planned OR deferred order in target
 │              │      (month, day) bucket (p-limit 2):
-│              │       - reserve(imsOrgId, count, dailyLimit, monthlyLimit)
-│              │         — atomic SQLite UPSERT, both dimensions.
+│              │       - reserve({workOrderId, imsOrgId, count, dailyLimit,
+│              │         monthlyLimit}) — per-WO row; caps are live /quota
+│              │         × (1 − QUOTA_SAFETY_BUFFER) (R5/R6).
 │              │       - If not granted → mark 'deferred', skip.
 │              │       - If granted → POST /data/core/hygiene/workorder.
 │              │         POST is non-idempotent: NO retry on 5xx/network.
 │              │         Log if Adobe operationCount diverges from total.
-│              │       - On success: persist adobe_workorder_id.
-│              │       - On failure: release(count, monthlyLimit), mark
-│              │         'failed'.
+│              │       - On 2xx: persist adobe_workorder_id + markAccepted(woId).
+│              │       - On 4xx: release(woId) (guarded WHERE accepted=0),
+│              │         mark 'failed'.
+│              │       - On 5xx/timeout/network (UNCERTAIN): keep 'submitting',
+│              │         HOLD the reservation, reconcile later (R5/R6).
 │              │  CSP guard against re-emitting identity content:
 │              │  ReplanForbiddenError (409) if any WO has shipped.
 └──────┬───────┘
@@ -413,8 +416,9 @@ Our code handles both.
   (e.g. `hashedKocid`) need the numeric nsid to reliably match clusters.
 - Parses both response shapes: extracts `data.clusters` OR `data` itself
   depending on which form was returned.
-- Matches each cluster to its source by `compositeXid.id` (falls back to
-  array position if absent).
+- Matches each cluster to its source STRICTLY by `compositeXid.id` — no
+  positional fallback (review R4 #2). Fails closed on any unmatched source,
+  on `unprocessedXids`/`unprocessedNids`, or on an unrecognized shape.
 - Each `member.nsid` is canonicalized via the namespace registry to fill in
   the missing `code`. If the registry has no hit, the row is still stored
   with only the nsid — Adobe's Hygiene API accepts namespace groups with
@@ -537,7 +541,8 @@ Origin or Referer), and registerUuidParamGuards on `:id` / `:credsId`.
 | POST | `/api/jobs/:id/plan` | Build work-order plan. Server-side fetches `/quota` first; planner emits initial day-bucketed WOs then redistributor re-buckets into month×day. Returns `{ planned, days, months, perMonthCounts, totalIdentifiers, shiftedFromPrevious, previousMonths, quota }`. 503 with `quota_unavailable` if Adobe is unreachable + no recent cache |
 | POST | `/api/jobs/:id/approve-month` | Flip `awaiting_approval` → `planned` for `{ monthIndex }` (≥ 2). 400 for monthIndex=1/non-integer; 404 if no awaiting WOs |
 | POST | `/api/jobs/:id/submit` | Kick off submission. Body: `{ dayIndex?, monthIndex? }`. Server runs redistributor against fresh `/quota` before picking work. Submit's failure handling differentiates Adobe-4xx (mark `failed` + release quota) from 5xx/timeout/network (keep `submitting`, hold quota — reconcile later) |
-| POST | `/api/jobs/:id/reconcile` | Per-job orphan reconciliation. Scans every WO with `adobe_workorder_id IS NULL` AND `status IN ('submitting','failed')`. For each, looks up Adobe by `displayName`. Outcomes: `matched` (record Adobe ID, flip to submitted, re-reserve quota if was failed), `rolledBack` (submitting + confirmed absent → planned + release), `stillFailed` (failed + confirmed absent → leave), `indeterminate` (Adobe 4xx on lookup → leave), `perWoError` (per-WO failures). Returns counts |
+| POST | `/api/jobs/:id/reconcile` | Per-job orphan reconciliation. Scans every WO with `adobe_workorder_id IS NULL` AND `status IN ('submitting','failed')`. Looks each up by its persisted `display_name` (R6 #2). Outcomes: `matched` (record Adobe ID; non-terminal → submitted, terminal Adobe status → local completed/failed + completed_at per R10 #2; `markAccepted`/`reactivate`), `indeterminate` (submitting **no-match OR 4xx** → leave in submitting, hold quota — never auto-roll-back, R6 #1), `stillFailed` (failed + not-listed → leave as failed but AMBIGUOUS; a no-match doesn't prove absence (R6 #1), stays `failure_definitive=0` so ordinary delete fail-closes per R11), `perWoError`. `rolledBack` is always 0 (kept for response shape). Returns counts |
+| POST | `/api/jobs/:id/work-orders/:woId/release-absent` | Operator-confirmed resolution for a stuck indeterminate orphan (R7 #1). Body `{ confirmedAbsent: true }` REQUIRED. Releases the held reservation + resets the WO to `planned` for retry, in one transaction (R8 #2). Fail-closed: 409 if the WO has an Adobe ID, an `accepted` reservation, its POST is still in flight (R8 #1), OR a reconciliation lookup is in flight for it (R9 #1 — a refcounted guard; releasing during a lookup that may find it in Adobe would duplicate); only a settled `submitting` orphan is eligible |
 | GET  | `/api/jobs/:id/work-orders` | All work orders (month_index + day_index + per-service status from product_status_details) |
 | GET  | `/api/jobs/:id/export` | Download expanded identities CSV (formula-injection sanitised). Uses `prepareStreamIdentitiesBySource()` for a FRESH prepared statement per request — overlapping exports cannot collide on a single Statement's one-iterator-per-stmt rule (2026-05-29 'statement busy' fix) |
 | DELETE | `/api/jobs/:id` | Hard-delete a job + cascade through `expanded_identities` and `work_orders`. 409 with `{error:'in_flight'}` when any WO is `submitting`/`submitted`/`received`/`validated`/`ingested`. `?force=true` bypasses; Adobe-side deletes continue but local tracking is dropped. Best-effort unlinks upload + exported CSV |
@@ -734,10 +739,11 @@ Full DDL in `src/db.js::initDb()`. Summary:
     UPSERT against both daily and monthly ledgers (monthly skipped if null).
   - If granted, posts to Adobe (hygiene POST is non-idempotent — see
     CLAUDE.md I11).
-  - On success, updates work_orders row.
-  - On failure, calls `release(orgId, count, monthlyLimit)` before
-    re-throwing — monthlyLimit gate prevents bleed into other jobs' monthly
-    counters when monthly tracking was off for this job.
+  - On 2xx, updates work_orders row + `markAccepted(woId)` (the reservation is
+    held until period rollover, R5).
+  - On 4xx, `release(woId)` (guarded WHERE accepted=0) + mark 'failed'.
+  - On 5xx/timeout/network (UNCERTAIN), keeps 'submitting' and HOLDS the
+    reservation — Adobe may have processed it; recovery reconciles later (R5/R6).
 
 ### Status monitor
 - `setInterval(60_000, tick)`.
@@ -785,8 +791,9 @@ Full DDL in `src/db.js::initDb()`. Summary:
   succeeds", the work order is left in `submitting` with no Adobe ID.
   `runner/recovery.js::reconcileOrphanWorkOrders()` runs at startup and
   reconciles via `GET /hygiene/workorder?displayName=...`:
-    - On match → record the Adobe ID and let the monitor take over.
-    - On confirmed no-match → roll back to `planned` and `release` quota.
+    - On match → record the Adobe ID + markAccepted; let the monitor take over.
+    - On no-match → leave in `submitting`, reservation HELD; NEVER auto-roll-back
+      (R6 #1 — absence unproven). Operator resolves via release-absent (R7 #1).
     - On 400 (filter not supported) OR transient 5xx/network error →
       leave the row alone for next-startup retry. Never roll back when
       the answer is indeterminate — that would risk a duplicate Adobe
@@ -916,7 +923,7 @@ Documented in `CLAUDE.md` but critical for review:
 
 ## 10. Test coverage and gaps
 
-**197 tests** as of the current codebase (`npm test`). Recent additions
+**231 tests** as of the current codebase (`npm test`). Recent additions
 (late-May 2026 hardening pass) extended coverage to: per-job orphan
 reconciliation, the `DELETE /api/jobs/:id` route with the in-flight
 guard, the `prepareStreamIdentitiesBySource()` Statement-per-call
@@ -942,8 +949,9 @@ before fast-csv runs.
   client_name / region, never touches the encrypted secret or the
   identity-key fields (`credentialsRoutes.test.js`).
 - Recovery reconciliation — orphan work orders without an Adobe ID are
-  matched, rolled back, or left alone depending on the Adobe response
-  (`recovery.test.js`).
+  matched (→ submitted) or left in `submitting` (no-match / indeterminate →
+  reservation held, never auto-rolled-back, R6 #1) depending on the Adobe
+  response (`recovery.test.js`).
 
 **Phase 1 — live quota (`quotaApi.test.js`, 8 tests)**
 - Cache miss → fresh Adobe fetch, result returned.
@@ -1108,16 +1116,17 @@ Please consider these explicitly in your audit:
     semantics vs. the event loop.)
 
 ### Error handling
-12. When `submitWorkOrder` throws, we call `release(count, monthlyLimit)`.
-    What if Adobe accepted the POST but we timed out waiting for the
-    response? The work order is created on their side but we "released"
-    the quota. Mitigation: the hygiene POST is non-idempotent (CLAUDE.md
-    I11) so we never silently double-fire on a retry; the orphan-recovery
-    routine on next startup attempts to reconcile via `GET /hygiene/
-    workorder?displayName=…`. On match it records the Adobe ID without
-    re-submitting. On 400 from the listing endpoint it leaves the row in
-    `submitting` rather than rolling back, so we don't create a duplicate
-    work order on the next submit.
+12. When `submitWorkOrder` throws we split by certainty: a **4xx** calls
+    `release(woId)` (guarded, refunds only un-acked work) + marks 'failed'; a
+    **5xx/timeout/network** is UNCERTAIN — Adobe may have created the WO, so we
+    do NOT release; the reservation stays HELD and the WO stays `submitting`.
+    The hygiene POST is non-idempotent (CLAUDE.md I11) so we never silently
+    double-fire on a retry; orphan recovery reconciles via `GET /hygiene/
+    workorder?displayName=…` (the persisted name, R6 #2). On match → record the
+    Adobe ID + markAccepted, no re-submit. On ANY no-match (recognized-empty,
+    400, network) → leave in `submitting`, reservation held; NEVER auto-roll-back
+    (R6 #1). The operator resolves a verified-absent one via release-absent
+    (R7 #1), gated against a still-in-flight POST (R8 #1).
 
 13. The retry logic retries on 401 (token refresh) and 429 (rate-limit;
     Adobe didn't process the request). 5xx and network errors retry only

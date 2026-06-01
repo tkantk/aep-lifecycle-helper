@@ -2,7 +2,7 @@ import pLimit from 'p-limit';
 import { expandBatch } from '../services/identityGraph.js';
 import { listNamespaces, buildNamespaceIndex } from '../services/namespaces.js';
 import { snapshotAndResetRateLimitHits } from '../services/adobeClient.js';
-import { bulkInsertIdentities, q } from '../db.js';
+import { insertIdentitiesAndCount, q } from '../db.js';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { streamIds } from '../utils/csv.js';
@@ -62,24 +62,61 @@ export async function runExpansion({
       namespacesJson: JSON.stringify(namespaces),
     });
   } catch (err) {
-    logger.warn({ err: err.message }, 'namespace registry load failed - proceeding without canonicalization');
-    namespaceIndex = undefined;
+    // FAIL CLOSED (review finding #10). Without the registry we can't
+    // canonicalize linked identities to {code,id}, and we can't resolve the
+    // source namespace's nsid — the Identity Graph would very likely return
+    // empty clusters and the operator would delete ONLY the source ids while
+    // the linked email/phone/CRMID survive (the silent-partial-delete failure
+    // mode, same family as I9). Abort rather than expand blind.
+    logger.error({ jobId, err: err.message },
+      'namespace registry load failed — aborting expansion (cannot canonicalize / resolve nsid)');
+    q().updateJobStatus.run('failed', `namespace registry load failed: ${err.message}`, jobId);
+    liveProgress.delete(jobId);
+    throw err;
   }
 
   // Custom namespaces (like hashedKocid) often need the numeric nsid to resolve
   // clusters reliably. If the caller gave us a code but no nsid, look the nsid
   // up in the registry now — sending both `ns` and `nsid` on /clusters/members
   // avoids empty responses for ambiguous custom-namespace codes.
-  let resolvedNsid = sourceNamespaceId;
-  if (resolvedNsid == null && namespaceIndex && sourceNamespace) {
+  // Defense-in-depth (review finding #8): normalize a non-finite/garbage nsid
+  // to null so the registry-resolution path below fires and a NaN can never be
+  // templated into the /clusters/members body. Catches a bad nsid from ANY
+  // caller (recovery, tests, future code), not just the upload route.
+  // Normalize a supplied nsid to a finite non-negative integer or null (review
+  // #8): Number('abc')===NaN must never reach the wire.
+  let resolvedNsid = Number.isInteger(sourceNamespaceId) && sourceNamespaceId >= 0
+    ? sourceNamespaceId : null;
+
+  // Validate the source namespace against the registry — FAIL CLOSED on any
+  // ambiguity (reviews #5 + #8 + #10):
+  //   (a) the code MUST exist in the org's registry (whether or not an nsid was
+  //       supplied — previously this was only checked when no nsid was given,
+  //       so a supplied nsid bypassed it, review #5);
+  //   (b) if both a code and an nsid are present, they MUST match exactly;
+  //   (c) when no nsid was supplied, resolve it from the registry.
+  // Expanding against an unrecognized/mismatched namespace would return empty
+  // clusters and delete only the source ids — a silent partial delete.
+  const failClosed = (msg) => {
+    logger.error({ jobId, sourceNamespace }, msg);
+    q().updateJobStatus.run('failed', msg, jobId);
+    liveProgress.delete(jobId);
+    throw new Error(msg);
+  };
+  if (namespaceIndex && sourceNamespace) {
     const hit = namespaceIndex.byCode.get(sourceNamespace);
-    if (hit) {
-      resolvedNsid = Number(hit.id);
+    if (!hit) {
+      failClosed(`source namespace "${sourceNamespace}" not found in the sandbox's namespace registry`);
+    }
+    const rid = Number(hit.id);
+    const regId = Number.isInteger(rid) && rid >= 0 ? rid : null;
+    if (resolvedNsid == null) {
+      resolvedNsid = regId;   // resolve from registry (may stay null if registry id is corrupt → code-only)
       logger.info({ jobId, sourceNamespace, resolvedNsid }, 'resolved source namespace nsid from registry');
-    } else {
-      const available = [...namespaceIndex.byCode.keys()].slice(0, 20);
-      logger.warn({ jobId, sourceNamespace, availableSample: available },
-        'source namespace code not found in registry — Identity Graph will likely return empty clusters');
+    } else if (regId != null && regId !== resolvedNsid) {
+      failClosed(
+        `source namespace "${sourceNamespace}" maps to nsid ${hit.id} in the registry, but nsid ` +
+        `${resolvedNsid} was supplied — refusing to expand against a mismatched code/nsid pair`);
     }
   }
 
@@ -102,7 +139,7 @@ export async function runExpansion({
 
   // ─── Per-batch timing instrumentation ─────────────────────────────────
   // Tracks rolling p50/p95 of `adobeMs` (Identity Graph round-trip) and
-  // `sqliteMs` (bulkInsertIdentities) over a 50-batch window so we can
+  // `sqliteMs` (insertIdentitiesAndCount) over a 50-batch window so we can
   // spot a slowdown the moment it starts. Every BATCHES_PER_SUMMARY
   // batches the runner emits an aggregate log line — a flat
   // sustained p95 means the bottleneck is environmental (Adobe rate
@@ -154,8 +191,10 @@ export async function runExpansion({
       }
 
       const t1 = Date.now();
-      const inserted = bulkInsertIdentities(rows);
-      q().incrementJobCounters.run(batch.length, inserted, jobId);
+      // Rows + counters in ONE transaction so a crash can't leave committed
+      // rows with a stale graph_members_seen (which a resume would then skip,
+      // bypassing the empty-graph guard) — review #1.
+      const inserted = insertIdentitiesAndCount(rows, batch.length, linkedTotal, jobId);
       const sqliteMs = Date.now() - t1;
 
       progress.processed += batch.length;
@@ -273,6 +312,27 @@ export async function runExpansion({
 
   try {
     await drainWave();
+
+    // FAIL CLOSED on an all-empty graph (review finding #2). When the job
+    // processed real sources but the Identity Graph returned ZERO linked
+    // members across ALL of them, that is the wrong-region / wrong-nsid /
+    // 200-empty fingerprint — proceeding would emit a source-ONLY deletion
+    // plan, silently leaving every linked email/phone/CRMID alive. We read the
+    // PERSISTED, cumulative counters (not run-local) so this is correct even
+    // when a previous run crashed mid-expansion and this is a resume: a fresh
+    // run that crashed before this check still incremented graph_members_seen
+    // per batch, so a genuinely-empty graph stays 0 across the resume too.
+    // Honor an explicit operator override.
+    const finalJob = q().getJob.get(jobId);
+    if (!config.allowEmptyGraph &&
+        finalJob.processed_count > 0 && (finalJob.graph_members_seen || 0) === 0) {
+      throw new Error(
+        `Identity Graph returned 0 linked identities across all ${finalJob.processed_count} source(s) — ` +
+        `this usually means a wrong region/namespace for this sandbox. Refusing to ship a ` +
+        `source-only deletion that would leave linked identities alive. ` +
+        `Verify the credential region and source namespace; set ALLOW_EMPTY_GRAPH=1 to override ` +
+        `if the sources genuinely have no linked identities.`);
+    }
 
     // With deferred dedup (no unique index), found_count was incremented with
     // raw insert counts that may include duplicates. Overwrite with the true

@@ -148,6 +148,20 @@ function validateTargetServices(targetServices, datasetId) {
  * All validation runs BEFORE we touch the network - if this throws, nothing
  * was sent to Adobe.
  */
+/**
+ * Canonicalize a work-order displayName to EXACTLY what Adobe will store, so the
+ * value submission persists (work_orders.display_name) byte-equals what this POST
+ * sends and orphan recovery's exact-match lookup always works (review R6 #2 +
+ * trailing-whitespace fix). IDEMPOTENT: trim both ends, cap at Adobe's 255 limit,
+ * then trimEnd again to drop any space the 255-cut may have left — applying it a
+ * second time is a no-op, so re-normalizing in submitWorkOrder below can never
+ * diverge from the stored copy. MUST be the single source of truth used by BOTH
+ * submission.js (to persist) and submitWorkOrder (to send).
+ */
+export function normalizeDisplayName(name) {
+  return String(name).trim().slice(0, 255).trimEnd();
+}
+
 export async function submitWorkOrder({
   creds, sandboxName, datasetId, displayName, description,
   targetServices, namespacesIdentities,
@@ -163,7 +177,7 @@ export async function submitWorkOrder({
   const body = {
     action: 'delete_identity',
     datasetId: normalizedDs,
-    displayName: String(displayName).trim().slice(0, 255),
+    displayName: normalizeDisplayName(displayName),
     description: String(description || '').slice(0, 1000),
     namespacesIdentities: groups,
   };

@@ -1,5 +1,6 @@
 import path from 'node:path';
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import dotenv from 'dotenv';
 import express from 'express';
@@ -16,6 +17,109 @@ dotenv.config({ path: path.join(__dirname, '..', '.env') });
 
 const { config, detectCloudSyncPath } = await import('./config.js');
 const { logger } = await import('./utils/logger.js');
+
+// ─── Refuse non-loopback bind without explicit acknowledgment ───────────
+// The API has no authentication and submits irreversible deletes. Binding to
+// anything other than loopback exposes it to the network, so a stray
+// HOST=0.0.0.0 must be paired with ALLOW_NON_LOOPBACK=1 (review hardening).
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', 'localhost']);
+if (!LOOPBACK_HOSTS.has(config.host) && !config.allowNonLoopback) {
+  logger.error(
+    `Refusing to bind to non-loopback host "${config.host}" without ALLOW_NON_LOOPBACK=1. ` +
+    `This API is unauthenticated and performs irreversible deletions — exposing it to the ` +
+    `network is dangerous. Set ALLOW_NON_LOOPBACK=1 only for an SSH-tunneled/trusted setup.`);
+  process.exit(1);
+}
+
+// ─── Ensure data directories exist ──────────────────────────────────────
+fs.mkdirSync(config.dataDir, { recursive: true });
+fs.mkdirSync(config.uploadDir, { recursive: true });
+fs.mkdirSync(config.outputDir, { recursive: true });
+fs.mkdirSync(path.dirname(config.dbPath), { recursive: true });
+
+// ─── Single-process advisory lock (acquire BEFORE opening SQLite) ────────
+// Two instances against the SAME database file corrupt the WAL (no multi-
+// writer coordination). Key the lock on the canonical DB PATH — NOT DATA_DIR —
+// because DB_PATH can point elsewhere, so two different DATA_DIRs could still
+// share one database file (review finding #6). Acquire it BEFORE importing
+// db.js, which opens the connection at module-eval time, so the connection is
+// never opened while another instance holds the lock. Reclaim only a stale
+// lock whose recorded pid is no longer alive. Released on shutdown.
+const lockPath = config.dbPath === ':memory:' ? null : path.resolve(config.dbPath) + '.lock';
+// The token THIS process wrote into the lock file (set on acquire). Shutdown
+// verifies the lock still holds OUR token before unlinking, so we never remove
+// a lock a successor reclaimed after we were declared stale (review R5 #6).
+let lockToken = null;
+
+// Synchronous sleep — startup runs synchronously before the server. Atomics.wait
+// blocks the thread without a busy-loop.
+function sleepSync(ms) {
+  try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* */ }
+}
+function readLockHolder(p) {
+  try { return fs.readFileSync(p, 'utf8').trim(); } catch { return null; }
+}
+
+function acquireSingleProcessLock() {
+  if (!lockPath) return;   // in-memory DB has no shared file to guard
+  const myToken = `${process.pid}:${crypto.randomUUID()}`;
+  const tmpPath = `${lockPath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+
+  for (let attempt = 0; attempt < 8; attempt++) {
+    // Create the lock ATOMICALLY and ALREADY-POPULATED via link(): write the
+    // token to a temp file, then hard-link it onto the lock path. link() fails
+    // EEXIST if the lock is held, and — unlike open(O_EXCL)+write — the lock
+    // file is never observable in an EMPTY state, eliminating both the
+    // publication-window race (review #3) and the zero-byte strand (review #7).
+    fs.writeFileSync(tmpPath, myToken);
+    let linked = false;
+    try {
+      fs.linkSync(tmpPath, lockPath);
+      linked = true;
+    } catch (err) {
+      if (err.code !== 'EEXIST') { try { fs.unlinkSync(tmpPath); } catch { /* */ } throw err; }
+    }
+    try { fs.unlinkSync(tmpPath); } catch { /* */ }
+
+    if (linked) {
+      // Ownership verification — confirm the lock holds OUR token (defends
+      // against a racing reclaim+rewrite). If not, back off and retry.
+      if (readLockHolder(lockPath) === myToken) { lockToken = myToken; return; }
+      sleepSync(25);
+      continue;
+    }
+
+    // Lock is held. Inspect the holder, with a GRACE RETRY for an empty lock
+    // (a legacy openSync-based writer mid-publication, or a crashed one).
+    let holder = readLockHolder(lockPath);
+    for (let g = 0; g < 5 && holder === ''; g++) { sleepSync(40); holder = readLockHolder(lockPath); }
+    if (holder === null) { sleepSync(25); continue; }   // vanished — retry
+
+    const pid = Number(String(holder).split(':')[0]);
+    const validPid = Number.isInteger(pid) && pid > 0;
+    let alive = false;
+    if (validPid) { try { process.kill(pid, 0); alive = true; } catch (e) { alive = e.code === 'EPERM'; } }
+
+    if (validPid && alive && pid !== process.pid) {
+      logger.error(
+        `Another instance (pid ${pid}) is already running against the database ${config.dbPath}. ` +
+        `Running two instances on one database corrupts the WAL. Stop the other instance first, ` +
+        `or point DB_PATH at a different database file.`);
+      process.exit(1);
+    }
+
+    // Dead pid, or genuinely-empty-after-grace (crashed publication) → reclaim.
+    // VERIFY the content is UNCHANGED since we read it before unlinking, so we
+    // never clobber a lock a fresh writer just published (review #3).
+    logger.warn({ staleHolder: holder || '(empty)' }, 'reclaiming stale/corrupt single-process lock');
+    if (readLockHolder(lockPath) === holder) { try { fs.unlinkSync(lockPath); } catch { /* */ } }
+    sleepSync(25);
+  }
+  throw new Error('could not acquire single-process lock after retries');
+}
+acquireSingleProcessLock();
+
+// ─── Now safe to open SQLite + load db-dependent modules (under the lock) ─
 const { initDb, db } = await import('./db.js');
 const { startMonitor, stopMonitor } = await import('./runner/monitor.js');
 const { runStartupRecovery } = await import('./runner/recovery.js');
@@ -29,10 +133,34 @@ const jobsRouter     = (await import('./routes/jobs.js')).default;
 const adobeRouter    = (await import('./routes/adobe.js')).default;
 const settingsRouter = (await import('./routes/settings.js')).default;
 
-// ─── Ensure data directories exist ──────────────────────────────────────
-fs.mkdirSync(config.uploadDir, { recursive: true });
-fs.mkdirSync(config.outputDir, { recursive: true });
-fs.mkdirSync(path.dirname(config.dbPath), { recursive: true });
+// ─── Purge orphaned upload files ────────────────────────────────────────
+// CSV uploads carry raw customer identifiers. Remove any upload file in the
+// upload dir that no job references (e.g. left behind by a force-deleted job
+// or an interrupted upload) so customer data isn't retained indefinitely
+// (review hardening). Job-referenced uploads are kept for crash-resume.
+// Only the helper's own uploads match this shape: <epoch-ms>_<uuid-v4>.<ext>
+// (see src/routes/upload.js multer storage filename). Restricting the purge to
+// it guarantees we never delete a file the tool didn't create, even if
+// UPLOAD_DIR points at a shared directory (review finding #7). Keep in lockstep
+// with the multer filename in upload.js.
+const GENERATED_UPLOAD_RE =
+  /^[0-9]+_[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\.(csv|txt|tsv)$/;
+function purgeOrphanedUploads() {
+  try {
+    const referenced = new Set(
+      db.prepare(`SELECT upload_path FROM jobs WHERE upload_path IS NOT NULL`)
+        .all().map(r => path.resolve(r.upload_path)));
+    let purged = 0;
+    for (const name of fs.readdirSync(config.uploadDir)) {
+      if (!GENERATED_UPLOAD_RE.test(name)) continue;   // not ours — never touch
+      const full = path.resolve(config.uploadDir, name);
+      if (!referenced.has(full)) { try { fs.unlinkSync(full); purged++; } catch { /* */ } }
+    }
+    if (purged > 0) logger.info({ purged }, 'purged orphaned upload files (no referencing job)');
+  } catch (err) {
+    logger.warn({ err: err.message }, 'orphaned-upload purge failed (non-fatal)');
+  }
+}
 
 // Warn loudly if `data/` sits inside a cloud-sync path — the encryption key
 // and all encrypted credentials live there. Syncing them to a third-party
@@ -47,6 +175,7 @@ if (cloudSync) {
 
 // ─── Init SQLite schema ─────────────────────────────────────────────────
 initDb();
+purgeOrphanedUploads();
 
 // ─── Express app ────────────────────────────────────────────────────────
 const app = express();
@@ -197,6 +326,14 @@ function shutdown(sig) {
     if (err) logger.error({ err: err.message }, 'server close error');
     try { db.pragma('wal_checkpoint(TRUNCATE)'); } catch (e) { logger.warn({ err: e.message }, 'wal_checkpoint failed'); }
     try { db.close(); } catch (e) { logger.warn({ err: e.message }, 'db close failed'); }
+    // Release the lock ONLY if it still holds OUR token. If we were wrongly
+    // declared stale and a successor reclaimed it, blindly unlinking would
+    // delete the successor's live lock and let a third instance in (review R5
+    // #6). Verify-then-unlink narrows (doesn't fully close) the TOCTOU window;
+    // that's acceptable for a best-effort local advisory lock.
+    if (lockPath && lockToken && readLockHolder(lockPath) === lockToken) {
+      try { fs.unlinkSync(lockPath); } catch { /* best-effort lock release */ }
+    }
     clearTimeout(timer);
     logger.info('shutdown complete');
     process.exit(0);

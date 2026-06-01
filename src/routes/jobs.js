@@ -1,7 +1,8 @@
 import { Router } from 'express';
 import { q, prepareStreamIdentitiesBySource } from '../db.js';
 import { planWorkOrders, runSubmission } from '../runner/submission.js';
-import { reconcileJobOrphans } from '../runner/recovery.js';
+import { reconcileJobOrphans, releaseAbsentOrphan } from '../runner/recovery.js';
+import { isWorkOrderReconciling } from '../runner/postingState.js';
 import { peek as peekQuota } from '../services/quotaManager.js';
 import { getOrgQuota } from '../services/quotaApi.js';
 import { decryptCreds } from '../utils/crypto.js';
@@ -150,13 +151,22 @@ router.post('/:id/submit', async (req, res, next) => {
       return next(err);
     }
 
-    // The actual submission runs async — we kick it off, return 200, and the
-    // UI polls /work-orders for progress. Errors (including quota_unavailable
-    // from runSubmission's pre-flight refresh) are logged; the operator sees
-    // the deferred/failed state on the next /work-orders poll.
-    runSubmission({ jobId: job.id, dayIndex, monthIndex }).catch(err =>
-      logger.error({ jobId: job.id, err: err.message, code: err.code }, 'submission run crashed'));
-    res.json({ ok: true });
+    // The actual submission runs async — we kick it off and return 200. So a
+    // preflight failure (e.g. quota_unavailable) isn't lost, PERSIST it to the
+    // job on rejection, making it observable via GET /api/jobs/:id instead of
+    // only logged (review finding #10). The UI polls and surfaces
+    // job.last_error. On a SUCCESSFUL run, runSubmission's final
+    // updateJobStatus(..., null, ...) clears last_error — so we deliberately do
+    // NOT clear here (a clear-at-start could be wiped by a no-op concurrent
+    // submit and erase a real error).
+    runSubmission({ jobId: job.id, dayIndex, monthIndex }).catch(err => {
+      logger.error({ jobId: job.id, err: err.message, code: err.code }, 'submission run crashed');
+      try {
+        const prefix = err.code === 'quota_unavailable' ? 'Submit blocked: ' : 'Submit failed: ';
+        q().setJobError.run(prefix + (err.message || String(err)), job.id);
+      } catch (e) { logger.warn({ jobId: job.id, err: e.message }, 'failed to persist submit error'); }
+    });
+    res.json({ ok: true, async: true });
   } catch (err) { next(err); }
 });
 
@@ -223,9 +233,16 @@ router.post('/:id/approve-month', (req, res, next) => {
  *  Response: { matched, rolledBack, indeterminate, stillFailed, perWoError, total }
  *
  *  - matched        → found in Adobe, status now 'submitted', Adobe ID recorded
- *  - rolledBack     → 'submitting' WO confirmed absent in Adobe → 'planned'
- *  - stillFailed    → 'failed' WO confirmed absent in Adobe → left as 'failed'
- *  - indeterminate  → Adobe rejected the lookup query (400); retry later
+ *                     (markAccepted, or reactivate if it was 'failed')
+ *  - indeterminate  → a 'submitting' WO with NO match (absence unproven — async
+ *                     creation may lag) OR a 400 from the lookup. Left in
+ *                     'submitting' with its reservation HELD for operator
+ *                     reconciliation; NEVER auto-rolled-back (review R6 #1).
+ *  - stillFailed    → 'failed' WO not listed in Adobe — left as 'failed' but
+ *                     AMBIGUOUS (a no-match doesn't prove absence, R6 #1); stays
+ *                     failure_definitive=0 so ordinary delete fail-closes (R11)
+ *  - rolledBack     → always 0 (R6 #1 removed auto-rollback; field kept for
+ *                     response-shape stability)
  *  - perWoError     → other failures (credentials missing, network) — left as-is
  */
 router.post('/:id/reconcile', async (req, res, next) => {
@@ -239,6 +256,24 @@ router.post('/:id/reconcile', async (req, res, next) => {
     const result = await reconcileJobOrphans(job.id);
     logger.info({ jobId: job.id, ...result }, 'reconcile complete');
     res.json({ ok: true, ...result });
+  } catch (err) { next(err); }
+});
+
+/** Operator-confirmed resolution for an indeterminate orphan (review R7 #1).
+ *  The operator must have VERIFIED in Adobe's Data Lifecycle UI (by the WO's
+ *  persisted displayName) that the work order does not exist there. Requires
+ *  `{ confirmedAbsent: true }`. Releases the held reservation and resets the WO
+ *  to 'planned' for a clean retry. Fail-closed: refuses any WO Adobe acked
+ *  (has an Adobe ID, or an accepted reservation) — see releaseAbsentOrphan. */
+router.post('/:id/work-orders/:woId/release-absent', (req, res, next) => {
+  try {
+    if (req.body?.confirmedAbsent !== true) {
+      const err = new Error('confirmedAbsent: true is required — verify in Adobe that this work order does not exist before releasing it for retry (releasing a WO Adobe actually processed would create a duplicate delete)');
+      err.status = 400; err.code = 'confirmation_required'; err.publicMessage = err.message;
+      return next(err);
+    }
+    const result = releaseAbsentOrphan(req.params.id, req.params.woId);
+    res.json(result);
   } catch (err) { next(err); }
 });
 
@@ -278,12 +313,17 @@ router.get('/:id/export', async (req, res, next) => {
  *  anyway; the Adobe-side deletions continue independently — only local
  *  tracking is lost.
  *
- *  States considered "in flight":
+ *  States considered "in flight" (block without --force):
  *    submitting → POST to Adobe in progress
  *    submitted, received, validated, ingested → Adobe is processing it
- *  States safe to delete without --force:
+ *  Also blocked without --force (review R11 #1):
+ *    any WO with a reconciliation lookup in flight (deleting races it)
+ *    a 'failed' WO with NO Adobe ID that is NOT a definitive 4xx — an
+ *      ambiguous legacy/timeout outcome Adobe may actually have processed
+ *  Safe to delete without --force:
  *    planned, deferred, awaiting_approval → never went to Adobe
- *    completed, failed → terminal
+ *    completed / Adobe-acked failed (has an ID) → terminal, reservation kept
+ *      as a tombstone; definitive-4xx failed → Adobe never created it
  *
  *  Does NOT refund quota. The local ledger reflects what Adobe actually
  *  processed; force-deleting an in-flight WO doesn't un-consume that quota
@@ -319,6 +359,43 @@ router.delete('/:id', async (req, res, next) => {
       return next(err);
     }
 
+    // R11 #1 — fail closed on AMBIGUOUS work orders whose Adobe outcome isn't
+    // settled, so an ordinary delete can't erase quota tracking for work Adobe
+    // actually did. Two cases:
+    //   (a) a reconciliation lookup is in flight for a WO — deleting now would
+    //       race it (the lookup may find the WO in Adobe + re-reserve quota);
+    //   (b) a 'failed' WO with NO Adobe ID that is NOT a definitive 4xx
+    //       rejection — a legacy/timeout outcome Adobe may have processed.
+    // The synchronous check + delete below means no reconcile can interleave
+    // between this check and the cascade. ?force=true is the explicit operator
+    // override (you may lose quota tracking for work Adobe actually did).
+    const reconciling     = wos.filter(w => isWorkOrderReconciling(w.id));
+    const ambiguousFailed = wos.filter(w => w.status === 'failed' && !w.adobe_workorder_id && !w.failure_definitive);
+    if ((reconciling.length > 0 || ambiguousFailed.length > 0) && !force) {
+      const reasons = [];
+      if (reconciling.length > 0)     reasons.push(`${reconciling.length} being reconciled with Adobe right now`);
+      if (ambiguousFailed.length > 0) reasons.push(`${ambiguousFailed.length} failed locally but never confirmed absent in Adobe (Adobe may have processed them)`);
+      const err = new Error(
+        `Cannot delete: ${reasons.join('; ')}. Run Reconcile — it auto-settles any work order Adobe ` +
+        `actually has (recording its ID). For any that stay unconfirmed, Adobe's list is ` +
+        `eventually-consistent so a missing entry does NOT prove absence: verify in Adobe's Data ` +
+        `Lifecycle UI, then pass ?force=true to delete anyway (forcing may lose quota tracking for ` +
+        `work Adobe actually performed).`
+      );
+      err.status = 409; err.code = 'unsettled';
+      err.publicMessage = err.message;
+      err.reconcilingCount = reconciling.length;
+      err.ambiguousFailedCount = ambiguousFailed.length;
+      return next(err);
+    }
+
+    // Drop this job's quota reservations FIRST (while its work_orders still
+    // exist for the status subquery). STATUS-AWARE (review R5 #2): never-sent
+    // (planned/deferred/awaiting_approval) and already-inactive reservations are
+    // refunded; an ACTIVE reservation for a WO that WAS sent to Adobe is KEPT as
+    // a tombstone (Adobe spent that quota — refunding it would over-ship). The
+    // tombstone survives the cascade (no FK) and expires at period rollover.
+    q().deleteReservationsForJob.run({ jobId });
     // CASCADE FK constraints on expanded_identities + work_orders collapse all
     // dependent rows in this single statement (the deletion is atomic).
     q().deleteJob.run(jobId);

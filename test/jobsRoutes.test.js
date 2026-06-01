@@ -34,6 +34,7 @@ const { initDb, q } = await import('../src/db.js');
 const jobsRouter = (await import('../src/routes/jobs.js')).default;
 const { makeErrorHandler } = await import('../src/middleware/security.js');
 const { logger } = await import('../src/utils/logger.js');
+const { markPosting, unmarkPosting, markReconciling, unmarkReconciling } = await import('../src/runner/postingState.js');
 
 let server;
 let baseUrl;
@@ -219,16 +220,197 @@ test('DELETE /api/jobs/:id?force=true deletes anyway when WOs are in flight', as
   assert.equal(q().getJob.get(jobId), undefined);
 });
 
-test('DELETE /api/jobs/:id treats planned/deferred/awaiting_approval/completed/failed as safe', async () => {
+test('R5 finding #2: force-delete keeps a sent WO\'s accepted reservation (tombstone) but refunds a never-sent one', async () => {
+  const jobId = insertJob();
+  const sentWo    = insertWorkOrder(jobId, 'submitted');   // reached Adobe — quota spent
+  const plannedWo = insertWorkOrder(jobId, 'planned');     // never sent
+  const today = new Date().toISOString().slice(0, 10);
+  const month = new Date().toISOString().slice(0, 7);
+  q().upsertReservation.run({ workOrderId: sentWo, imsOrgId: 'fd-org@AcmeOrg', utcDate: today, utcMonth: month, count: 100_000 });
+  q().markAcceptedReservation.run(sentWo);                 // Adobe acked it
+  q().upsertReservation.run({ workOrderId: plannedWo, imsOrgId: 'fd-org@AcmeOrg', utcDate: today, utcMonth: month, count: 50_000 });
+
+  const res = await request('DELETE', `/api/jobs/${jobId}?force=true`);
+  assert.equal(res.status, 200);
+  assert.equal(q().getJob.get(jobId), undefined, 'job is gone');
+
+  const sentRes = q().getReservation.get(sentWo);
+  assert.ok(sentRes && sentRes.active === 1,
+    'accepted/sent reservation survives force-delete as a tombstone (refunding it would over-ship)');
+  assert.equal(q().getReservation.get(plannedWo), undefined,
+    'never-sent reservation is refunded — Adobe never received it');
+});
+
+// ─── R7 #1: per-WO operator "confirmed absent → release & retry" ────────────
+
+function reserveFor(woId, org, count = 5) {
+  const today = new Date().toISOString().slice(0, 10);
+  const month = new Date().toISOString().slice(0, 7);
+  q().upsertReservation.run({ workOrderId: woId, imsOrgId: org, utcDate: today, utcMonth: month, count });
+}
+
+test('R7 #1: release-absent REQUIRES explicit confirmation', async () => {
+  const jobId = insertJob();
+  const woId = insertWorkOrder(jobId, 'submitting');
+  const res = await request('POST', `/api/jobs/${jobId}/work-orders/${woId}/release-absent`, {});
+  assert.equal(res.status, 400);
+  assert.equal(res.body.error, 'confirmation_required');
+  // Unchanged — no confirmation, no action.
+  assert.equal(q().getAllOrdersForJob.all(jobId).find(w => w.id === woId).status, 'submitting');
+});
+
+test('R7 #1: release-absent on a confirmed-absent submitting orphan releases its reservation + resets to planned', async () => {
+  const jobId = insertJob();
+  const woId = insertWorkOrder(jobId, 'submitting');
+  reserveFor(woId, 'abs-org@AcmeOrg');                       // pending (accepted=0)
+  const res = await request('POST', `/api/jobs/${jobId}/work-orders/${woId}/release-absent`, { confirmedAbsent: true });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.status, 'planned');
+  assert.equal(q().getAllOrdersForJob.all(jobId).find(w => w.id === woId).status, 'planned');
+  assert.equal(q().getReservation.get(woId).active, 0, 'reservation released for a clean retry');
+});
+
+test('R7 #1: release-absent REFUSES a WO that already has an Adobe work-order ID', async () => {
+  const jobId = insertJob();
+  const woId = insertWorkOrder(jobId, 'submitting');
+  q().updateWorkOrderSubmitted.run({ id: woId, adobeWorkorderId: 'DI-already', adobeStatus: 'received', bundleId: null, submittedAt: null });
+  const res = await request('POST', `/api/jobs/${jobId}/work-orders/${woId}/release-absent`, { confirmedAbsent: true });
+  assert.equal(res.status, 409, 'a WO Adobe acknowledged can never be marked absent');
+});
+
+test('R7 #1: release-absent REFUSES when the reservation is already accepted (defensive)', async () => {
+  const jobId = insertJob();
+  const woId = insertWorkOrder(jobId, 'submitting');
+  reserveFor(woId, 'abs2-org@AcmeOrg');
+  q().markAcceptedReservation.run(woId);                     // accepted=1 (Adobe spent it)
+  const res = await request('POST', `/api/jobs/${jobId}/work-orders/${woId}/release-absent`, { confirmedAbsent: true });
+  assert.equal(res.status, 409);
+  assert.equal(q().getReservation.get(woId).active, 1, 'accepted reservation must NOT be released');
+  assert.equal(q().getAllOrdersForJob.all(jobId).find(w => w.id === woId).status, 'submitting', 'status unchanged');
+});
+
+test('R7 #1: release-absent 404 for an unknown work order', async () => {
+  const jobId = insertJob();
+  const res = await request('POST', `/api/jobs/${jobId}/work-orders/${uuid()}/release-absent`, { confirmedAbsent: true });
+  assert.equal(res.status, 404);
+});
+
+test('R7 #1: release-absent rejects a malformed (non-UUID) woId with 400', async () => {
+  const jobId = insertJob();
+  const res = await request('POST', `/api/jobs/${jobId}/work-orders/not-a-uuid/release-absent`, { confirmedAbsent: true });
+  assert.equal(res.status, 400);
+  assert.equal(res.body.error, 'invalid_id');
+});
+
+test('R8 #1: release-absent REFUSES while the WO POST is still in flight (no race release)', async () => {
+  const jobId = insertJob();
+  const woId = insertWorkOrder(jobId, 'submitting');
+  reserveFor(woId, 'posting-org@AcmeOrg');
+  markPosting(woId);                              // simulate a live in-flight POST
+  try {
+    const res = await request('POST', `/api/jobs/${jobId}/work-orders/${woId}/release-absent`, { confirmedAbsent: true });
+    assert.equal(res.status, 409, 'cannot release a WO whose POST may still 2xx');
+    assert.equal(res.body.error, 'posting');
+    assert.equal(q().getReservation.get(woId).active, 1, 'reservation NOT released during the in-flight window');
+    assert.equal(q().getAllOrdersForJob.all(jobId).find(w => w.id === woId).status, 'submitting', 'status unchanged');
+  } finally {
+    unmarkPosting(woId);
+  }
+});
+
+test('R9 #1: release-absent REFUSES while a reconciliation lookup is in flight for the WO', async () => {
+  const jobId = insertJob();
+  const woId = insertWorkOrder(jobId, 'submitting');
+  reserveFor(woId, 'reconciling-org@AcmeOrg');
+  markReconciling(woId);                          // simulate an in-flight Adobe lookup
+  try {
+    const res = await request('POST', `/api/jobs/${jobId}/work-orders/${woId}/release-absent`, { confirmedAbsent: true });
+    assert.equal(res.status, 409, 'cannot release while a reconcile may still find the WO in Adobe');
+    assert.equal(res.body.error, 'reconciling');
+    assert.equal(q().getReservation.get(woId).active, 1, 'reservation NOT released');
+    assert.equal(q().getAllOrdersForJob.all(jobId).find(w => w.id === woId).status, 'submitting', 'status unchanged');
+  } finally {
+    unmarkReconciling(woId);
+  }
+});
+
+test('R9 #1: release-absent bumps the WO attempt counter (invalidates a stale reconcile)', async () => {
+  const jobId = insertJob();
+  const woId = insertWorkOrder(jobId, 'submitting');
+  reserveFor(woId, 'attempt-org@AcmeOrg');
+  const before = q().getWorkOrderAttempt.get(woId).attempt;
+  const res = await request('POST', `/api/jobs/${jobId}/work-orders/${woId}/release-absent`, { confirmedAbsent: true });
+  assert.equal(res.status, 200);
+  assert.equal(q().getWorkOrderAttempt.get(woId).attempt, before + 1, 'attempt bumped so a stale reconcile result is discarded');
+});
+
+test('R8 #2: release + status-reset are atomic — a write failure rolls back the release', async () => {
+  const jobId = insertJob();
+  const woId = insertWorkOrder(jobId, 'submitting');
+  reserveFor(woId, 'atomic-org@AcmeOrg');         // active=1, accepted=0
+  // Inject a failure into the SECOND write (the status reset), after the guarded
+  // release has run inside the transaction.
+  const orig = q().updateWorkOrderStatus;
+  q().updateWorkOrderStatus = { run: () => { throw new Error('simulated status write failure'); } };
+  try {
+    const res = await request('POST', `/api/jobs/${jobId}/work-orders/${woId}/release-absent`, { confirmedAbsent: true });
+    assert.equal(res.status, 500, 'the write failure surfaces as an error');
+  } finally {
+    q().updateWorkOrderStatus = orig;             // restore before reading state
+  }
+  assert.equal(q().getReservation.get(woId).active, 1, 'release was ROLLED BACK with the failed status write (atomic)');
+  assert.equal(q().getAllOrdersForJob.all(jobId).find(w => w.id === woId).status, 'submitting', 'status unchanged');
+});
+
+test('DELETE /api/jobs/:id treats planned/deferred/awaiting_approval/completed + settled-failed as safe', async () => {
   const jobId = insertJob();
   insertWorkOrder(jobId, 'planned');
   insertWorkOrder(jobId, 'deferred');
   insertWorkOrder(jobId, 'awaiting_approval');
   insertWorkOrder(jobId, 'completed');
-  insertWorkOrder(jobId, 'failed');
+  // A DEFINITIVE 4xx failure (Adobe never created it) — settled, safe to delete.
+  const def = insertWorkOrder(jobId, 'failed');
+  q().markWorkOrderFailedDefinitive.run('Adobe 400 validation error', def);
+  // An Adobe-acked failed (has an ID, terminal) — we KNOW Adobe has it, so not
+  // ambiguous. updateWorkOrderReconciledMatch maps adobeStatus 'failed' → local
+  // 'failed' + completed_at (R10 #2).
+  const acked = insertWorkOrder(jobId, 'submitting');
+  q().updateWorkOrderReconciledMatch.run({ id: acked, adobeWorkorderId: 'DI-ackedfail', adobeStatus: 'failed', bundleId: null, submittedAt: null });
 
   const res = await request('DELETE', `/api/jobs/${jobId}`);
-  assert.equal(res.status, 200);   // none of these are "in flight to Adobe"
+  assert.equal(res.status, 200, 'settled states (incl. definitive-4xx + Adobe-acked failed) are safe');
+});
+
+test('R11 #1: DELETE refuses (409 unsettled) an AMBIGUOUS failed WO (no Adobe ID, not definitive) without force', async () => {
+  const jobId = insertJob();
+  insertWorkOrder(jobId, 'failed');   // legacy/ambiguous: no Adobe ID, failure_definitive=0
+  const res = await request('DELETE', `/api/jobs/${jobId}`);
+  assert.equal(res.status, 409);
+  assert.equal(res.body.error, 'unsettled');
+  assert.ok(q().getJob.get(jobId), 'job NOT deleted — its failed WO may be real Adobe work');
+});
+
+test('R11 #1: DELETE ?force=true deletes an ambiguous failed WO (explicit operator override)', async () => {
+  const jobId = insertJob();
+  insertWorkOrder(jobId, 'failed');
+  const res = await request('DELETE', `/api/jobs/${jobId}?force=true`);
+  assert.equal(res.status, 200);
+  assert.equal(q().getJob.get(jobId), undefined);
+});
+
+test('R11 #1: DELETE refuses (409 unsettled) while a WO is being reconciled, without force', async () => {
+  const jobId = insertJob();
+  const woId = insertWorkOrder(jobId, 'failed');
+  q().markWorkOrderFailedDefinitive.run('4xx', woId);   // definitive so only the reconciling guard blocks
+  markReconciling(woId);
+  try {
+    const res = await request('DELETE', `/api/jobs/${jobId}`);
+    assert.equal(res.status, 409);
+    assert.equal(res.body.error, 'unsettled');
+    assert.ok(q().getJob.get(jobId), 'job NOT deleted while a reconcile lookup is in flight for it');
+  } finally {
+    unmarkReconciling(woId);
+  }
 });
 
 test('DELETE /api/jobs/:id unlinks the uploaded CSV', async () => {

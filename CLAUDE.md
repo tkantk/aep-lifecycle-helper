@@ -107,7 +107,17 @@ src/
 │   │                           fired-today guard. Iterates jobs with
 │   │                           un-shipped WOs via runSubmission.
 │   ├── monitor.js              setInterval(60s) status poll
-│   └── recovery.js             One-shot startup reconciliation of orphan work orders
+│   ├── postingState.js         In-memory sets of work orders in a state-
+│   │                           determining op RIGHT NOW: POST in flight (R8 #1)
+│   │                           or a reconcile lookup in flight (R9 #1).
+│   │                           release-absent refuses to act on either — a live
+│   │                           POST may still 2xx (over-ship), and a live lookup
+│   │                           may find the WO in Adobe (duplicate on retry).
+│   └── recovery.js             Startup reconciliation of orphan work orders
+│                               (refcounted reconcile guard + monotonic
+│                               unresolved-CAS + terminal finalise + bounded-
+│                               parallel lookups, R9/R10) + operator
+│                               release-absent action (R7 #1)
 │
 ├── routes/                     Express route modules
 │   ├── config.js               Credential CRUD + test
@@ -234,29 +244,90 @@ But the default should be to keep them together.
 
 The flow is:
 
-1. `reserve(imsOrgId, count, dailyLimit, monthlyLimit)` checks BOTH caps.
-   Denies with `reason: 'daily'` or `reason: 'monthly'` depending on which
-   cap would overflow. If both pass, both ledgers are incremented.
+1. `reserve({workOrderId, imsOrgId, count, dailyLimit, monthlyLimit})` checks
+   BOTH caps against `effective_used` (see the per-WO model below). Denies with
+   `reason: 'daily'` or `reason: 'monthly'`. On grant it records an active
+   per-WO reservation.
 2. If `granted === false`, the work order is marked `deferred`. Daily
    denials clear at UTC midnight; monthly denials clear at UTC first-of-month.
-3. If the subsequent Adobe submission **fails**, we call
-   `release(imsOrgId, count, monthlyLimit)` — decrementing the daily ledger
-   always, and the monthly ledger only when `monthlyLimit != null`. Without
-   this, a transient 500 would waste quota permanently.
+3. If the subsequent Adobe submission **fails (4xx)** — or the operator
+   confirms an uncertain orphan is absent in Adobe (R7 #1) — we call
+   `release(workOrderId)`, deactivating that WO's reservation. `release` is
+   GUARDED (`WHERE accepted = 0`): once Adobe has acked a WO it can NEVER be
+   refunded (see the lifecycle below). An UNCERTAIN failure (5xx/timeout/network)
+   does NOT release — the reservation is HELD for recovery (R5/R6).
 
-`monthlyLimit` can be `null` (or 0 from the UI) to disable monthly tracking
-for a job — useful for operators whose contract has no monthly cap. In that
-mode only the daily dimension is checked, AND `release` skips the monthly
-decrement so it can't eat headroom from unrelated jobs on the same org that
-have monthly tracking on. **Pass the same `monthlyLimit` you passed to
-`reserve` — `submission.js` and `recovery.js` both use `job.monthly_limit`.**
+**Per-work-order reservation model (review R4 #1) under the HOLD-UNTIL-ROLLOVER
+lifecycle (review R5, 2026-05-31).** The ledger separates Adobe's observed usage
+from our reservations:
 
-Any code that submits a work order MUST pair `reserve` with `release`
-in a try/catch. **Exception**: on network timeout we don't know if Adobe
-received the POST. `services/adobeClient.js`'s retry guard never retries
-the hygiene POST on network errors OR 5xx (see I11), so the double-submit
-risk is minimal, but the quota may undercount. Reconcile by checking
-Adobe's actual usage if precise accounting matters.
+```
+effective_used(period) = adobe_floor(period) + Σ active reservations(period)
+```
+
+- **`adobe_floor`** (per period, in `quota_usage`/`_monthly`) = Adobe's observed
+  org-wide consumed. Raised in exactly ONE way: `seedFloor(org, daily.consumed,
+  monthly.consumed)` (MAX with live `/quota`, at the top of every submit run; MAX
+  never lowers it). Tracked SEPARATELY from our reservations so `seedFloor` can
+  never absorb/lose them. **Nothing else touches the floor.**
+- **`quota_reservations`** — one row per WO (`count`, its own `utc_date` +
+  `utc_year_month`, `active`, **`accepted`**). Lifecycle:
+  - `reserve({workOrderId,…})` → `active=1, accepted=0` (PENDING). Grants iff
+    `effective_used + count` stays within BOTH caps.
+  - `markAccepted(woId)` → `accepted=1`. Adobe ACKED the POST (2xx) — or recovery
+    matched the orphan in Adobe — so Adobe has spent the quota.
+  - `release(woId)` → `active=0` **IFF `accepted=0`** (refund only un-acked work).
+  - `reactivate(woId)` → `active=1, accepted=1` (a 'failed' WO Adobe DID process).
+
+**R5 critical — why there is NO mid-period drop and NO `complete()`:** Adobe's
+`/quota` is org-wide and eventually-consistent with NO per-tool attribution. A
+floor RISE is never proof that OUR specific accepted work entered it — a
+concurrent external hygiene job in the same org can push the floor up while ours
+still lags. So R4.1's deactivate-on-terminal, AND every timer/floor-delta
+"assimilation drop", can deactivate a reservation whose count is NOT yet in the
+floor → `effective_used` understates true consumption → the next `reserve`
+OVER-SHIPS an irreversible delete. A 5-agent adversarial design review
+(2026-05-31) reproduced this for every drop heuristic. The ONLY provably-safe
+rule: an accepted reservation is **HELD until the UTC day/month rolls over**
+(Adobe's period counter resets then too), at which point the period-keyed SUM
+simply stops matching it. The monitor updates DISPLAY status only — it never
+touches quota. Over-defer (holding slightly too long; the floor + held reservation
+transiently double-count) is the SAFE direction and self-corrects at rollover;
+over-ship is irreversible. **Do not add any mid-period drop — `complete()` was
+removed for this reason. Do not un-guard `release()`.**
+
+**Force-delete + GC must not refund accepted work (review R5 #2):**
+`db.deleteReservationsForJob` is STATUS-AWARE — it refunds only inactive or
+never-sent (`planned`/`deferred`/`awaiting_approval`) reservations and KEEPS an
+active reservation whose WO was sent to Adobe as a TOMBSTONE (survives the cascade
+— no FK — and counts until period rollover). `db.gcOrphanReservations` deletes
+only orphans that no longer count (inactive, or a prior-month tombstone); a
+current-month active tombstone is kept.
+
+**Upgrade safety (review R5 #3):** `initDb` runs idempotent backfills — folds a
+pre-R4 `quota_usage.used` into `adobe_floor` (so a conservative hold survives the
+upgrade), and stamps `accepted=1` on any pre-R5 active reservation whose WO had
+already reached Adobe (so `release`'s `accepted=0` guard can't refund it).
+
+Monthly is **ALWAYS** tracked (review R4 #4 removed "0 = disable monthly"). Live
+`/quota` caps win; `job.monthly_limit` + config are fallbacks. Submission requires
+a FRESH `/quota` (refuses `stale`, review R4 #2). Any code that submits MUST pair
+`reserve(woId,…)` with `markAccepted(woId)` on a 2xx and `release(woId)` on a 4xx.
+
+Any code that submits a work order MUST settle the reservation by certainty:
+`markAccepted(woId)` on a 2xx, `release(woId)` on a 4xx. On an UNCERTAIN failure
+(network timeout / 5xx) we do NOT know if Adobe received the POST, so we do NOT
+release — the reservation stays HELD (so the ledger never undercounts what Adobe
+may have spent), the WO stays `submitting`, and orphan recovery reconciles it by
+its persisted displayName (R6 #2). `services/adobeClient.js`'s retry guard never
+retries the hygiene POST on network errors OR 5xx (see I11), so there is no
+silent double-submit. A genuinely-absent uncertain orphan is resolved by the
+operator via `release-absent` (R7 #1), gated against a still-in-flight POST
+(R8 #1) AND an in-flight reconciliation lookup (R9 #1, refcounted). Reconcile
+writes are CAS-guarded to apply only while the WO is still an unresolved orphan
+(attempt unchanged + no Adobe ID + status submitting/failed), so concurrent
+reconcile results are monotonic and an already-terminal Adobe match is finalised
+to local completed/failed (R10 #1/#2).
 
 ### I6. Client secrets are encrypted at rest
 
@@ -329,6 +400,15 @@ to Adobe — all three are safe to re-plan over. The UI in `web/app.js`
 mirrors the guard: the Plan tab no longer auto-POSTs `/plan` on tab
 entry, and the "↻ Re-plan" button auto-disables once any order has
 shipped, with a tooltip explaining why.
+
+**Critical (2026-05-31, review blocker #1):** because re-plan is allowed
+while `deferred` rows exist, `db.js::deletePlannedOrders` MUST clear
+`deferred` too — it deletes `('planned','awaiting_approval','deferred')`.
+If it left `deferred` rows behind, the surviving deferred WO plus the
+freshly re-emitted planned WO would cover the SAME identities and the
+next Submit would ship both → duplicate irreversible delete. Any status
+that is on the "safe to re-plan over" list above MUST also be in
+`deletePlannedOrders`'s delete set. Keep the two lists in lockstep.
 
 **Phase 2 refinement (2026-05-15):** At the end of `planWorkOrders`,
 `markFutureMonthsAwaitingApproval` flips all Month 2+ WOs from `planned`
@@ -479,6 +559,17 @@ Adobe's `operationCount` in the POST work-order response is logged when it
 diverges from our pre-submit `total` — drift detector for identifier-
 counting discrepancies without needing a live delete to verify.
 
+**External-writer caveat (review R6 #3).** `/quota` is ORG-WIDE and we snapshot
+it ONCE per submit run, then grant local reservations against it. The R5
+hold-until-rollover model gives zero over-ship **for this tool's own
+accounting** — but it cannot see a CONCURRENT external writer (another UI user,
+API client, or a second helper instance in the same org) who consumes quota
+between our snapshot and our submit. The mitigations are operational: ensure
+this tool is the only writer, or set `QUOTA_SAFETY_BUFFER` (fraction 0..0.95,
+default 0) to hold back headroom. `runner/submission.js` applies it as
+`liveCap = floor(quota × (1 − buffer))`. Do NOT claim "zero over-ship" without
+this qualifier.
+
 ### I16. Configurable auto-resume scheduler is opt-in and routes through `runSubmission`
 
 `runner/scheduler.js` provides a setInterval(60s) tick that resubmits
@@ -545,10 +636,15 @@ Avoid:
   `err.originalMessage`. Tests in `test/adobeClient.test.js`.
 - Validation errors throw `WorkOrderValidationError` (in `hygiene.js`) —
   these are pre-network and safe.
-- Runtime errors from the Adobe API bubble up; the runner catches them,
-  marks the work order `failed`, stores the error message, and releases
-  the quota reservation (passing the job's `monthly_limit` so monthly
-  decrement is gated correctly — see I5).
+- Runtime errors from the Adobe submit are split by certainty (CLAUDE.md I11,
+  reviews R5/R6): a **4xx** (Adobe definitively rejected) marks the WO `failed`
+  and calls `release(woId)` — guarded `WHERE accepted=0`, so only un-acked work
+  is refunded. A **5xx / timeout / network** error is UNCERTAIN (Adobe may have
+  processed it); the WO stays `submitting` with its reservation **HELD** (NOT
+  released) for orphan recovery — releasing here would risk over-ship + a
+  duplicate on retry. Recovery never auto-rolls-back an uncertain orphan (R6 #1);
+  the operator resolves a confirmed-absent one via
+  `POST /api/jobs/:id/work-orders/:woId/release-absent` (R7 #1).
 
 ### Logging
 
@@ -626,18 +722,24 @@ These are NOT yet implemented but are worth flagging if the user asks:
 3. **Audit export.** We have `api_audit` in the schema but no write path
    yet. If the client needs SOC-style audit logs, wire logging in
    `adobeClient.js` to insert one row per Adobe call.
-4. **Implement the recovery list-without-filter fallback.** When Adobe's
-   `GET /hygiene/workorder?displayName=…` returns 400, the recovery
-   path currently leaves the orphan in `submitting` (safer than rolling
-   back, since rolling back risks duplicates). The originally documented
-   fallback was to list recent orders without the filter and match
-   client-side. Add it if Adobe ever breaks the displayName filter for
-   real and we need automated recovery rather than operator triage.
+4. **List-without-filter recovery fallback.** Recovery NEVER auto-rolls-back an
+   uncertain orphan (review R6 #1): on ANY no-match (recognized-empty list, 400,
+   or transient error) the WO is LEFT in `submitting` with its reservation HELD,
+   because Adobe's async work-order creation gives no read-after-write guarantee.
+   The operator-confirmed escape hatch IS implemented (see "Already done" below).
+   The remaining future enhancement: when Adobe's `displayName` filter itself
+   400s, fall back to listing recent orders WITHOUT the filter and matching
+   client-side, so reconciliation still works rather than going indeterminate.
 
 **Already done (don't ask again):**
 - Resume a job across restarts — `runner/recovery.js::resumeExpandingJobs`
   rebuilds `expanded_identities` source-ID set and resumes via
   `runExpansion(... skipSourceIds)`. Tests in `test/recovery.test.js`.
+- Operator-confirmed resolution for a stuck indeterminate orphan (review R7 #1)
+  — `POST /api/jobs/:id/work-orders/:woId/release-absent` (`recovery.js::
+  releaseAbsentOrphan`) + the per-WO "Confirmed absent → retry" button in the
+  Submit-tab reconcile banner. Fail-closed; requires `{confirmedAbsent:true}`.
+  Tests in `test/jobsRoutes.test.js`.
 
 ---
 
@@ -689,9 +791,11 @@ which require `https://platform-{region}.adobe.io` (region ∈ `va7`, `nld2`,
    costs a round-trip.
 6. Never add telemetry, analytics, or outbound calls beyond the documented
    Adobe endpoints.
-7. Run `node --test test` before suggesting a change is done. **113 tests
-   should pass** (as of the 2026-04-28 in-flight-first + sandbox-filter
-   session).
+7. Run `npm test` before suggesting a change is done (use `npm test`, NOT
+   `node --test test` — on Node ≥23 the bare `test` arg is treated as a test
+   name and silently runs nothing; `npm test` → `scripts/run-tests.mjs` which
+   enumerates `test/*.test.js`). **267 tests should pass** (as of the 2026-06-01
+   R11 delete-safety session — ambiguous-failed + reconciling delete guards).
 8. **After your change**, append a bullet to the current session in
    `docs/CHANGELOG.md` describing what + why. If you changed the module map,
    data flow, Adobe contract, or DB schema, also update `docs/ARCHITECTURE.md`.

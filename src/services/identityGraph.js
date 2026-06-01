@@ -1,7 +1,6 @@
 import { config } from '../config.js';
 import { createAdobeClient } from './adobeClient.js';
 import { canonicalizeNamespace } from './namespaces.js';
-import { logger } from '../utils/logger.js';
 
 /**
  * Identity Graph cluster expansion.
@@ -24,9 +23,13 @@ import { logger } from '../utils/logger.js';
  *   ...
  * ]
  *
- * Position in the response array matches position of the corresponding
- * input id. If Adobe returns fewer results than we sent, we iterate
- * by the input array and assume missing entries have empty identities.
+ * Each requested source is matched to its cluster STRICTLY by
+ * `compositeXid.id` (Adobe documents "one entry per requested XID regardless of
+ * cluster association"). There is NO positional fallback (review R4 #2) —
+ * guessing by array position could silently mis-assign one source's cluster to
+ * another. The batch FAILS CLOSED on any source Adobe didn't return, on
+ * Adobe-reported `unprocessedXids`/`unprocessedNids`, or on an unrecognized
+ * response shape, rather than emit a source-only partial delete.
  */
 
 // Defence-in-depth allowlist — see services/namespaces.js for the rationale.
@@ -73,7 +76,13 @@ export async function expandBatch({ creds, sandboxName, namespace, namespaceId, 
   const compositeXids = ids.map(id => {
     const x = { id };
     if (namespace) x.ns = namespace;
-    if (namespaceId != null) x.nsid = Number(namespaceId);
+    // Only template a FINITE nsid into the body. Guard null/undefined FIRST —
+    // Number(null) === 0 is finite, so a bare isFinite() check would wrongly
+    // send "nsid": 0 when no nsid was supplied. A NaN (from Number('abc'))
+    // would serialize as "nsid": null and could mis-target the graph — review
+    // finding #8. The upload route + expansion runner already coerce upstream;
+    // this is the last line of defense at the wire.
+    if (namespaceId != null && Number.isFinite(Number(namespaceId))) x.nsid = Number(namespaceId);
     return x;
   });
 
@@ -96,9 +105,33 @@ export async function expandBatch({ creds, sandboxName, namespace, namespaceId, 
   //
   // Members come back with nsid only (no ns code) in the current shape, so
   // canonicalizeNamespace fills in the code from the registry index.
-  const clustersArray = Array.isArray(data)
-    ? data
-    : (Array.isArray(data?.clusters) ? data.clusters : []);
+  // FAIL CLOSED on an unrecognized response shape (review #2). If it's neither
+  // the current object-with-clusters nor the legacy bare array, we can't safely
+  // interpret it — refuse rather than treat it as "empty" and emit source-only
+  // deletes.
+  const recognized = Array.isArray(data) || Array.isArray(data?.clusters);
+  if (!recognized) {
+    throw new Error(
+      `Identity Graph returned an unrecognized response shape ` +
+      `(keys=${Object.keys(data || {}).join(',') || typeof data}) — refusing to expand ` +
+      `against an unknown response (would risk source-only partial deletes).`);
+  }
+  const clustersArray = Array.isArray(data) ? data : data.clusters;
+
+  // FAIL CLOSED on Adobe-reported unprocessed identities (review #2). Adobe's
+  // documented response lists XIDs/NIDs it could NOT process in `unprocessedXids`
+  // / `unprocessedNids`. Emitting an unprocessed source as a deletion target
+  // would delete only its source id and leave its linked identities alive — a
+  // silent partial delete. Refuse the batch; the operator retries (resume skips
+  // already-processed sources). Lowering IDENTITY_CONCURRENCY usually clears it.
+  const unprocessedXids = Array.isArray(data?.unprocessedXids) ? data.unprocessedXids : [];
+  const unprocessedNids = Array.isArray(data?.unprocessedNids) ? data.unprocessedNids : [];
+  if (unprocessedXids.length || unprocessedNids.length) {
+    throw new Error(
+      `Identity Graph could not process ${unprocessedXids.length + unprocessedNids.length} ` +
+      `identity(ies) in this batch (unprocessedXids/unprocessedNids non-empty) — refusing to ` +
+      `emit a partial (source-only) deletion. Retry; lower IDENTITY_CONCURRENCY if it persists.`);
+  }
 
   // Match clusters to source IDs by compositeXid.id (preferred) rather than
   // array position — Adobe's documentation doesn't guarantee order, and
@@ -109,28 +142,19 @@ export async function expandBatch({ creds, sandboxName, namespace, namespaceId, 
     if (xid) clusterBySourceId.set(xid, c);
   }
 
-  // Diagnostic: if Adobe returned zero members across the whole batch, dump
-  // the raw response so the operator can see whether it's an unexpected shape,
-  // an auth error embedded in a 200, or a genuinely-empty batch.
-  const totalMembers = clustersArray.reduce((n, c) =>
-    n + ((c?.members?.length) || (c?.identities?.length) || 0), 0);
-  if (totalMembers === 0) {
-    logger.warn({
-      batchSize: ids.length,
-      firstXid: compositeXids[0],
-      responseShape: Array.isArray(data)
-        ? `array[${data.length}]`
-        : `object(keys=${Object.keys(data || {}).join(',')})`,
-      rawResponsePreview: JSON.stringify(data).slice(0, 2000),
-    }, 'identity-graph returned zero linked identities across whole batch');
-  }
-
   const sourceNs = canonicalizeNamespace(
     { ns: namespace, nsid: namespaceId }, namespaceIndex
   );
 
-  return ids.map((sourceId, i) => {
-    const cluster = clusterBySourceId.get(sourceId) || clustersArray[i] || {};
+  // REQUIRE every requested source to be matched by id — NO positional fallback
+  // (review #2). Adobe documents "one entry per requested XID regardless of
+  // cluster association"; a missing entry is anomalous (wrong region / partial
+  // response). Guessing by array position would silently mis-assign a source to
+  // another source's cluster. Fail closed on any unmatched source.
+  const unmatched = [];
+  const out = ids.map((sourceId) => {
+    const cluster = clusterBySourceId.get(sourceId);
+    if (!cluster) { unmatched.push(sourceId); return null; }
     const rawMembers = cluster.members || cluster.identities || [];
     const linkedIdentities = rawMembers.map(node => {
       const ns = canonicalizeNamespace(
@@ -140,4 +164,12 @@ export async function expandBatch({ creds, sandboxName, namespace, namespaceId, 
     });
     return { sourceId, sourceNamespace: sourceNs, linkedIdentities };
   });
+
+  if (unmatched.length) {
+    throw new Error(
+      `Identity Graph response did not include ${unmatched.length} of ${ids.length} ` +
+      `requested source identity(ies) (e.g. ${unmatched.slice(0, 3).join(', ')}) — refusing to ` +
+      `emit them as source-only deletions. Retry; verify the credential region and source namespace.`);
+  }
+  return out;
 }
