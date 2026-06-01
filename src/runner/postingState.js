@@ -1,25 +1,42 @@
 /**
- * In-process registry of work orders whose non-idempotent Adobe hygiene POST is
- * CURRENTLY in flight (review R8 #1).
+ * In-process registry of work orders that are in a STATE-DETERMINING operation
+ * right now — either their Adobe hygiene POST is in flight (review R8 #1), or a
+ * reconciliation lookup against Adobe is in flight for them (review R9 #1).
  *
- * A work order in status 'submitting' has TWO meanings: (a) its POST is in
- * flight right now, or (b) the POST settled UNCERTAIN (timeout / 5xx / network)
- * and is awaiting recovery. The operator "release-absent" action must act only
- * on (b): releasing a reservation while its POST may still 2xx would drop the
- * hold and over-ship a destructive, irreversible delete.
+ * Why this matters: a work order in status 'submitting' is ambiguous — the
+ * outcome may still be settling. The operator "release-absent" action (which
+ * releases the held reservation and resets the WO to 'planned' for retry) must
+ * NOT act on a WO whose fate is still being determined:
  *
- * This set is the precise signal for (a). It is intentionally IN-MEMORY: a
- * crash/restart kills any live POST, so a recovered crash-orphan is correctly
- * NOT considered posting and is eligible for resolution. The single-process
- * advisory lock (index.js) guarantees this set observes every in-flight POST.
+ *   • POST in flight — releasing while the POST may still 2xx would drop the
+ *     hold and over-ship a destructive, irreversible delete (R8 #1).
+ *   • Reconciliation lookup in flight — we are actively asking Adobe whether it
+ *     ALREADY has this WO. If the operator releases + retries during that
+ *     lookup, and Adobe did have the original, the retry creates a SECOND
+ *     irreversible delete (duplicate). The operator must wait for the lookup to
+ *     answer before deciding (R9 #1).
  *
- * Kept in its own module (importing nothing) so both runner/submission.js (which
- * marks/unmarks) and runner/recovery.js (which reads) can use it with zero risk
- * of a circular import.
+ * Both sets are IN-MEMORY by design. They track whether a LOCAL operation is
+ * currently in flight in THIS process — NOT whether Adobe received anything. A
+ * crash/restart ends any local POST or lookup (there is no live task left to
+ * complete it), so a recovered orphan is correctly not considered in-flight and
+ * is eligible for operator resolution. Whether Adobe actually accepted a
+ * crashed-mid-flight POST is unknowable locally — that is exactly why
+ * release-absent is OPERATOR-CONFIRMED (the operator verifies in Adobe's UI by
+ * the persisted displayName). The single-process advisory lock (index.js)
+ * guarantees these sets observe every in-flight operation.
+ *
+ * Kept in its own module (importing nothing) so runner/submission.js (POST) and
+ * runner/recovery.js (lookup + release-absent) share it with zero risk of a
+ * circular import.
  */
 
 const postingWoIds = new Set();
-
 export function markPosting(workOrderId)   { postingWoIds.add(workOrderId); }
 export function unmarkPosting(workOrderId) { postingWoIds.delete(workOrderId); }
 export function isWorkOrderPosting(workOrderId) { return postingWoIds.has(workOrderId); }
+
+const reconcilingWoIds = new Set();
+export function markReconciling(workOrderId)   { reconcilingWoIds.add(workOrderId); }
+export function unmarkReconciling(workOrderId) { reconcilingWoIds.delete(workOrderId); }
+export function isWorkOrderReconciling(workOrderId) { return reconcilingWoIds.has(workOrderId); }

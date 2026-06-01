@@ -118,6 +118,53 @@ test('R6 #1: Adobe list has no match for an uncertain POST → INDETERMINATE (st
   assert.match(wo.last_error || '', /unconfirmed|not yet listed|reconcil/i);
 });
 
+test('R9 #1: a reconcile DISCARDS a FOUND result if the WO changed during the awaited lookup (CAS)', async () => {
+  // The duplicate-delete race: a reconcile snapshots the orphan, awaits the Adobe
+  // lookup, and during that await the operator releases + retries the WO. Applying
+  // the (now stale) FOUND result would clobber local state. The attempt-CAS
+  // discards it. (The reconciling guard normally blocks the release entirely;
+  // this proves the defense-in-depth CAS independently.)
+  const { jobId } = seedCredAndJob({ name: 'cas-found' });
+  const localId = `wo-casf-${seq}`;
+  const name = `Delete cas-found - WO ${localId}`;
+  seedOrphanWorkOrder(jobId, localId);
+  reserve({ workOrderId: localId, imsOrgId: `org-${seq}@AcmeOrg`, count: 2, dailyLimit: 1_000_000, monthlyLimit: null });
+
+  mockIms();
+  nock(GATEWAY).get(/\/data\/core\/hygiene\/workorder/).query(true).delay(120)
+    .reply(200, { results: [{ workorderId: 'DI-stale', displayName: name, status: 'received', createdAt: '2026-05-31T00:00:00Z' }] });
+
+  const p = reconcileOrphanWorkOrders();              // awaits the delayed lookup
+  await new Promise(r => setTimeout(r, 40));
+  q().bumpWorkOrderAttempt.run(localId);              // simulate operator release+retry mid-lookup
+  await p;
+
+  const wo = q().getAllOrdersForJob.all(jobId)[0];
+  assert.equal(wo.adobe_workorder_id, null, 'stale FOUND result discarded — Adobe ID NOT recorded');
+  assert.equal(wo.status, 'submitting', 'WO not flipped to submitted by the stale result');
+});
+
+test('R9 #1: a reconcile DISCARDS a NO-MATCH write if the WO changed during the lookup (no stale revert)', async () => {
+  const { jobId } = seedCredAndJob({ name: 'cas-nomatch' });
+  const localId = `wo-casn-${seq}`;
+  seedOrphanWorkOrder(jobId, localId);
+  reserve({ workOrderId: localId, imsOrgId: `org-${seq}@AcmeOrg`, count: 2, dailyLimit: 1_000_000, monthlyLimit: null });
+
+  mockIms();
+  nock(GATEWAY).get(/\/data\/core\/hygiene\/workorder/).query(true).delay(120)
+    .reply(200, { results: [] });                     // no match
+
+  const p = reconcileOrphanWorkOrders();
+  await new Promise(r => setTimeout(r, 40));
+  // Simulate the operator having released + retried: status→planned, attempt bumped.
+  q().bumpWorkOrderAttempt.run(localId);
+  q().updateWorkOrderStatus.run('planned', null, localId);
+  await p;
+
+  const wo = q().getAllOrdersForJob.all(jobId)[0];
+  assert.equal(wo.status, 'planned', 'stale NO-MATCH write discarded — WO not reverted to submitting');
+});
+
 test('R6 #2: recovery matches a long-job-name orphan via the stored UUID-first display_name', async () => {
   // A long job name truncated at 255 would drop a trailing UUID, making the WO
   // invisible to recovery → false "absent". The fix: a UUID-FIRST displayName is

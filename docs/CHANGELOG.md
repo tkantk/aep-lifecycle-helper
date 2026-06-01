@@ -9,6 +9,49 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-06-01 (R9) — Ninth-round review: release-absent vs. reconcile-lookup duplicate race
+
+R8 closed the live-POST race, but a ninth review found a DISTINCT duplicate-delete
+race: release-absent (and its retry) could race an outstanding reconciliation
+LOOKUP. `'submitting'` is ambiguous, and the R8 guard only covered an active POST,
+not an active Adobe lookup. Repro: a reconcile snapshots the orphan and awaits the
+Adobe GET; during the await the operator releases + retries; the stale GET returns
+`DI-original` (Adobe HAD it) while the retry creates `DI-retry` → Adobe holds BOTH
+→ duplicate irreversible delete. The same class exists at startup (recovery runs
+async while the HTTP server is up). Suite **251 → 255** pass, audit clean.
+
+### #1 (blocker) — two complementary defenses
+
+- **Reconcile-in-flight guard.** `postingState.js` gains a `reconciling` set.
+  Both `reconcileOrphanWorkOrders` (startup) and `reconcileJobOrphans` (route)
+  now mark EVERY snapshotted orphan reconciling UP FRONT (synchronously, before
+  the first `await`) and unmark each in a `finally` after it's processed — so
+  `release-absent` is refused (409 `reconciling`) for any orphan from the moment
+  a reconcile run starts until that WO is resolved, closing the snapshot→process
+  window. They also skip a WO whose POST is in flight (let it settle).
+- **Attempt-CAS (defense-in-depth).** New `work_orders.attempt` counter. A
+  reconcile snapshots it before the lookup and applies its result only if it's
+  unchanged (`applyIfUnchanged` transaction); `release-absent` bumps it. So even
+  if a mutation slipped through, a stale lookup result can never clobber a
+  released/retried WO — it's discarded and logged.
+- **UI.** The Reconcile button disables every per-WO "Confirmed absent → retry"
+  control while the lookup is in flight (matches the server 409).
+
+### #2 (low) — doc precision
+
+`postingState.js` no longer overstates that a restart "kills a live POST" (it
+ends the LOCAL task; whether Adobe accepted the request is unknowable locally —
+which is why release-absent is operator-confirmed). The work-order state-machine
+diagram (`03-`) now shows the POST/reconcile guards on the SUBMITTING→PLANNED edge.
+
+### Tests
+
++4: reconciling-guard 409, attempt-bump on release, and two delayed-lookup CAS
+integration tests (a slow Adobe lookup with a concurrent attempt bump → the stale
+FOUND and NO-MATCH writes are both discarded). 255 pass / 0 fail.
+
+---
+
 ## 2026-06-01 (R8) — Eighth-round review: release-absent reopened an over-ship path
 
 The seventh review confirmed R7's escape hatch was XSS-safe and fail-closed for

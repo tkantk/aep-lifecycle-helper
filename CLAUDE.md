@@ -107,12 +107,15 @@ src/
 │   │                           fired-today guard. Iterates jobs with
 │   │                           un-shipped WOs via runSubmission.
 │   ├── monitor.js              setInterval(60s) status poll
-│   ├── postingState.js         In-memory set of work orders whose Adobe POST is
-│   │                           in flight RIGHT NOW (R8 #1). release-absent refuses
-│   │                           to act on one — releasing during a live POST that
-│   │                           may still 2xx would over-ship.
-│   └── recovery.js             One-shot startup reconciliation of orphan work
-│                               orders + operator release-absent action (R7 #1)
+│   ├── postingState.js         In-memory sets of work orders in a state-
+│   │                           determining op RIGHT NOW: POST in flight (R8 #1)
+│   │                           or a reconcile lookup in flight (R9 #1).
+│   │                           release-absent refuses to act on either — a live
+│   │                           POST may still 2xx (over-ship), and a live lookup
+│   │                           may find the WO in Adobe (duplicate on retry).
+│   └── recovery.js             Startup reconciliation of orphan work orders
+│                               (guard + attempt-CAS, R9 #1) + operator
+│                               release-absent action (R7 #1)
 │
 ├── routes/                     Express route modules
 │   ├── config.js               Credential CRUD + test
@@ -784,7 +787,7 @@ which require `https://platform-{region}.adobe.io` (region ∈ `va7`, `nld2`,
 7. Run `npm test` before suggesting a change is done (use `npm test`, NOT
    `node --test test` — on Node ≥23 the bare `test` arg is treated as a test
    name and silently runs nothing; `npm test` → `scripts/run-tests.mjs` which
-   enumerates `test/*.test.js`). **251 tests should pass** (as of the 2026-05-31
+   enumerates `test/*.test.js`). **255 tests should pass** (as of the 2026-05-31
    R7 operator-workflow session — per-WO release-absent action + UI/doc fixes).
 8. **After your change**, append a bullet to the current session in
    `docs/CHANGELOG.md` describing what + why. If you changed the module map,

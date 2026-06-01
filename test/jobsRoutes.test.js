@@ -34,7 +34,7 @@ const { initDb, q } = await import('../src/db.js');
 const jobsRouter = (await import('../src/routes/jobs.js')).default;
 const { makeErrorHandler } = await import('../src/middleware/security.js');
 const { logger } = await import('../src/utils/logger.js');
-const { markPosting, unmarkPosting } = await import('../src/runner/postingState.js');
+const { markPosting, unmarkPosting, markReconciling, unmarkReconciling } = await import('../src/runner/postingState.js');
 
 let server;
 let baseUrl;
@@ -316,6 +316,32 @@ test('R8 #1: release-absent REFUSES while the WO POST is still in flight (no rac
   } finally {
     unmarkPosting(woId);
   }
+});
+
+test('R9 #1: release-absent REFUSES while a reconciliation lookup is in flight for the WO', async () => {
+  const jobId = insertJob();
+  const woId = insertWorkOrder(jobId, 'submitting');
+  reserveFor(woId, 'reconciling-org@AcmeOrg');
+  markReconciling(woId);                          // simulate an in-flight Adobe lookup
+  try {
+    const res = await request('POST', `/api/jobs/${jobId}/work-orders/${woId}/release-absent`, { confirmedAbsent: true });
+    assert.equal(res.status, 409, 'cannot release while a reconcile may still find the WO in Adobe');
+    assert.equal(res.body.error, 'reconciling');
+    assert.equal(q().getReservation.get(woId).active, 1, 'reservation NOT released');
+    assert.equal(q().getAllOrdersForJob.all(jobId).find(w => w.id === woId).status, 'submitting', 'status unchanged');
+  } finally {
+    unmarkReconciling(woId);
+  }
+});
+
+test('R9 #1: release-absent bumps the WO attempt counter (invalidates a stale reconcile)', async () => {
+  const jobId = insertJob();
+  const woId = insertWorkOrder(jobId, 'submitting');
+  reserveFor(woId, 'attempt-org@AcmeOrg');
+  const before = q().getWorkOrderAttempt.get(woId).attempt;
+  const res = await request('POST', `/api/jobs/${jobId}/work-orders/${woId}/release-absent`, { confirmedAbsent: true });
+  assert.equal(res.status, 200);
+  assert.equal(q().getWorkOrderAttempt.get(woId).attempt, before + 1, 'attempt bumped so a stale reconcile result is discarded');
 });
 
 test('R8 #2: release + status-reset are atomic — a write failure rolls back the release', async () => {

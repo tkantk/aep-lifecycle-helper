@@ -1651,6 +1651,12 @@ async function renderSubmit() {
       `;
       $('#submit-body').insertBefore(banner, $('#submit-body').querySelector('.progress-head'));
       onClickGuarded(banner.querySelector('#btn-reconcile'), async () => {
+        // Disable every per-WO release control while Reconcile is asking Adobe
+        // whether it already has these WOs — releasing+retrying one mid-lookup
+        // could create a duplicate delete (review R9 #1; the server also rejects
+        // it with 409 'reconciling', this is the matching UI affordance).
+        const releaseBtns = [...banner.querySelectorAll('[data-release-absent]')];
+        releaseBtns.forEach(b => { b.disabled = true; });
         try {
           const r = await http('POST', `/jobs/${state.job.id}/reconcile`);
           const parts = [];
@@ -1659,10 +1665,11 @@ async function renderSubmit() {
           if (r.indeterminate > 0)  parts.push(`${r.indeterminate} still unconfirmed — verify in Adobe, then use “Confirmed absent → retry” below`);
           if (r.perWoError > 0)     parts.push(`${r.perWoError} errored`);
           showToast(parts.length ? `Reconcile: ${parts.join(', ')}.` : 'Nothing to reconcile.', { kind: 'success' });
-          // Re-fetch WOs and re-render.
+          // Re-fetch WOs and re-render (rebuilds the banner + buttons fresh).
           state.workOrders = await http('GET', `/jobs/${state.job.id}/work-orders`);
           await refresh();
         } catch (err) {
+          releaseBtns.forEach(b => { b.disabled = false; });   // re-enable on failure
           showToast(`Reconcile failed: ${err.message}`, { kind: 'error' });
         }
       }, { loadingText: 'Reconciling…' });

@@ -268,6 +268,12 @@ export function initDb() {
     // 255 used to drop the trailing UUID → orphan invisible → duplicate on
     // resubmit). NULL for legacy rows; recovery falls back to reconstruction.
     { table: 'work_orders', column: 'display_name', type: 'TEXT' },
+    // Review R9 #1: monotonic per-WO attempt counter for compare-and-swap. A
+    // reconcile snapshots `attempt` before its (awaited) Adobe lookup and only
+    // applies the result if `attempt` is unchanged — so a stale lookup response
+    // can never mutate a WO the operator released + retried during the await.
+    // Bumped by release-absent (the WO becomes a fresh attempt).
+    { table: 'work_orders', column: 'attempt', type: 'INTEGER NOT NULL DEFAULT 0' },
   ];
   for (const { table, column, type } of additiveColumns) {
     try {
@@ -577,6 +583,12 @@ function prepared() {
     // release & retry" action (review R7 #1) so a woId from a different job
     // can't be acted on.
     getWorkOrderByIdAndJob: db.prepare(`SELECT * FROM work_orders WHERE id = ? AND job_id = ?`),
+    // Review R9 #1: compare-and-swap support. A reconcile snapshots `attempt`
+    // before its awaited lookup; getWorkOrderAttempt re-reads it just before the
+    // write so a stale lookup result is discarded if the WO changed meanwhile.
+    // bumpWorkOrderAttempt is called by release-absent (a fresh attempt).
+    getWorkOrderAttempt: db.prepare(`SELECT attempt FROM work_orders WHERE id = ?`),
+    bumpWorkOrderAttempt: db.prepare(`UPDATE work_orders SET attempt = attempt + 1 WHERE id = ?`),
     // Unshipped (planned + deferred) WOs in deterministic creation order.
     // The redistributor consumes this and updates each row's month/day index.
     getUnshippedOrdersForJob: db.prepare(`

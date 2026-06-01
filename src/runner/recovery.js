@@ -5,7 +5,25 @@ import { runExpansion } from './expansion.js';
 import { getWorkOrder } from '../services/hygiene.js';
 import { decryptCreds } from '../utils/crypto.js';
 import { reactivate, markAccepted, release } from '../services/quotaManager.js';
-import { isWorkOrderPosting } from './postingState.js';
+import { isWorkOrderPosting, markReconciling, unmarkReconciling, isWorkOrderReconciling } from './postingState.js';
+
+/**
+ * Compare-and-swap wrapper for a reconcile write (review R9 #1). A reconcile
+ * reads the orphan, then AWAITS an Adobe lookup; during that await the operator
+ * could release + retry the WO. Applying the (now stale) lookup result would
+ * corrupt local state. So every reconcile write goes through here: in one
+ * transaction, re-read the WO's `attempt`; only run the writes if it still
+ * equals the value snapshotted before the lookup. Returns true if applied,
+ * false if the result was stale and discarded.
+ */
+function applyIfUnchanged(woId, snapshotAttempt, writeFn) {
+  return db.transaction(() => {
+    const cur = q().getWorkOrderAttempt.get(woId);
+    if (!cur || cur.attempt !== snapshotAttempt) return false;   // changed during the lookup → stale
+    writeFn();
+    return true;
+  })();
+}
 
 /**
  * Startup reconciliation for jobs and work orders left in flight when the
@@ -89,60 +107,92 @@ export async function reconcileOrphanWorkOrders() {
 
   logger.info({ count: orphans.length }, 'recovery: reconciling orphan submitting work orders');
 
-  for (const wo of orphans) {
-    try {
-      const creds = await decryptCreds(wo.j_creds_id);
-      // Prefer the EXACT displayName persisted before the POST (R6 #2) — it
-      // matches Adobe's stored value even when a long job name was truncated.
-      // Fall back to reconstruction for legacy rows submitted before R6 (their
-      // name was `Delete <job.name> - WO <uuid>`).
-      const displayName = wo.display_name || `Delete ${wo.j_name} - WO ${wo.id}`;
-      const found = await findAdobeWorkOrderByDisplayNamePrefix({
-        creds,
-        sandboxName: wo.j_sandbox_name,
-        prefix: displayName,
-      });
+  // Mark EVERY snapshotted orphan as reconciling UP FRONT (synchronously, before
+  // the first await), so release-absent is refused for any of them from the
+  // moment this run starts until each is individually processed — closing the
+  // window where the operator could release+retry a WO before the loop reaches
+  // it (review R9 #1). Unmarked per-WO in the loop's finally.
+  for (const wo of orphans) markReconciling(wo.id);
 
-      if (found === __testInternal__.LOOKUP_INDETERMINATE) {
-        // Adobe couldn't tell us whether this orphan exists — leaving it
-        // in 'submitting' is the safe choice. A subsequent startup will
-        // retry the lookup. Operators can also reconcile manually via the
-        // Adobe UI by searching for the displayName prefix.
-        logger.warn({ localId: wo.id },
-          'recovery: lookup indeterminate (400 from list endpoint); leaving orphan in submitting');
-      } else if (found) {
-        q().updateWorkOrderSubmitted.run({
-          id: wo.id,
-          adobeWorkorderId: found.workorderId,
-          adobeStatus: found.status,
-          bundleId: found.bundleId,
-          submittedAt: found.createdAt,
+  try {
+    for (const wo of orphans) {
+      try {
+        // Skip a WO whose POST is still in flight in this process — let it settle
+        // (its own 2xx/catch will resolve it); reconciling it now would race the
+        // POST. The next reconcile picks it up if still unresolved.
+        if (isWorkOrderPosting(wo.id)) continue;
+
+        const snapshotAttempt = wo.attempt ?? 0;
+        const creds = await decryptCreds(wo.j_creds_id);
+        // Prefer the EXACT displayName persisted before the POST (R6 #2) — it
+        // matches Adobe's stored value even when a long job name was truncated.
+        // Fall back to reconstruction for legacy rows submitted before R6 (their
+        // name was `Delete <job.name> - WO <uuid>`).
+        const displayName = wo.display_name || `Delete ${wo.j_name} - WO ${wo.id}`;
+        const found = await findAdobeWorkOrderByDisplayNamePrefix({
+          creds,
+          sandboxName: wo.j_sandbox_name,
+          prefix: displayName,
         });
-        // Adobe HAS this WO (the POST went through before the crash) → promote
-        // the still-pending reservation to accepted so it's held, not refunded
-        // by a later release (review R5).
-        markAccepted(wo.id);
-        logger.info({ localId: wo.id, adobeId: found.workorderId },
-          'recovery: matched orphan to existing Adobe work order');
-      } else {
-        // Adobe's list responded but shows no match. This does NOT prove Adobe
-        // never received the (uncertain) POST — work-order creation is async and
-        // Adobe documents no read-after-write guarantee, so the WO may simply not
-        // be listed yet. Rolling back + releasing would risk a DUPLICATE
-        // irreversible delete on the next submit (review R6 #1). Treat as
-        // INDETERMINATE: hold the reservation, keep the WO in 'submitting', and
-        // surface it for operator reconciliation.
-        q().updateWorkOrderStatus.run('submitting',
-          'submission outcome unconfirmed: not yet listed in Adobe (async creation may lag). ' +
-          'Left for operator reconciliation — verify in Adobe before any retry.', wo.id);
-        logger.warn({ localId: wo.id },
-          'recovery: orphan not yet listed in Adobe — INDETERMINATE, left in submitting (no rollback, no release)');
+
+        if (found === __testInternal__.LOOKUP_INDETERMINATE) {
+          // Adobe couldn't tell us whether this orphan exists — leaving it
+          // in 'submitting' is the safe choice. A subsequent startup will
+          // retry the lookup. (No write → no CAS needed.)
+          logger.warn({ localId: wo.id },
+            'recovery: lookup indeterminate (400 from list endpoint); leaving orphan in submitting');
+        } else if (found) {
+          // CAS: only apply if the WO didn't change during the awaited lookup
+          // (operator release+retry would have bumped `attempt`) — review R9 #1.
+          const applied = applyIfUnchanged(wo.id, snapshotAttempt, () => {
+            q().updateWorkOrderSubmitted.run({
+              id: wo.id,
+              adobeWorkorderId: found.workorderId,
+              adobeStatus: found.status,
+              bundleId: found.bundleId,
+              submittedAt: found.createdAt,
+            });
+            // Adobe HAS this WO → promote the still-pending reservation to
+            // accepted so it's held, not refunded by a later release (review R5).
+            markAccepted(wo.id);
+          });
+          if (applied) {
+            logger.info({ localId: wo.id, adobeId: found.workorderId },
+              'recovery: matched orphan to existing Adobe work order');
+          } else {
+            logger.warn({ localId: wo.id },
+              'recovery: discarded a STALE lookup result — WO changed during the lookup (R9 #1)');
+          }
+        } else {
+          // Adobe's list responded but shows no match. This does NOT prove Adobe
+          // never received the (uncertain) POST — work-order creation is async
+          // with no read-after-write guarantee, so the WO may simply not be
+          // listed yet. Rolling back + releasing would risk a DUPLICATE
+          // irreversible delete (review R6 #1). Treat as INDETERMINATE: hold the
+          // reservation, keep the WO in 'submitting'. CAS-guarded so a stale
+          // no-match can't revert a WO that changed during the lookup.
+          applyIfUnchanged(wo.id, snapshotAttempt, () => {
+            q().updateWorkOrderStatus.run('submitting',
+              'submission outcome unconfirmed: not yet listed in Adobe (async creation may lag). ' +
+              'Left for operator reconciliation — verify in Adobe before any retry.', wo.id);
+          });
+          logger.warn({ localId: wo.id },
+            'recovery: orphan not yet listed in Adobe — INDETERMINATE, left in submitting (no rollback, no release)');
+        }
+      } catch (err) {
+        // Transient error — leave the orphan alone and retry on next startup.
+        logger.warn({ localId: wo.id, err: err.message },
+          'recovery: reconciliation failed; leaving orphan for next restart');
+      } finally {
+        // This WO is fully processed — release the reconcile guard for it so the
+        // operator can resolve it now (e.g. a no-match the operator confirms).
+        unmarkReconciling(wo.id);
       }
-    } catch (err) {
-      // Transient error — leave the orphan alone and retry on next startup.
-      logger.warn({ localId: wo.id, err: err.message },
-        'recovery: reconciliation failed; leaving orphan for next restart');
     }
+  } finally {
+    // Safety net: clear any still-marked WO (e.g. a posting-skip or an
+    // unexpected throw before the per-WO finally). Idempotent.
+    for (const wo of orphans) unmarkReconciling(wo.id);
   }
   return orphans.length;
 }
@@ -269,79 +319,91 @@ export async function reconcileJobOrphans(jobId) {
 
   let matched = 0, rolledBack = 0, indeterminate = 0, stillFailed = 0, perWoError = 0;
 
-  for (const wo of orphans) {
-    try {
-      const creds = await decryptCreds(wo.j_creds_id);
-      // Exact persisted name (R6 #2), fallback to reconstruction for legacy rows.
-      const displayName = wo.display_name || `Delete ${wo.j_name} - WO ${wo.id}`;
-      const found = await findAdobeWorkOrderByDisplayNamePrefix({
-        creds,
-        sandboxName: wo.j_sandbox_name,
-        prefix: displayName,
-      });
+  // Guard release-absent for every snapshotted orphan for the whole run (R9 #1).
+  for (const wo of orphans) markReconciling(wo.id);
 
-      if (found === LOOKUP_INDETERMINATE) {
-        indeterminate++;
-        logger.warn({ localId: wo.id, prevStatus: wo.status },
-          'reconcile: lookup indeterminate (Adobe rejected list query); leaving as-is');
-        continue;
-      }
+  try {
+    for (const wo of orphans) {
+      try {
+        if (isWorkOrderPosting(wo.id)) continue;     // let an in-flight POST settle
 
-      if (found) {
-        // Re-reserve quota for previously-'failed' WOs. The old buggy
-        // catch-all release() in submission.js gave back quota that Adobe
-        // had actually spent. Direct ledger upsert (bypasses the cap) is
-        // the right tool — we're correcting the ledger to match reality,
-        // not reserving fresh capacity.
-        if (wo.status === 'failed') {
-          // The WO was marked 'failed' (its reservation deactivated) but Adobe
-          // actually processed it — re-activate the reservation AS accepted so
-          // the ledger reflects the real spend and it's HELD until rollover
-          // (review R5). If there's no reservation row (legacy), this is a no-op
-          // and the floor still picks it up via /quota on the next seedFloor.
-          reactivate(wo.id);
-        } else {
-          // status 'submitting' found in Adobe → the POST went through; promote
-          // the still-pending reservation to accepted so it isn't refunded.
-          markAccepted(wo.id);
-        }
-        q().updateWorkOrderSubmitted.run({
-          id: wo.id,
-          adobeWorkorderId: found.workorderId,
-          adobeStatus: found.status,
-          bundleId: found.bundleId,
-          submittedAt: found.createdAt,
+        const snapshotAttempt = wo.attempt ?? 0;
+        const creds = await decryptCreds(wo.j_creds_id);
+        // Exact persisted name (R6 #2), fallback to reconstruction for legacy rows.
+        const displayName = wo.display_name || `Delete ${wo.j_name} - WO ${wo.id}`;
+        const found = await findAdobeWorkOrderByDisplayNamePrefix({
+          creds,
+          sandboxName: wo.j_sandbox_name,
+          prefix: displayName,
         });
-        matched++;
-        logger.info({ localId: wo.id, adobeId: found.workorderId, prevStatus: wo.status },
-          'reconcile: matched WO to existing Adobe work order');
-        continue;
-      }
 
-      // Not found in Adobe.
-      if (wo.status === 'submitting') {
-        // A no-match does NOT prove Adobe never received the uncertain POST
-        // (async creation, no read-after-write guarantee). Rolling back +
-        // releasing would risk a DUPLICATE irreversible delete. Treat as
-        // INDETERMINATE — hold the reservation, keep it in 'submitting' for
-        // operator reconciliation (review R6 #1).
-        indeterminate++;
-        q().updateWorkOrderStatus.run('submitting',
-          'submission outcome unconfirmed: not yet listed in Adobe (async creation may lag). ' +
-          'Verify in Adobe before any retry.', wo.id);
-        logger.warn({ localId: wo.id },
-          'reconcile: orphan not yet listed in Adobe — INDETERMINATE, left in submitting (no rollback)');
-      } else {
-        // status='failed' AND Adobe confirms absence → genuinely failed (a 4xx
-        // rejection definitively never processed). Safe to leave as failed.
-        stillFailed++;
-        logger.info({ localId: wo.id }, 'reconcile: failed WO confirmed absent in Adobe; leaving as failed');
+        if (found === LOOKUP_INDETERMINATE) {
+          indeterminate++;
+          logger.warn({ localId: wo.id, prevStatus: wo.status },
+            'reconcile: lookup indeterminate (Adobe rejected list query); leaving as-is');
+          continue;
+        }
+
+        if (found) {
+          // CAS: only apply if the WO didn't change during the awaited lookup
+          // (operator release+retry would have bumped `attempt`) — review R9 #1.
+          const applied = applyIfUnchanged(wo.id, snapshotAttempt, () => {
+            if (wo.status === 'failed') {
+              // 'failed' but Adobe actually processed it → re-activate the
+              // reservation AS accepted (held until rollover, review R5).
+              reactivate(wo.id);
+            } else {
+              // 'submitting' found in Adobe → the POST went through; promote the
+              // still-pending reservation to accepted so it isn't refunded.
+              markAccepted(wo.id);
+            }
+            q().updateWorkOrderSubmitted.run({
+              id: wo.id,
+              adobeWorkorderId: found.workorderId,
+              adobeStatus: found.status,
+              bundleId: found.bundleId,
+              submittedAt: found.createdAt,
+            });
+          });
+          if (applied) {
+            matched++;
+            logger.info({ localId: wo.id, adobeId: found.workorderId, prevStatus: wo.status },
+              'reconcile: matched WO to existing Adobe work order');
+          } else {
+            logger.warn({ localId: wo.id },
+              'reconcile: discarded a STALE lookup result — WO changed during the lookup (R9 #1)');
+          }
+          continue;
+        }
+
+        // Not found in Adobe.
+        if (wo.status === 'submitting') {
+          // No-match does NOT prove absence (async creation, no read-after-write
+          // guarantee). INDETERMINATE — hold the reservation, keep 'submitting'
+          // (review R6 #1). CAS-guarded against a stale revert.
+          indeterminate++;
+          applyIfUnchanged(wo.id, snapshotAttempt, () => {
+            q().updateWorkOrderStatus.run('submitting',
+              'submission outcome unconfirmed: not yet listed in Adobe (async creation may lag). ' +
+              'Verify in Adobe before any retry.', wo.id);
+          });
+          logger.warn({ localId: wo.id },
+            'reconcile: orphan not yet listed in Adobe — INDETERMINATE, left in submitting (no rollback)');
+        } else {
+          // status='failed' AND Adobe confirms absence → genuinely failed.
+          stillFailed++;
+          logger.info({ localId: wo.id }, 'reconcile: failed WO confirmed absent in Adobe; leaving as failed');
+        }
+      } catch (err) {
+        perWoError++;
+        logger.warn({ localId: wo.id, err: err.message },
+          'reconcile: per-WO failure; leaving as-is');
+      } finally {
+        unmarkReconciling(wo.id);
       }
-    } catch (err) {
-      perWoError++;
-      logger.warn({ localId: wo.id, err: err.message },
-        'reconcile: per-WO failure; leaving as-is');
     }
+  } finally {
+    for (const wo of orphans) unmarkReconciling(wo.id);
   }
 
   return { total: orphans.length, matched, rolledBack, indeterminate, stillFailed, perWoError };
@@ -365,7 +427,12 @@ export async function reconcileJobOrphans(jobId) {
  *     R8 #1): 'submitting' means both "POST in flight" and "settled uncertain",
  *     and releasing a reservation whose POST may still 2xx would lose the hold
  *     and over-ship. We act only on a SETTLED uncertain orphan.
+ *   - refuses (409) if a RECONCILIATION lookup is in flight for it (review R9 #1):
+ *     that lookup is asking Adobe whether it already has the WO; releasing +
+ *     retrying before the answer could create a DUPLICATE delete.
  *   - refuses (409) if its reservation is `accepted` (Adobe spent the quota).
+ * It also bumps the WO's `attempt` counter so any reconcile that snapshotted the
+ * old value discards its now-stale lookup result (CAS, review R9 #1).
  * The validation + guarded release + status reset run in ONE SQLite transaction
  * (review R8 #2) so a failure can never leave the reservation released while the
  * WO is still 'submitting'. The caller (route) additionally requires an explicit
@@ -390,12 +457,22 @@ export function releaseAbsentOrphan(jobId, woId) {
       const e = new Error('this work order\'s submission is still in flight to Adobe — wait for it to settle, then reconcile before marking it absent');
       e.status = 409; e.code = 'posting'; e.publicMessage = e.message; throw e;
     }
+    if (isWorkOrderReconciling(woId)) {
+      // A reconcile is actively asking Adobe whether it ALREADY has this WO.
+      // Releasing + retrying now could create a duplicate if the lookup comes
+      // back FOUND (review R9 #1). Make the operator wait for the answer.
+      const e = new Error('a reconciliation lookup is in progress for this work order — wait for it to finish (it may find the WO in Adobe), then retry');
+      e.status = 409; e.code = 'reconciling'; e.publicMessage = e.message; throw e;
+    }
     const resv = q().getReservation.get(woId);
     if (resv && resv.accepted === 1) {
       const e = new Error('this work order\'s reservation is marked accepted (Adobe spent the quota) — it cannot be released');
       e.status = 409; e.code = 'accepted'; e.publicMessage = e.message; throw e;
     }
     release(woId);                                 // guarded WHERE accepted=0
+    // Bump the attempt counter so any reconcile whose lookup is in flight (and
+    // snapshotted the old attempt) discards its now-stale result (review R9 #1).
+    q().bumpWorkOrderAttempt.run(woId);
     q().updateWorkOrderStatus.run('planned', null, woId);
     logger.info({ jobId, woId }, 'operator confirmed orphan absent in Adobe → released + reset to planned for retry');
     return { ok: true, woId, status: 'planned' };
