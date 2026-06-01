@@ -272,6 +272,28 @@ test('R10 #2 (manual route): reconcileJobOrphans finalises a terminal=failed mat
   assert.ok(wo.completed_at, 'completed_at stamped');
 });
 
+test('R11 follow-up: a reconcile NO-MATCH on a failed WO does NOT mark it definitive (absence unproven → stays ambiguous, no over-ship)', async () => {
+  // The reviewer suggested marking failure_definitive=1 on a reconcile no-match
+  // so ordinary delete unblocks. That is UNSAFE: a no-match doesn't prove Adobe
+  // absence (eventually-consistent list, R6 #1), and a false-definitive would
+  // let job-delete erase tracking for real Adobe spend → over-ship. Lock the
+  // safe behavior: a no-match leaves the failed WO AMBIGUOUS.
+  const { jobId } = seedCredAndJob({ name: 'nomatch-failed' });
+  const localId = `wo-nmf-${seq}`;
+  q().insertWorkOrder.run({ id: localId, jobId, dayIndex: 1, datasetIds: 'ALL',
+    targetServicesJson: null, namespacesIdentities: '[]', identifierCount: 2, status: 'failed' });
+  assert.equal(q().getAllOrdersForJob.all(jobId)[0].failure_definitive, 0, 'precondition: ambiguous');
+
+  mockIms();
+  nock(GATEWAY).get(/\/data\/core\/hygiene\/workorder/).query(true).reply(200, { results: [] });
+
+  const r = await reconcileJobOrphans(jobId);
+  assert.equal(r.stillFailed, 1);
+  const wo = q().getAllOrdersForJob.all(jobId)[0];
+  assert.equal(wo.status, 'failed');
+  assert.equal(wo.failure_definitive, 0, 'a no-match must NOT settle ambiguity (absence is not proven)');
+});
+
 test('R11 #1: a legacy failed WO is reconcile-guarded during its lookup, and its quota is re-reserved when Adobe has it', async () => {
   // The over-ship race: a legacy 'failed' WO with an INACTIVE reservation (the
   // old timeout bug released it even though Adobe processed it). If ordinary

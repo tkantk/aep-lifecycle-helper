@@ -404,7 +404,7 @@ restart required.
 | `submitting`          | Two meanings: (a) POST to Adobe in flight, (b) UNCERTAIN — POST timed out / network reset / 5xx; Adobe may have processed it, quota still reserved | Recovery / reconcile by `displayName` |
 | `submitted`           | Adobe ACK'd with a work-order ID; monitoring in progress       | Monitor polls 60s      |
 | `completed`           | Adobe confirms deletion complete (terminal)                    | Export results         |
-| `failed`              | Adobe returned 4xx (definitive rejection) and quota was released (terminal) | Review error message; optionally reconcile if you suspect Adobe processed it anyway |
+| `failed`              | Two kinds (R11): **definitive** — a 4xx rejection, `failure_definitive=1`, Adobe never created it so no quota spent → safe to delete; **ambiguous** — a legacy/timeout outcome with no Adobe ID, `failure_definitive=0` → Adobe may have processed it, so ordinary job-delete is blocked (409 `unsettled`) until reconciled (or `?force=true`). A monitor-reported `failed` has an Adobe ID → terminal, not ambiguous. | Review error message; reconcile (settles any Adobe actually has); for ambiguous, verify in Adobe + `?force=true` |
 
 ### 4.4 Submit → reconcile flow
 

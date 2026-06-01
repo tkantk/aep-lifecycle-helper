@@ -374,8 +374,11 @@ router.delete('/:id', async (req, res, next) => {
       if (reconciling.length > 0)     reasons.push(`${reconciling.length} being reconciled with Adobe right now`);
       if (ambiguousFailed.length > 0) reasons.push(`${ambiguousFailed.length} failed locally but never confirmed absent in Adobe (Adobe may have processed them)`);
       const err = new Error(
-        `Cannot delete: ${reasons.join('; ')}. Run Reconcile first to settle their Adobe status, ` +
-        `or pass ?force=true to delete anyway — forcing may lose quota tracking for work Adobe actually performed.`
+        `Cannot delete: ${reasons.join('; ')}. Run Reconcile — it auto-settles any work order Adobe ` +
+        `actually has (recording its ID). For any that stay unconfirmed, Adobe's list is ` +
+        `eventually-consistent so a missing entry does NOT prove absence: verify in Adobe's Data ` +
+        `Lifecycle UI, then pass ?force=true to delete anyway (forcing may lose quota tracking for ` +
+        `work Adobe actually performed).`
       );
       err.status = 409; err.code = 'unsettled';
       err.publicMessage = err.message;

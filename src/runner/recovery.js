@@ -435,9 +435,16 @@ export async function reconcileJobOrphans(jobId) {
               'reconcile: stale no-match discarded — WO resolved/changed during the lookup (R10 #1)');
           }
         } else {
-          // status='failed' AND Adobe confirms absence → genuinely failed.
+          // status='failed' and Adobe's list shows no match. We deliberately do
+          // NOT mark this failure_definitive (review R11 follow-up): a no-match
+          // does NOT prove Adobe absence — work-order creation is async and the
+          // list is eventually-consistent (R6 #1), so a legacy/timeout 'failed'
+          // WO Adobe actually processed could simply not be listed yet. Marking
+          // it definitive here would let an ordinary job-delete erase tracking
+          // for real Adobe spend → over-ship. It stays ambiguous; the operator
+          // verifies in Adobe's UI and uses ?force=true if truly absent.
           stillFailed++;
-          logger.info({ localId: wo.id }, 'reconcile: failed WO confirmed absent in Adobe; leaving as failed');
+          logger.info({ localId: wo.id }, 'reconcile: failed WO not listed in Adobe; left ambiguous (absence unproven)');
         }
       } catch (err) {
         perWoError++;
