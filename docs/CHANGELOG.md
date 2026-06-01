@@ -18,17 +18,23 @@ not an active Adobe lookup. Repro: a reconcile snapshots the orphan and awaits t
 Adobe GET; during the await the operator releases + retries; the stale GET returns
 `DI-original` (Adobe HAD it) while the retry creates `DI-retry` → Adobe holds BOTH
 → duplicate irreversible delete. The same class exists at startup (recovery runs
-async while the HTTP server is up). Suite **251 → 255** pass, audit clean.
+async while the HTTP server is up). Suite **251 → 256** pass, audit clean (refcount fix + concurrent-reconcile test added per the R9 review).
 
 ### #1 (blocker) — two complementary defenses
 
-- **Reconcile-in-flight guard.** `postingState.js` gains a `reconciling` set.
-  Both `reconcileOrphanWorkOrders` (startup) and `reconcileJobOrphans` (route)
-  now mark EVERY snapshotted orphan reconciling UP FRONT (synchronously, before
-  the first `await`) and unmark each in a `finally` after it's processed — so
-  `release-absent` is refused (409 `reconciling`) for any orphan from the moment
-  a reconcile run starts until that WO is resolved, closing the snapshot→process
-  window. They also skip a WO whose POST is in flight (let it settle).
+- **Reconcile-in-flight guard (REFCOUNTED).** `postingState.js` gains a
+  `reconciling` refcount (`Map<woId, count>`). Both `reconcileOrphanWorkOrders`
+  (startup) and `reconcileJobOrphans` (route) mark EVERY snapshotted orphan
+  reconciling UP FRONT (synchronously, before the first `await`) and unmark each
+  exactly once via a per-run `marked` set — so `release-absent` is refused (409
+  `reconciling`) for any orphan from the moment a reconcile run starts until that
+  WO is resolved. **The refcount is essential** (caught by the R9 adversarial
+  review): two reconcile runs can overlap on the same WO (startup recovery is
+  fire-and-forget while the server accepts a manual `POST /reconcile`); a plain
+  Set let the first run to finish a WO tear the shared guard out from under the
+  second run's still-in-flight lookup, reopening the duplicate window. The count
+  keeps the WO guarded until the LAST reconcile for it settles. They also skip a
+  WO whose POST is in flight (let it settle).
 - **Attempt-CAS (defense-in-depth).** New `work_orders.attempt` counter. A
   reconcile snapshots it before the lookup and applies its result only if it's
   unchanged (`applyIfUnchanged` transaction); `release-absent` bumps it. So even

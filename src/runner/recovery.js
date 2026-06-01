@@ -111,8 +111,11 @@ export async function reconcileOrphanWorkOrders() {
   // the first await), so release-absent is refused for any of them from the
   // moment this run starts until each is individually processed — closing the
   // window where the operator could release+retry a WO before the loop reaches
-  // it (review R9 #1). Unmarked per-WO in the loop's finally.
-  for (const wo of orphans) markReconciling(wo.id);
+  // it (review R9 #1). The guard is REFCOUNTED, so we must unmark each WO exactly
+  // ONCE per run; `marked` tracks what this run still holds so the per-WO finally
+  // and the outer safety-net finally can't double-decrement (R9 follow-up).
+  const marked = new Set();
+  for (const wo of orphans) { markReconciling(wo.id); marked.add(wo.id); }
 
   try {
     for (const wo of orphans) {
@@ -184,15 +187,15 @@ export async function reconcileOrphanWorkOrders() {
         logger.warn({ localId: wo.id, err: err.message },
           'recovery: reconciliation failed; leaving orphan for next restart');
       } finally {
-        // This WO is fully processed — release the reconcile guard for it so the
-        // operator can resolve it now (e.g. a no-match the operator confirms).
-        unmarkReconciling(wo.id);
+        // This WO is fully processed — release THIS run's reconcile hold for it
+        // (exactly once; `marked.delete` returns false if already unmarked).
+        if (marked.delete(wo.id)) unmarkReconciling(wo.id);
       }
     }
   } finally {
-    // Safety net: clear any still-marked WO (e.g. a posting-skip or an
-    // unexpected throw before the per-WO finally). Idempotent.
-    for (const wo of orphans) unmarkReconciling(wo.id);
+    // Safety net: release this run's hold on any WO not reached by a per-WO
+    // finally (e.g. an unexpected throw in the loop) — each exactly once.
+    for (const id of marked) unmarkReconciling(id);
   }
   return orphans.length;
 }
@@ -320,7 +323,10 @@ export async function reconcileJobOrphans(jobId) {
   let matched = 0, rolledBack = 0, indeterminate = 0, stillFailed = 0, perWoError = 0;
 
   // Guard release-absent for every snapshotted orphan for the whole run (R9 #1).
-  for (const wo of orphans) markReconciling(wo.id);
+  // Refcounted + per-run `marked` set so the per-WO and outer finally unmark each
+  // exactly once (R9 follow-up — concurrent reconciles must not over-decrement).
+  const marked = new Set();
+  for (const wo of orphans) { markReconciling(wo.id); marked.add(wo.id); }
 
   try {
     for (const wo of orphans) {
@@ -399,11 +405,11 @@ export async function reconcileJobOrphans(jobId) {
         logger.warn({ localId: wo.id, err: err.message },
           'reconcile: per-WO failure; leaving as-is');
       } finally {
-        unmarkReconciling(wo.id);
+        if (marked.delete(wo.id)) unmarkReconciling(wo.id);
       }
     }
   } finally {
-    for (const wo of orphans) unmarkReconciling(wo.id);
+    for (const id of marked) unmarkReconciling(id);
   }
 
   return { total: orphans.length, matched, rolledBack, indeterminate, stillFailed, perWoError };

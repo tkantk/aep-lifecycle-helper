@@ -24,6 +24,7 @@ const { initDb, q, db } = await import('../src/db.js');
 const { storeCreds } = await import('../src/utils/crypto.js');
 const { reconcileOrphanWorkOrders, resumeExpandingJobs } = await import('../src/runner/recovery.js');
 const { reserve, peek } = await import('../src/services/quotaManager.js');
+const { isWorkOrderReconciling } = await import('../src/runner/postingState.js');
 
 const GATEWAY = 'https://platform.adobe.io';
 
@@ -163,6 +164,35 @@ test('R9 #1: a reconcile DISCARDS a NO-MATCH write if the WO changed during the 
 
   const wo = q().getAllOrdersForJob.all(jobId)[0];
   assert.equal(wo.status, 'planned', 'stale NO-MATCH write discarded — WO not reverted to submitting');
+});
+
+test('R9 follow-up: concurrent reconciles keep the WO guarded until BOTH settle (refcount, no premature unmark)', async () => {
+  // A plain Set let whichever concurrent reconcile finished a WO first delete the
+  // shared guard out from under the other run's still-in-flight lookup, reopening
+  // the duplicate-delete window. The refcount keeps the WO guarded until the LAST
+  // in-flight reconcile for it settles.
+  const { jobId } = seedCredAndJob({ name: 'concurrent' });
+  const localId = `wo-conc-${seq}`;
+  seedOrphanWorkOrder(jobId, localId);
+  reserve({ workOrderId: localId, imsOrgId: `org-${seq}@AcmeOrg`, count: 2, dailyLimit: 1_000_000, monthlyLimit: null });
+
+  nock('https://ims-na1.adobelogin.com').persist().post('/ims/token/v3').reply(200, { access_token: 'tok', expires_in: 86400 });
+  // Two lookups: the first reconcile gets the FAST (40ms) reply, the second the SLOW (200ms).
+  nock(GATEWAY).get(/\/data\/core\/hygiene\/workorder/).query(true).delay(40).reply(200, { results: [] });
+  nock(GATEWAY).get(/\/data\/core\/hygiene\/workorder/).query(true).delay(200).reply(200, { results: [] });
+
+  const pA = reconcileOrphanWorkOrders();   // marks (count 0→1)
+  const pB = reconcileOrphanWorkOrders();   // marks (count 1→2)
+
+  // After the FAST reconcile has finished + unmarked (count 2→1) but the SLOW one
+  // is still awaiting its lookup, the WO MUST still be guarded.
+  await new Promise(r => setTimeout(r, 100));
+  assert.equal(isWorkOrderReconciling(localId), true,
+    'guard held while the slower reconcile lookup is still in flight (refcount > 0)');
+
+  await Promise.all([pA, pB]);
+  assert.equal(isWorkOrderReconciling(localId), false,
+    'guard cleared only after BOTH reconciles settled (refcount back to 0)');
 });
 
 test('R6 #2: recovery matches a long-job-name orphan via the stored UUID-first display_name', async () => {

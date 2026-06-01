@@ -36,7 +36,24 @@ export function markPosting(workOrderId)   { postingWoIds.add(workOrderId); }
 export function unmarkPosting(workOrderId) { postingWoIds.delete(workOrderId); }
 export function isWorkOrderPosting(workOrderId) { return postingWoIds.has(workOrderId); }
 
-const reconcilingWoIds = new Set();
-export function markReconciling(workOrderId)   { reconcilingWoIds.add(workOrderId); }
-export function unmarkReconciling(workOrderId) { reconcilingWoIds.delete(workOrderId); }
-export function isWorkOrderReconciling(workOrderId) { return reconcilingWoIds.has(workOrderId); }
+// REFCOUNTED (review R9 follow-up): two reconcile runs (startup + a manual
+// POST /reconcile, or two tabs) can be in flight over the SAME work order at
+// once — startup recovery is fire-and-forget while the HTTP server already
+// accepts requests. A plain Set would let whichever run finishes the WO FIRST
+// delete the shared entry out from under the other run's still-in-flight lookup,
+// reopening the duplicate-delete window. A per-WO count keeps the WO guarded
+// until the LAST in-flight reconcile for it settles. Callers MUST pair each
+// markReconciling with exactly one unmarkReconciling (recovery.js tracks a
+// per-run set so the per-WO + outer finally never double-decrement).
+const reconcilingWoIds = new Map();   // workOrderId -> in-flight reconcile count
+export function markReconciling(workOrderId) {
+  reconcilingWoIds.set(workOrderId, (reconcilingWoIds.get(workOrderId) || 0) + 1);
+}
+export function unmarkReconciling(workOrderId) {
+  const next = (reconcilingWoIds.get(workOrderId) || 0) - 1;
+  if (next <= 0) reconcilingWoIds.delete(workOrderId);   // floors at 0 (never negative)
+  else reconcilingWoIds.set(workOrderId, next);
+}
+export function isWorkOrderReconciling(workOrderId) {
+  return (reconcilingWoIds.get(workOrderId) || 0) > 0;
+}
