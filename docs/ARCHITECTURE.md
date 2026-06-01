@@ -508,7 +508,7 @@ src/
 
 test/                       node --test (via `npm test` → scripts/run-tests.mjs,
                             which enumerates test/*.test.js and sets a stable
-                            test ENCRYPTION_KEY). 248 tests covering hygiene
+                            test ENCRYPTION_KEY). 251 tests covering hygiene
                             validators,
                             namespace canonicalization, IMS token cache, quota
                             atomicity (incl. monthly-disabled release gating),
@@ -675,8 +675,12 @@ source of truth (CLAUDE.md I15), and monthly is ALWAYS tracked (R4 #4 removed th
   Adobe documents work-order creation as asynchronous with no read-after-write
   guarantee, so a missing list entry does NOT prove absence — rolling back +
   releasing would risk a duplicate irreversible delete on the next submit. A
-  genuinely-absent WO is resolved by the operator (verify in Adobe, then
-  force-delete or let a later reconcile match it once Adobe's list catches up).
+  genuinely-absent WO is resolved by the operator via the **release-absent**
+  action (R7 #1): after verifying in Adobe's UI (by the persisted displayName)
+  that the WO does not exist, the operator releases its held reservation and
+  resets it to `planned` for retry. The action is fail-closed — it refuses any
+  WO with an Adobe ID, an accepted reservation, or a still-in-flight POST (R8 #1),
+  and the release + reset run in one transaction (R8 #2).
 - **Single-process only** — running two instances against the same database
   corrupts the WAL. Enforced by a single-process advisory lock (`index.js`):
   a `<dbPath>.lock` file keyed on the canonical resolved `DB_PATH` (not

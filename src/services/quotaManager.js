@@ -132,12 +132,14 @@ export function markAccepted(workOrderId) {
 }
 
 /**
- * Release a work order's reservation — Adobe did NOT process it (4xx rejection /
- * orphan-not-found rollback). GUARDED (review R5 #2): the underlying statement
- * only deactivates a reservation with accepted=0, so a reservation Adobe has
- * acked can NEVER be refunded (refunding it would over-ship). Keyed by WO id,
- * so it frees the reservation's OWN period (no cross-day mis-decrement).
- * Idempotent; a no-op on an accepted reservation.
+ * Release a work order's reservation. Called when Adobe did NOT process it: a
+ * 4xx rejection, a durability-write failure before the POST, or an operator
+ * confirming an uncertain orphan is absent (release-absent, R7 #1). Recovery
+ * NEVER auto-releases on a no-match (R6 #1). GUARDED (review R5 #2): the
+ * underlying statement only deactivates a reservation with accepted=0, so a
+ * reservation Adobe has acked can NEVER be refunded (refunding it would
+ * over-ship). Keyed by WO id, so it frees the reservation's OWN period (no
+ * cross-day mis-decrement). Idempotent; a no-op on an accepted reservation.
  */
 export function release(workOrderId) {
   q().releaseReservation.run(workOrderId);

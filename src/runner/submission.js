@@ -8,10 +8,12 @@ import { q, db, prepareStreamIdentitiesBySource, setWorkOrderSubmittingDurable }
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { decryptCreds } from '../utils/crypto.js';
+import { markPosting, unmarkPosting } from './postingState.js';
 
 // Module-level set guards against two concurrent runSubmission calls for the
 // same job in the same process (e.g. user double-clicks the Submit button).
 const inFlight = new Set();
+
 
 /**
  * Work-order planning and submission.
@@ -421,6 +423,13 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
           return;
         }
 
+        // Mark the in-flight window OPEN (review R8 #1): from here until the POST
+        // settles (success or error, see the finally below), release-absent must
+        // refuse to touch this WO. The catch + settlement run synchronously after
+        // the await returns, so the WO stays guarded through markAccepted / the
+        // uncertain-error write with no interleaving release possible.
+        markPosting(wo.id);
+
         const namespacesIdentities = JSON.parse(wo.namespaces_identities);
         const targetServices = wo.target_services_json ? JSON.parse(wo.target_services_json) : undefined;
 
@@ -493,6 +502,13 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
           logger.warn({ localId: wo.id, status: status ?? '(no response)', err: err.message },
             'submission UNCERTAIN (timeout/network/5xx) — Adobe may have processed it. Left in submitting status; orphan-reconcile will check Adobe via displayName on next startup or via POST /api/jobs/:id/reconcile.');
         }
+      } finally {
+        // In-flight window CLOSED — the POST has settled (2xx → markAccepted, or
+        // error → catch handled it, all synchronously above). The WO is now in a
+        // settled state and release-absent may act on it if it's an uncertain
+        // orphan (review R8 #1). unmark is a no-op if it was never marked
+        // (deferred / durability-failed paths return before markPosting()).
+        unmarkPosting(wo.id);
       }
     }));
 

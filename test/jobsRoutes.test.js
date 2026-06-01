@@ -34,6 +34,7 @@ const { initDb, q } = await import('../src/db.js');
 const jobsRouter = (await import('../src/routes/jobs.js')).default;
 const { makeErrorHandler } = await import('../src/middleware/security.js');
 const { logger } = await import('../src/utils/logger.js');
+const { markPosting, unmarkPosting } = await import('../src/runner/postingState.js');
 
 let server;
 let baseUrl;
@@ -299,6 +300,40 @@ test('R7 #1: release-absent rejects a malformed (non-UUID) woId with 400', async
   const res = await request('POST', `/api/jobs/${jobId}/work-orders/not-a-uuid/release-absent`, { confirmedAbsent: true });
   assert.equal(res.status, 400);
   assert.equal(res.body.error, 'invalid_id');
+});
+
+test('R8 #1: release-absent REFUSES while the WO POST is still in flight (no race release)', async () => {
+  const jobId = insertJob();
+  const woId = insertWorkOrder(jobId, 'submitting');
+  reserveFor(woId, 'posting-org@AcmeOrg');
+  markPosting(woId);                              // simulate a live in-flight POST
+  try {
+    const res = await request('POST', `/api/jobs/${jobId}/work-orders/${woId}/release-absent`, { confirmedAbsent: true });
+    assert.equal(res.status, 409, 'cannot release a WO whose POST may still 2xx');
+    assert.equal(res.body.error, 'posting');
+    assert.equal(q().getReservation.get(woId).active, 1, 'reservation NOT released during the in-flight window');
+    assert.equal(q().getAllOrdersForJob.all(jobId).find(w => w.id === woId).status, 'submitting', 'status unchanged');
+  } finally {
+    unmarkPosting(woId);
+  }
+});
+
+test('R8 #2: release + status-reset are atomic — a write failure rolls back the release', async () => {
+  const jobId = insertJob();
+  const woId = insertWorkOrder(jobId, 'submitting');
+  reserveFor(woId, 'atomic-org@AcmeOrg');         // active=1, accepted=0
+  // Inject a failure into the SECOND write (the status reset), after the guarded
+  // release has run inside the transaction.
+  const orig = q().updateWorkOrderStatus;
+  q().updateWorkOrderStatus = { run: () => { throw new Error('simulated status write failure'); } };
+  try {
+    const res = await request('POST', `/api/jobs/${jobId}/work-orders/${woId}/release-absent`, { confirmedAbsent: true });
+    assert.equal(res.status, 500, 'the write failure surfaces as an error');
+  } finally {
+    q().updateWorkOrderStatus = orig;             // restore before reading state
+  }
+  assert.equal(q().getReservation.get(woId).active, 1, 'release was ROLLED BACK with the failed status write (atomic)');
+  assert.equal(q().getAllOrdersForJob.all(jobId).find(w => w.id === woId).status, 'submitting', 'status unchanged');
 });
 
 test('DELETE /api/jobs/:id treats planned/deferred/awaiting_approval/completed/failed as safe', async () => {

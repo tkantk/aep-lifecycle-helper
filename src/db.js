@@ -180,7 +180,8 @@ export function initDb() {
     -- order with its own period keys. effective_used(period) = adobe_floor(period)
     --   + SUM(count) of ACTIVE reservations in that period.
     --   active=1: reserved / held (counts toward effective).
-    --   active=0: released — Adobe did NOT process it (4xx / orphan-not-found).
+    --   active=0: released — Adobe did NOT process it (4xx / durability-fail /
+    --             operator release-absent R7 #1; recovery never auto-releases).
     --
     -- accepted (R5): 0 = pending (committed locally, Adobe has not acked); 1 =
     -- Adobe ACKED the POST and has spent the quota. An accepted reservation is
@@ -698,9 +699,13 @@ function prepared() {
         ims_org_id = excluded.ims_org_id, utc_date = excluded.utc_date,
         utc_year_month = excluded.utc_year_month, count = excluded.count, active = 1, accepted = 0
     `),
-    // Adobe ACKED the POST — promote to accepted so it can never be released
-    // and is held until period rollover (review R5).
-    markAcceptedReservation: db.prepare(`UPDATE quota_reservations SET accepted = 1 WHERE work_order_id = ?`),
+    // Adobe ACKED the POST — promote to accepted AND active so it can never be
+    // released and is held until period rollover (review R5). active=1 is
+    // defense-in-depth (review R8 #1): if a release somehow slipped in during the
+    // in-flight window, a subsequent markAccepted re-activates the hold so the
+    // ledger reflects the spend Adobe actually made — it never leaves an
+    // Adobe-acked WO uncounted.
+    markAcceptedReservation: db.prepare(`UPDATE quota_reservations SET active = 1, accepted = 1 WHERE work_order_id = ?`),
     // Release is GUARDED: only an un-accepted (pending) reservation can be
     // deactivated. Adobe-accepted work must never be refunded (review R5 #2).
     releaseReservation:    db.prepare(`UPDATE quota_reservations SET active = 0 WHERE work_order_id = ? AND accepted = 0`),

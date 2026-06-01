@@ -9,6 +9,57 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-06-01 (R8) — Eighth-round review: release-absent reopened an over-ship path
+
+The seventh review confirmed R7's escape hatch was XSS-safe and fail-closed for
+already-acked work, but an eighth review found the new operator action reopened an
+over-ship path plus an atomicity gap and stale docs. Suite **248 → 251** pass.
+
+### #1 (blocker) — release-absent could release a LIVE in-flight POST
+
+`'submitting'` means BOTH "POST in flight right now" AND "settled uncertain", and
+release-absent only checked `status === 'submitting'`. Repro: operator releases
+while the WO's POST is mid-flight → reservation active=0; the delayed Adobe 2xx
+then calls `markAccepted`, which (pre-R8) only set `accepted=1`, NOT `active=1` —
+so the spend stayed uncounted and the next reserve over-ships. **Fixes (two
+layers):** (a) new `runner/postingState.js` — an in-memory set of work orders
+whose POST is in flight; `submission.js` marks a WO before the POST and unmarks it
+in a `finally`; `releaseAbsentOrphan` refuses (409 `posting`) while a WO is in it.
+No race window — the mark and the first `await` are separated by no yield point.
+In-memory is correct: a crash kills any live POST, so a recovered crash-orphan is
+(rightly) resolvable. (b) `markAccepted` now sets `active=1, accepted=1`
+defensively, so an Adobe-acked WO is never left uncounted even if a release
+slipped through.
+
+### #2 (high) — release + status-reset were not atomic
+
+`releaseAbsentOrphan` deactivated the reservation and reset status in two separate
+statements; a failure between them left the reservation released but the WO still
+`submitting`. Wrapped the validation + guarded release + status reset in one
+`db.transaction` — a write failure now rolls the release back. Regression test
+injects a status-write failure and asserts the reservation survives.
+
+### #3 (medium) — a hardcoded test date broke at UTC month rollover
+
+`quotaManager.test.js` hardcoded `2026-06-01` as a "prior day"; it began failing
+when UTC reached 2026-06-01. Replaced with a relative `otherDayThisMonth()` helper
+(a day in the current month that isn't today; rollover-proof). Swept all tests for
+other hardcoded near-dates — none remain.
+
+### #4 (medium) — finished the stale-doc sweep
+
+Corrected the remaining passages describing timeout undercount / auto-rollback /
+obsolete `release(count,...)` signatures: `CLAUDE.md` I5 exception, `ARCHITECTURE`
+recovery callout, `REVIEW.md` (submit flow + error-handling §12 + endpoint), the
+`release` docstring, and the `quota_reservations` schema comment.
+
+### Tests
+
++3 regression tests (in-flight guard 409, atomic-rollback, markAccepted
+re-activation). 251 pass / 0 fail; audit clean.
+
+---
+
 ## 2026-05-31 (R7) — Seventh-round review: operator-workflow completeness
 
 The sixth review confirmed the core safety redesign is sound (no remaining

@@ -170,9 +170,11 @@ with auto-populated forms and live quota banners.
 │              │       - If granted → POST /data/core/hygiene/workorder.
 │              │         POST is non-idempotent: NO retry on 5xx/network.
 │              │         Log if Adobe operationCount diverges from total.
-│              │       - On success: persist adobe_workorder_id.
-│              │       - On failure: release(count, monthlyLimit), mark
-│              │         'failed'.
+│              │       - On 2xx: persist adobe_workorder_id + markAccepted(woId).
+│              │       - On 4xx: release(woId) (guarded WHERE accepted=0),
+│              │         mark 'failed'.
+│              │       - On 5xx/timeout/network (UNCERTAIN): keep 'submitting',
+│              │         HOLD the reservation, reconcile later (R5/R6).
 │              │  CSP guard against re-emitting identity content:
 │              │  ReplanForbiddenError (409) if any WO has shipped.
 └──────┬───────┘
@@ -737,10 +739,11 @@ Full DDL in `src/db.js::initDb()`. Summary:
     UPSERT against both daily and monthly ledgers (monthly skipped if null).
   - If granted, posts to Adobe (hygiene POST is non-idempotent — see
     CLAUDE.md I11).
-  - On success, updates work_orders row.
-  - On failure, calls `release(orgId, count, monthlyLimit)` before
-    re-throwing — monthlyLimit gate prevents bleed into other jobs' monthly
-    counters when monthly tracking was off for this job.
+  - On 2xx, updates work_orders row + `markAccepted(woId)` (the reservation is
+    held until period rollover, R5).
+  - On 4xx, `release(woId)` (guarded WHERE accepted=0) + mark 'failed'.
+  - On 5xx/timeout/network (UNCERTAIN), keeps 'submitting' and HOLDS the
+    reservation — Adobe may have processed it; recovery reconciles later (R5/R6).
 
 ### Status monitor
 - `setInterval(60_000, tick)`.
@@ -1113,16 +1116,17 @@ Please consider these explicitly in your audit:
     semantics vs. the event loop.)
 
 ### Error handling
-12. When `submitWorkOrder` throws, we call `release(count, monthlyLimit)`.
-    What if Adobe accepted the POST but we timed out waiting for the
-    response? The work order is created on their side but we "released"
-    the quota. Mitigation: the hygiene POST is non-idempotent (CLAUDE.md
-    I11) so we never silently double-fire on a retry; the orphan-recovery
-    routine on next startup attempts to reconcile via `GET /hygiene/
-    workorder?displayName=…`. On match it records the Adobe ID without
-    re-submitting. On 400 from the listing endpoint it leaves the row in
-    `submitting` rather than rolling back, so we don't create a duplicate
-    work order on the next submit.
+12. When `submitWorkOrder` throws we split by certainty: a **4xx** calls
+    `release(woId)` (guarded, refunds only un-acked work) + marks 'failed'; a
+    **5xx/timeout/network** is UNCERTAIN — Adobe may have created the WO, so we
+    do NOT release; the reservation stays HELD and the WO stays `submitting`.
+    The hygiene POST is non-idempotent (CLAUDE.md I11) so we never silently
+    double-fire on a retry; orphan recovery reconciles via `GET /hygiene/
+    workorder?displayName=…` (the persisted name, R6 #2). On match → record the
+    Adobe ID + markAccepted, no re-submit. On ANY no-match (recognized-empty,
+    400, network) → leave in `submitting`, reservation held; NEVER auto-roll-back
+    (R6 #1). The operator resolves a verified-absent one via release-absent
+    (R7 #1), gated against a still-in-flight POST (R8 #1).
 
 13. The retry logic retries on 401 (token refresh) and 429 (rate-limit;
     Adobe didn't process the request). 5xx and network errors retry only

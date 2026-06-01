@@ -43,6 +43,17 @@ const R = (o, wo, count, daily = DAILY, monthly = MONTHLY) =>
 
 function todayUtc()  { const d = new Date(); return d.toISOString().slice(0, 10); }
 function monthUtc()  { const d = new Date(); return d.toISOString().slice(0, 7); }
+// A day in the CURRENT UTC month that is NOT today — so a reservation dated here
+// counts in this month's monthly sum but not today's daily sum. Rollover-proof
+// (works on the 1st of the month too: it picks the 2nd). Day 1 and day 2 exist
+// in every month. (Review R8 #3 — replaces a hardcoded date that broke at UTC
+// month rollover.)
+function otherDayThisMonth() {
+  const d = new Date();
+  const ym = d.toISOString().slice(0, 7);
+  const otherDay = d.getUTCDate() === 1 ? 2 : 1;
+  return { date: `${ym}-${String(otherDay).padStart(2, '0')}`, month: ym };
+}
 
 before(() => { initDb(); });
 after(() => {
@@ -101,6 +112,22 @@ test('release REFUSES to deactivate an ACCEPTED reservation (no refund of Adobe-
   release('wo1');                              // must be a no-op
   assert.equal(q().getReservation.get('wo1').active, 1, 'accepted reservation must NOT be released');
   assert.equal(peek(o, DAILY, MONTHLY).daily.used, 600_000, 'quota stays held — Adobe spent it');
+});
+
+test('R8 #1: markAccepted reactivates a (racily) released reservation — Adobe-acked work is never left uncounted', () => {
+  // The blocker: if release-absent slips in during a WO's in-flight POST, the
+  // reservation goes active=0; the delayed Adobe 2xx then calls markAccepted.
+  // Pre-R8 markAccepted only set accepted=1 (NOT active=1), so the spend stayed
+  // uncounted → over-ship. markAccepted now re-activates the hold defensively.
+  const o = org();
+  R(o, 'wo1', 100_000);                         // active=1, accepted=0
+  release('wo1');                                // active=0 (simulated race)
+  assert.equal(peek(o, DAILY, MONTHLY).daily.used, 0);
+  markAccepted('wo1');                           // Adobe 2xx arrives
+  const row = q().getReservation.get('wo1');
+  assert.equal(row.active, 1, 'markAccepted re-activates the hold (defense-in-depth)');
+  assert.equal(row.accepted, 1);
+  assert.equal(peek(o, DAILY, MONTHLY).daily.used, 100_000, 'the Adobe spend is counted again — no over-ship');
 });
 
 test('reactivate restores a released reservation AS accepted', () => {
@@ -264,13 +291,14 @@ test('R5 finding #3: migration folds legacy used→adobe_floor and marks legacy 
 test('R5: multi-day shipping toward the monthly cap grants correctly (the operator\'s real job)', () => {
   const o = org();
   const monthly = 3_000_000;
-  // Day 1: ship 1M (held, accepted). utc_date = a fixed "day 1".
+  // "Day 1": a prior day THIS month (held, accepted) — counts monthly, not today's daily.
+  const d1 = otherDayThisMonth();
   for (let i = 0; i < 10; i++) {
-    q().upsertReservation.run({ workOrderId: `d1-${i}`, imsOrgId: o, utcDate: '2026-06-01', utcMonth: '2026-06', count: 100_000 });
+    q().upsertReservation.run({ workOrderId: `d1-${i}`, imsOrgId: o, utcDate: d1.date, utcMonth: d1.month, count: 100_000 });
     markAccepted(`d1-${i}`);
   }
-  // Day 2: Adobe assimilated day-1 → monthly floor = 1M. effective = floor(1M) + held(1M) = 2M.
-  q().maxMonthlyFloor.run(o, '2026-06', 1_000_000);
+  // "Day 2" (today): Adobe assimilated day-1 → monthly floor = 1M. effective = floor(1M) + held(1M) = 2M.
+  q().maxMonthlyFloor.run(o, d1.month, 1_000_000);
   // A day-2 reservation of 570k (the user's actual remainder) must GRANT: 2M + 570k = 2.57M ≤ 3M.
   const r = reserve({ workOrderId: 'd2', imsOrgId: o, count: 570_000,
     dailyLimit: DAILY, monthlyLimit: monthly });
