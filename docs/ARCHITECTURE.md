@@ -238,8 +238,10 @@ demo — never for production. See CLAUDE.md I12.
                          reservation, leave in 'submitting' for operator
                          reconciliation. NEVER auto-rolls back (R6 #1) — a no-
                          match doesn't prove absence (async creation may lag).
-                       • no match + was failed   → leave as 'failed' (a 4xx
-                         rejection genuinely never processed)
+                       • no match + was failed   → leave as 'failed', AMBIGUOUS.
+                         A no-match does NOT prove absence (R6 #1); a legacy/
+                         timeout 'failed' Adobe may actually have processed. Stays
+                         failure_definitive=0 so ordinary delete fail-closes (R11).
                        • Adobe 400 / network    → leave as-is, retry next time
                      No restart required; runs in-process against the same
                      adobeClient as the rest of the tool.

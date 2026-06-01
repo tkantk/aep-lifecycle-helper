@@ -9,6 +9,28 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-06-01 (R11.1) — R11 review follow-up: operator UI + wording (no safety logic)
+
+The R11 review verdict: **"R11 closes the destructive blocker… I did not find
+another silent duplicate-delete or over-ship path. Push d5025ae and open the PR."**
+The remaining items were UI/doc cleanup so the operator isn't stranded when the new
+fail-closed protection activates. No backend logic changed; suite stays 267/267.
+
+- **(medium) UI resolves the `unsettled` 409.** The Delete-Job flow handled only
+  `in_flight` (offered a force confirm); an `unsettled` 409 (R11 — a WO reconciling
+  or an ambiguous failed) just toasted with no action. It now offers the same
+  verified force path, with a STRONGER confirm: force only after verifying absence
+  in Adobe's UI; forcing may lose quota tracking → next batch could over-count.
+  `web/app.js`.
+- **(low) reconcile toast wording.** `${stillFailed} confirmed failed` →
+  `… failed locally, still unconfirmed in Adobe (verify before deleting)` — a
+  no-match doesn't confirm failure/absence. `web/app.js`.
+- **(low) doc sweep.** Corrected the last comments/docs that called a failed
+  no-match "confirmed absent": `routes/jobs.js`, `ARCHITECTURE.md`, `DESIGN_DOC.md`,
+  `REVIEW.md` now say it stays AMBIGUOUS (absence unproven, fail-closed on delete).
+
+---
+
 ## 2026-06-01 (R11) — Eleventh-round review: job-delete vs. reconcile over-ship
 
 The R10 consolidated audit surfaced one more over-ship path. Suite **262 → 266**

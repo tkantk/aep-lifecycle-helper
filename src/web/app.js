@@ -1170,18 +1170,25 @@ async function renderExpand() {
       state.workOrders = [];
       goto('upload');
     } catch (err) {
-      if (err.status === 409 && err.data?.error === 'in_flight') {
-        // Server said WOs are mid-flight to Adobe. Offer the force path.
-        const forceOk = confirm(
-          `${err.data.message}\n\n` +
-          `Force-delete anyway?\n\n` +
-          `Adobe's deletion of those identifiers will continue independently — ` +
-          `we just lose visibility into when it finishes.`
-        );
+      const code = err.status === 409 ? err.data?.error : null;
+      // Both blocking codes offer a force path, but 'unsettled' (R11 #1 — a WO
+      // is reconciling or is an ambiguous failed that Adobe MAY have processed)
+      // carries a stronger warning: forcing can lose quota tracking for real
+      // Adobe work, so the operator must first verify absence in Adobe's UI.
+      if (code === 'in_flight' || code === 'unsettled') {
+        const extra = code === 'unsettled'
+          ? `\n\nForce-delete ONLY after you have verified in Adobe's Data Lifecycle UI that these ` +
+            `work order(s) do NOT exist there. Forcing may lose quota tracking for work Adobe actually ` +
+            `performed — your next batch could over-count against the cap.`
+          : `\n\nAdobe's deletion of those identifiers will continue independently — ` +
+            `we just lose visibility into when it finishes.`;
+        const forceOk = confirm(`${err.data.message}${extra}\n\nForce-delete anyway?`);
         if (!forceOk) return;
         try {
           await http('DELETE', `/jobs/${state.job.id}?force=true`);
-          showToast(`Job force-deleted (Adobe-side deletions still in flight).`, { kind: 'warning' });
+          showToast(code === 'unsettled'
+            ? `Job force-deleted — verify your next batch's quota against Adobe's /quota.`
+            : `Job force-deleted (Adobe-side deletions still in flight).`, { kind: 'warning' });
           suppressAutoLoadOnce();
           state.job = null;
           state.progress = null;
@@ -1661,7 +1668,7 @@ async function renderSubmit() {
           const r = await http('POST', `/jobs/${state.job.id}/reconcile`);
           const parts = [];
           if (r.matched > 0)        parts.push(`${r.matched} matched in Adobe`);
-          if (r.stillFailed > 0)    parts.push(`${r.stillFailed} confirmed failed`);
+          if (r.stillFailed > 0)    parts.push(`${r.stillFailed} failed locally, still unconfirmed in Adobe (verify before deleting)`);
           if (r.indeterminate > 0)  parts.push(`${r.indeterminate} still unconfirmed — verify in Adobe, then use “Confirmed absent → retry” below`);
           if (r.perWoError > 0)     parts.push(`${r.perWoError} errored`);
           showToast(parts.length ? `Reconcile: ${parts.join(', ')}.` : 'Nothing to reconcile.', { kind: 'success' });

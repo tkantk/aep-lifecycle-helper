@@ -238,7 +238,9 @@ router.post('/:id/approve-month', (req, res, next) => {
  *                     creation may lag) OR a 400 from the lookup. Left in
  *                     'submitting' with its reservation HELD for operator
  *                     reconciliation; NEVER auto-rolled-back (review R6 #1).
- *  - stillFailed    → 'failed' WO confirmed absent in Adobe → left as 'failed'
+ *  - stillFailed    → 'failed' WO not listed in Adobe — left as 'failed' but
+ *                     AMBIGUOUS (a no-match doesn't prove absence, R6 #1); stays
+ *                     failure_definitive=0 so ordinary delete fail-closes (R11)
  *  - rolledBack     → always 0 (R6 #1 removed auto-rollback; field kept for
  *                     response-shape stability)
  *  - perWoError     → other failures (credentials missing, network) — left as-is
