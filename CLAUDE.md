@@ -794,8 +794,8 @@ which require `https://platform-{region}.adobe.io` (region ∈ `va7`, `nld2`,
 7. Run `npm test` before suggesting a change is done (use `npm test`, NOT
    `node --test test` — on Node ≥23 the bare `test` arg is treated as a test
    name and silently runs nothing; `npm test` → `scripts/run-tests.mjs` which
-   enumerates `test/*.test.js`). **262 tests should pass** (as of the 2026-06-01
-   R10 recovery-state-correctness session — monotonic CAS + terminal finalisation + parallel reconcile).
+   enumerates `test/*.test.js`). **266 tests should pass** (as of the 2026-06-01
+   R11 delete-safety session — ambiguous-failed + reconciling delete guards).
 8. **After your change**, append a bullet to the current session in
    `docs/CHANGELOG.md` describing what + why. If you changed the module map,
    data flow, Adobe contract, or DB schema, also update `docs/ARCHITECTURE.md`.

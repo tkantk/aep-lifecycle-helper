@@ -362,16 +362,55 @@ test('R8 #2: release + status-reset are atomic — a write failure rolls back th
   assert.equal(q().getAllOrdersForJob.all(jobId).find(w => w.id === woId).status, 'submitting', 'status unchanged');
 });
 
-test('DELETE /api/jobs/:id treats planned/deferred/awaiting_approval/completed/failed as safe', async () => {
+test('DELETE /api/jobs/:id treats planned/deferred/awaiting_approval/completed + settled-failed as safe', async () => {
   const jobId = insertJob();
   insertWorkOrder(jobId, 'planned');
   insertWorkOrder(jobId, 'deferred');
   insertWorkOrder(jobId, 'awaiting_approval');
   insertWorkOrder(jobId, 'completed');
-  insertWorkOrder(jobId, 'failed');
+  // A DEFINITIVE 4xx failure (Adobe never created it) — settled, safe to delete.
+  const def = insertWorkOrder(jobId, 'failed');
+  q().markWorkOrderFailedDefinitive.run('Adobe 400 validation error', def);
+  // An Adobe-acked failed (has an ID, terminal) — we KNOW Adobe has it, so not
+  // ambiguous. updateWorkOrderReconciledMatch maps adobeStatus 'failed' → local
+  // 'failed' + completed_at (R10 #2).
+  const acked = insertWorkOrder(jobId, 'submitting');
+  q().updateWorkOrderReconciledMatch.run({ id: acked, adobeWorkorderId: 'DI-ackedfail', adobeStatus: 'failed', bundleId: null, submittedAt: null });
 
   const res = await request('DELETE', `/api/jobs/${jobId}`);
-  assert.equal(res.status, 200);   // none of these are "in flight to Adobe"
+  assert.equal(res.status, 200, 'settled states (incl. definitive-4xx + Adobe-acked failed) are safe');
+});
+
+test('R11 #1: DELETE refuses (409 unsettled) an AMBIGUOUS failed WO (no Adobe ID, not definitive) without force', async () => {
+  const jobId = insertJob();
+  insertWorkOrder(jobId, 'failed');   // legacy/ambiguous: no Adobe ID, failure_definitive=0
+  const res = await request('DELETE', `/api/jobs/${jobId}`);
+  assert.equal(res.status, 409);
+  assert.equal(res.body.error, 'unsettled');
+  assert.ok(q().getJob.get(jobId), 'job NOT deleted — its failed WO may be real Adobe work');
+});
+
+test('R11 #1: DELETE ?force=true deletes an ambiguous failed WO (explicit operator override)', async () => {
+  const jobId = insertJob();
+  insertWorkOrder(jobId, 'failed');
+  const res = await request('DELETE', `/api/jobs/${jobId}?force=true`);
+  assert.equal(res.status, 200);
+  assert.equal(q().getJob.get(jobId), undefined);
+});
+
+test('R11 #1: DELETE refuses (409 unsettled) while a WO is being reconciled, without force', async () => {
+  const jobId = insertJob();
+  const woId = insertWorkOrder(jobId, 'failed');
+  q().markWorkOrderFailedDefinitive.run('4xx', woId);   // definitive so only the reconciling guard blocks
+  markReconciling(woId);
+  try {
+    const res = await request('DELETE', `/api/jobs/${jobId}`);
+    assert.equal(res.status, 409);
+    assert.equal(res.body.error, 'unsettled');
+    assert.ok(q().getJob.get(jobId), 'job NOT deleted while a reconcile lookup is in flight for it');
+  } finally {
+    unmarkReconciling(woId);
+  }
 });
 
 test('DELETE /api/jobs/:id unlinks the uploaded CSV', async () => {

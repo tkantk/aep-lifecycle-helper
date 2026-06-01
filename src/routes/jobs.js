@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { q, prepareStreamIdentitiesBySource } from '../db.js';
 import { planWorkOrders, runSubmission } from '../runner/submission.js';
 import { reconcileJobOrphans, releaseAbsentOrphan } from '../runner/recovery.js';
+import { isWorkOrderReconciling } from '../runner/postingState.js';
 import { peek as peekQuota } from '../services/quotaManager.js';
 import { getOrgQuota } from '../services/quotaApi.js';
 import { decryptCreds } from '../utils/crypto.js';
@@ -310,12 +311,17 @@ router.get('/:id/export', async (req, res, next) => {
  *  anyway; the Adobe-side deletions continue independently — only local
  *  tracking is lost.
  *
- *  States considered "in flight":
+ *  States considered "in flight" (block without --force):
  *    submitting → POST to Adobe in progress
  *    submitted, received, validated, ingested → Adobe is processing it
- *  States safe to delete without --force:
+ *  Also blocked without --force (review R11 #1):
+ *    any WO with a reconciliation lookup in flight (deleting races it)
+ *    a 'failed' WO with NO Adobe ID that is NOT a definitive 4xx — an
+ *      ambiguous legacy/timeout outcome Adobe may actually have processed
+ *  Safe to delete without --force:
  *    planned, deferred, awaiting_approval → never went to Adobe
- *    completed, failed → terminal
+ *    completed / Adobe-acked failed (has an ID) → terminal, reservation kept
+ *      as a tombstone; definitive-4xx failed → Adobe never created it
  *
  *  Does NOT refund quota. The local ledger reflects what Adobe actually
  *  processed; force-deleting an in-flight WO doesn't un-consume that quota
@@ -348,6 +354,33 @@ router.delete('/:id', async (req, res, next) => {
       err.status = 409; err.code = 'in_flight';
       err.publicMessage = err.message;
       err.inFlightCount = inFlight.length;
+      return next(err);
+    }
+
+    // R11 #1 — fail closed on AMBIGUOUS work orders whose Adobe outcome isn't
+    // settled, so an ordinary delete can't erase quota tracking for work Adobe
+    // actually did. Two cases:
+    //   (a) a reconciliation lookup is in flight for a WO — deleting now would
+    //       race it (the lookup may find the WO in Adobe + re-reserve quota);
+    //   (b) a 'failed' WO with NO Adobe ID that is NOT a definitive 4xx
+    //       rejection — a legacy/timeout outcome Adobe may have processed.
+    // The synchronous check + delete below means no reconcile can interleave
+    // between this check and the cascade. ?force=true is the explicit operator
+    // override (you may lose quota tracking for work Adobe actually did).
+    const reconciling     = wos.filter(w => isWorkOrderReconciling(w.id));
+    const ambiguousFailed = wos.filter(w => w.status === 'failed' && !w.adobe_workorder_id && !w.failure_definitive);
+    if ((reconciling.length > 0 || ambiguousFailed.length > 0) && !force) {
+      const reasons = [];
+      if (reconciling.length > 0)     reasons.push(`${reconciling.length} being reconciled with Adobe right now`);
+      if (ambiguousFailed.length > 0) reasons.push(`${ambiguousFailed.length} failed locally but never confirmed absent in Adobe (Adobe may have processed them)`);
+      const err = new Error(
+        `Cannot delete: ${reasons.join('; ')}. Run Reconcile first to settle their Adobe status, ` +
+        `or pass ?force=true to delete anyway — forcing may lose quota tracking for work Adobe actually performed.`
+      );
+      err.status = 409; err.code = 'unsettled';
+      err.publicMessage = err.message;
+      err.reconcilingCount = reconciling.length;
+      err.ambiguousFailedCount = ambiguousFailed.length;
       return next(err);
     }
 

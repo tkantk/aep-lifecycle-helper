@@ -489,7 +489,10 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
 
         if (isAdobeRejection) {
           release(wo.id);
-          q().updateWorkOrderStatus.run('failed', err.message, wo.id);
+          // Mark DEFINITIVE (review R11 #1): a 4xx means Adobe never created the
+          // WO (no quota spent), so it's unambiguously safe to delete later —
+          // unlike an uncertain timeout (kept 'submitting') or a legacy 'failed'.
+          q().markWorkOrderFailedDefinitive.run(err.message, wo.id);
           failed++;
           logger.error({ localId: wo.id, status, err: err.message },
             'submission failed (Adobe rejected — 4xx)');

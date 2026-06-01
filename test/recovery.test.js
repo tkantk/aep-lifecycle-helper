@@ -23,7 +23,7 @@ process.env.OUTPUT_DIR = os.tmpdir();
 const { initDb, q, db } = await import('../src/db.js');
 const { storeCreds } = await import('../src/utils/crypto.js');
 const { reconcileOrphanWorkOrders, reconcileJobOrphans, resumeExpandingJobs } = await import('../src/runner/recovery.js');
-const { reserve, peek } = await import('../src/services/quotaManager.js');
+const { reserve, peek, release } = await import('../src/services/quotaManager.js');
 const { isWorkOrderReconciling } = await import('../src/runner/postingState.js');
 
 const GATEWAY = 'https://platform.adobe.io';
@@ -270,6 +270,38 @@ test('R10 #2 (manual route): reconcileJobOrphans finalises a terminal=failed mat
   assert.equal(wo.adobe_workorder_id, 'DI-failed');
   assert.equal(wo.status, 'failed', 'terminal=failed normalised locally');
   assert.ok(wo.completed_at, 'completed_at stamped');
+});
+
+test('R11 #1: a legacy failed WO is reconcile-guarded during its lookup, and its quota is re-reserved when Adobe has it', async () => {
+  // The over-ship race: a legacy 'failed' WO with an INACTIVE reservation (the
+  // old timeout bug released it even though Adobe processed it). If ordinary
+  // job-delete removed it during a reconcile lookup, the reconcile's reactivate
+  // is lost → the spend is untracked → over-ship. R11 guards the WO while the
+  // lookup is in flight (ordinary delete → 409) and the reconcile re-reserves.
+  const { jobId } = seedCredAndJob({ name: 'legacy-fail' });
+  const localId = `wo-legfail-${seq}`;
+  q().insertWorkOrder.run({ id: localId, jobId, dayIndex: 1, datasetIds: 'ALL',
+    targetServicesJson: null, namespacesIdentities: '[]', identifierCount: 2, status: 'failed' });
+  reserve({ workOrderId: localId, imsOrgId: `org-${seq}@AcmeOrg`, count: 2, dailyLimit: 1_000_000, monthlyLimit: null });
+  release(localId);                                  // inactive (the legacy bug)
+  assert.equal(q().getReservation.get(localId).active, 0);
+
+  mockIms();
+  nock(GATEWAY).get(/\/data\/core\/hygiene\/workorder/).query(true).delay(120)
+    .reply(200, { results: [{ workorderId: 'DI-real', displayName: `Delete legacy-fail - WO ${localId}`, status: 'completed', createdAt: '2026-06-01T00:00:00Z' }] });
+
+  const p = reconcileJobOrphans(jobId);
+  // While the lookup is in flight the WO is guarded — the ordinary DELETE route
+  // checks isWorkOrderReconciling and would 409 (proven at the route level too).
+  await new Promise(r => setTimeout(r, 40));
+  assert.equal(isWorkOrderReconciling(localId), true, 'guarded against ordinary delete during the lookup');
+
+  await p;
+  // Adobe HAD it → reconcile reactivated the reservation, re-tracking the spend.
+  const resv = q().getReservation.get(localId);
+  assert.equal(resv.active, 1, 'quota re-reserved for real Adobe work (no over-ship)');
+  assert.equal(resv.accepted, 1);
+  assert.equal(q().getAllOrdersForJob.all(jobId)[0].status, 'completed', 'terminal Adobe status finalised (R10 #2)');
 });
 
 test('R10 #3: a SLOW lookup for one orphan does not hold the reconcile guard for another (parallel)', async () => {

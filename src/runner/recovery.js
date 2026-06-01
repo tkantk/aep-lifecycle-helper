@@ -13,6 +13,16 @@ import { isWorkOrderPosting, markReconciling, unmarkReconciling, isWorkOrderReco
 // lookup (a 60s GET timeout + retries) can't hold the reconcile guard for every
 // later orphan for minutes — each WO is unguarded as soon as ITS OWN lookup
 // settles. Sequential would serialize the guard-release behind the slowest WO.
+//
+// KNOWN, INTENTIONAL over-defer (review R11 #2): mark-all-UP-FRONT means a WO
+// still QUEUED behind the concurrency limit (e.g. the 6th of 6 with limit 5) is
+// guarded — release-absent returns 409 reconciling — before its own lookup has
+// even started. That is SAFE (over-defer; the queue drains as lookups settle)
+// and is the price of closing the duplicate-delete window: marking each WO only
+// right before its own lookup would leave a queued WO un-guarded, so the operator
+// could release+retry it before the loop reaches it and Adobe would hold the
+// original AND the retry → duplicate. The attempt-CAS protects LOCAL state but
+// cannot un-create an Adobe-side delete, so mark-all-up-front is required.
 const RECONCILE_CONCURRENCY = 5;
 
 /**
@@ -191,13 +201,17 @@ export async function reconcileOrphanWorkOrders() {
           // irreversible delete (review R6 #1). Treat as INDETERMINATE: hold the
           // reservation, keep the WO in 'submitting'. CAS-guarded so a stale
           // no-match can't revert a WO that changed during the lookup.
-          applyIfStillUnresolved(wo.id, snapshotAttempt, () => {
+          const held = applyIfStillUnresolved(wo.id, snapshotAttempt, () => {
             q().updateWorkOrderStatus.run('submitting',
               'submission outcome unconfirmed: not yet listed in Adobe (async creation may lag). ' +
               'Left for operator reconciliation — verify in Adobe before any retry.', wo.id);
           });
-          logger.warn({ localId: wo.id },
-            'recovery: orphan not yet listed in Adobe — INDETERMINATE, left in submitting (no rollback, no release)');
+          // Only call it INDETERMINATE if the write actually applied; if the CAS
+          // discarded it, a CONCURRENT op (a fast match, or release+retry)
+          // resolved the WO — don't emit a misleading signal (review R11 #3).
+          logger.warn({ localId: wo.id }, held
+            ? 'recovery: orphan not yet listed in Adobe — INDETERMINATE, left in submitting (no rollback, no release)'
+            : 'recovery: stale no-match discarded — WO resolved/changed during the lookup (R10 #1)');
         }
       } catch (err) {
         // Transient error — leave the orphan alone and retry on next startup.
@@ -405,14 +419,21 @@ export async function reconcileJobOrphans(jobId) {
           // No-match does NOT prove absence (async creation, no read-after-write
           // guarantee). INDETERMINATE — hold the reservation, keep 'submitting'
           // (review R6 #1). CAS-guarded against a stale revert.
-          indeterminate++;
-          applyIfStillUnresolved(wo.id, snapshotAttempt, () => {
+          const held = applyIfStillUnresolved(wo.id, snapshotAttempt, () => {
             q().updateWorkOrderStatus.run('submitting',
               'submission outcome unconfirmed: not yet listed in Adobe (async creation may lag). ' +
               'Verify in Adobe before any retry.', wo.id);
           });
-          logger.warn({ localId: wo.id },
-            'reconcile: orphan not yet listed in Adobe — INDETERMINATE, left in submitting (no rollback)');
+          // Count/report INDETERMINATE only if the write applied; a CAS discard
+          // means a concurrent op resolved the WO (review R11 #3).
+          if (held) {
+            indeterminate++;
+            logger.warn({ localId: wo.id },
+              'reconcile: orphan not yet listed in Adobe — INDETERMINATE, left in submitting (no rollback)');
+          } else {
+            logger.warn({ localId: wo.id },
+              'reconcile: stale no-match discarded — WO resolved/changed during the lookup (R10 #1)');
+          }
         } else {
           // status='failed' AND Adobe confirms absence → genuinely failed.
           stillFailed++;

@@ -274,6 +274,13 @@ export function initDb() {
     // can never mutate a WO the operator released + retried during the await.
     // Bumped by release-absent (the WO becomes a fresh attempt).
     { table: 'work_orders', column: 'attempt', type: 'INTEGER NOT NULL DEFAULT 0' },
+    // Review R11 #1: distinguishes a DEFINITIVE Adobe rejection (a 4xx on the
+    // POST — never created in Adobe, consumed no quota) from an AMBIGUOUS 'failed'
+    // row (a legacy pre-2026-05-29 timeout that Adobe may actually have
+    // processed). Set to 1 only on a 4xx. Existing/legacy 'failed' rows default
+    // to 0 = ambiguous, so ordinary job-delete fails closed on them (they could
+    // represent real Adobe spend; deleting their tracking risks over-ship).
+    { table: 'work_orders', column: 'failure_definitive', type: 'INTEGER NOT NULL DEFAULT 0' },
   ];
   for (const { table, column, type } of additiveColumns) {
     try {
@@ -628,6 +635,12 @@ function prepared() {
     setProjectedMonths: db.prepare(`UPDATE jobs SET projected_months = ?, updated_at = datetime('now') WHERE id = ?`),
     updateWorkOrderStatus: db.prepare(`
       UPDATE work_orders SET status = ?, last_error = ?, updated_at = datetime('now') WHERE id = ?
+    `),
+    // Review R11 #1: a 4xx is a DEFINITIVE rejection — Adobe never created the WO,
+    // so it consumed no quota and is safe to delete. Mark it so ordinary
+    // job-delete can distinguish it from an ambiguous (legacy/timeout) 'failed'.
+    markWorkOrderFailedDefinitive: db.prepare(`
+      UPDATE work_orders SET status = 'failed', last_error = ?, failure_definitive = 1, updated_at = datetime('now') WHERE id = ?
     `),
     // Durable pre-POST checkpoint (review R6 #2): set status='submitting' AND the
     // exact displayName that will be sent to Adobe. COALESCE keeps an existing

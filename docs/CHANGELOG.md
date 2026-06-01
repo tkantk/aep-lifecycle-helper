@@ -9,6 +9,48 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-06-01 (R11) — Eleventh-round review: job-delete vs. reconcile over-ship
+
+The R10 consolidated audit surfaced one more over-ship path. Suite **262 → 266**
+pass, audit clean.
+
+### #1 (blocker) — ordinary job-delete could erase tracking for real Adobe work
+
+A legacy/timeout `failed` WO (no Adobe ID, an INACTIVE reservation) might actually
+have been processed by Adobe. Ordinary `DELETE /api/jobs/:id` treated every
+`failed` row as safe and deleted it + its inactive reservation. Racing a
+concurrent reconcile (whose lookup would find the WO + re-reserve the quota), the
+delete removed the row first; the R10 CAS correctly discarded the stale lookup —
+but the quota was now untracked, so a later `reserve` over-shipped. **Fix:**
+ordinary delete now fails closed (409 `unsettled`, unless `?force=true`) when any
+WO is (a) currently being reconciled (`isWorkOrderReconciling`) or (b) an
+AMBIGUOUS `failed` — no Adobe ID and not a definitive 4xx. The check + cascade are
+synchronous so no reconcile can interleave. A new `work_orders.failure_definitive`
+column (set on a 4xx, which Adobe never created → consumed no quota) distinguishes
+a settled rejection (safe to delete) from a legacy/ambiguous outcome; legacy rows
+default to ambiguous (fail-closed). `routes/jobs.js`, `db.js`, `submission.js`.
+
+### #2 (medium) — documented the queued-row reconcile over-defer
+
+With `p-limit(5)`, a WO queued behind the limit is guarded (release-absent → 409)
+before its own lookup starts — safe over-defer. Marking each WO only right before
+its lookup would reopen the duplicate-delete window (mark-all-upfront is required;
+the CAS can't un-create an Adobe delete), so this is documented as intentional.
+
+### #3 (low) — no misleading INDETERMINATE on a CAS discard
+
+A stale no-match that the CAS discarded (a concurrent op resolved the WO) no
+longer increments the reconcile `indeterminate` counter or logs INDETERMINATE; it
+logs a "stale discarded" note instead.
+
+### Tests
+
++4: ambiguous-`failed` delete refused (409), `?force` override, delete refused
+while reconciling, and an end-to-end legacy-failed reconcile (guarded during the
+lookup + quota re-reserved when Adobe has it). 266 pass / 0 fail.
+
+---
+
 ## 2026-06-01 (R10) — Tenth-round review: recovery-state correctness (consolidated audit)
 
 R9 closed the duplicate-delete race; a consolidated recovery audit then found two
