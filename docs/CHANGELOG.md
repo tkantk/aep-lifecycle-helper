@@ -9,6 +9,54 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-06-01 (P1) — Flaky-network prod incident: quota-preflight retry, monitor backoff, instant job-load
+
+Live prod incident on a Windows box behind a flaky corporate network to Adobe.
+After recovering the 1.6M-profile job (1,000,000 deleted; 607,384 still planned),
+a Submit blocked with *"Adobe /quota is unreachable; refusing to ship against a
+stale (cached) snapshot"* while the QUOTA panel showed numbers, the terminal
+spammed `status poll failed … timeout of 15000ms exceeded` / `monitor tick
+complete polled=10 failed=10`, and clicking a job "did nothing for a long time
+then suddenly opened". Three independent causes, three fixes. Suite 267 → **274**.
+A 3-lens adversarial review returned **GO, zero safety blockers**: no fail-closed
+or over-ship guard is weakened (I15/R5/I11 re-verified verbatim).
+
+- **(Backend, #1) `/quota` preflight self-heals on a flaky network.** Root cause:
+  `adobeClient` deliberately does NOT retry timeouts (`axiosRetry.isNetworkError`
+  excludes `ECONNABORTED`), so a single slow `/quota` GET fell straight through to
+  the stale path and BLOCKED the destructive submit. `getOrgQuota` gains a bounded
+  outer retry (`liveAttempts` / `retryDelayMs`, linear backoff) BEFORE the
+  unchanged stale/throw fallback; submission's preflight passes
+  `config.quotaPreflightAttempts` (default 3) / `quotaPreflightRetryDelayMs`
+  (2000). **Fail-closed preserved:** `stale:false` is still set only on a genuine
+  2xx; all-attempts-fail still falls to stale (refused, I15) or throws
+  `quota_unavailable`. The retry can only turn a transient timeout into a FRESH
+  snapshot. `services/quotaApi.js`, `runner/submission.js`, `config.js`
+  (`QUOTA_PREFLIGHT_ATTEMPTS` / `QUOTA_PREFLIGHT_RETRY_DELAY_MS` env).
+- **(Backend, #2) Monitor per-WO exponential backoff.** On an Adobe outage every
+  status poll timed out and the monitor re-polled all open WOs every 60s, flooding
+  the network and contending with the Submit's `/quota` call. A failed poll now
+  backs the WO off (2×,4×,8×… capped at 16×60s); a success clears it instantly.
+  **R5 intact** — the monitor still writes only DISPLAY status, never the quota
+  ledger. The poll cursor (`last_polled_at`) is now stamped for EVERY candidate,
+  including backed-off ones skipped this tick, so a backed-off WO can't freeze the
+  `LIMIT 100` window and starve eligible WOs on orgs with >100 open WOs (caught by
+  the review). `runner/monitor.js`.
+- **(Backend/Frontend, #3) Job-load no longer freezes the event loop.** The real
+  cause of the "click does nothing, then opens" lag wasn't quota — `GET
+  /jobs/:id` ran `countIdentitiesByNamespace` (a nested GROUP-BY over every
+  `expanded_identities` row — millions on a 1.6M job) SYNCHRONOUSLY on every load,
+  freezing the single-threaded loop (UI + monitor). The breakdown is now opt-in
+  via `?breakdown=1`; the only consumer (Expand tab) passes it and null-guards.
+  `switchToJob` also paints an immediate spinner. `routes/jobs.js`, `web/app.js`.
+- **(Tests, +7)** `quotaApi.test.js` (+2: transient-timeout self-heal returns FRESH;
+  exhausting all attempts still raises `quota_unavailable`), `monitorBackoff.test.js`
+  (NEW, 3: fail→skip, success→full cadence, backed-off WO cursor still advances),
+  `jobsRoutes.test.js` (+2: byNamespace omitted by default / included with
+  `?breakdown=1`).
+- **Known minor (deferred):** `_pollBackoff` entries for WOs that reach terminal
+  status linger until restart (bounded dead memory; cosmetic on a laptop tool).
+
 ## 2026-06-01 (R11.1) — R11 review follow-up: operator UI + wording (no safety logic)
 
 The R11 review verdict: **"R11 closes the destructive blocker… I did not find

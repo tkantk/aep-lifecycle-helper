@@ -989,6 +989,12 @@ async function ensureActiveJobLoaded(preferredStatuses = null) {
  * state.job and shows that job's progress / plan / submit state.
  */
 async function switchToJob(jobId) {
+  // Immediate feedback: paint a spinner into the current tab body so the click
+  // visibly registers, even though the job-detail round-trip is now fast (the
+  // heavy namespace GROUP-BY was moved off this path). Operators reported "we
+  // don't know if anything is happening on click" while the event loop froze.
+  const body = document.getElementById(`${state.step}-body`);
+  if (body) body.innerHTML = '<div class="empty-state"><div class="big-icon spin">↻</div><div>Loading job…</div></div>';
   try {
     const detail = await http('GET', `/jobs/${jobId}`);
     state.job = detail.job;
@@ -1214,7 +1220,10 @@ async function renderExpand() {
   const render = async () => {
     const [p, j] = await Promise.all([
       http('GET', `/jobs/${state.job.id}/progress`),
-      http('GET', `/jobs/${state.job.id}`),
+      // ?breakdown=1: the Expand tab is the ONLY consumer of byNamespace, and
+      // that GROUP-BY is heavy on a large job — every other caller (job switch,
+      // Submit) omits it so the hot path doesn't freeze the event loop.
+      http('GET', `/jobs/${state.job.id}?breakdown=1`),
     ]);
     state.progress = p; state.job = j.job;
 
@@ -1222,7 +1231,7 @@ async function renderExpand() {
     const done = p.status !== 'expanding';
     const ratio = p.processed ? (p.found / p.processed).toFixed(2) + '×' : '—';
 
-    const byNs = j.breakdown.byNamespace;
+    const byNs = j.breakdown.byNamespace || [];
     const total = byNs.reduce((s, r) => s + r.count, 0);
 
     $('#expand-body').innerHTML = `

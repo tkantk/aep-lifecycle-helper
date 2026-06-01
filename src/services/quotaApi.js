@@ -36,6 +36,9 @@ import { logger } from '../utils/logger.js';
 const PATH = '/data/core/hygiene/quota';
 const CACHE_TTL_MS = 60 * 60 * 1000;             // 1 hour — quota changes slowly
 const HARD_FLOOR_MS = 24 * 60 * 60 * 1000;        // 24 hours — beyond this, stale cache is no longer trustworthy
+const DEFAULT_LIVE_RETRY_DELAY_MS = 2000;         // base backoff between live-fetch retries
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, ms)));
 
 /**
  * In-memory cache keyed on imsOrgId. We deliberately don't persist to SQLite:
@@ -98,7 +101,10 @@ function shapeResponse(data) {
  *   error: string|null,  // populated when the latest live fetch attempt failed
  * }>}
  */
-export async function getOrgQuota(creds, { refresh = false } = {}) {
+export async function getOrgQuota(
+  creds,
+  { refresh = false, liveAttempts = 1, retryDelayMs = DEFAULT_LIVE_RETRY_DELAY_MS } = {},
+) {
   const orgId = creds?.imsOrgId;
   if (!orgId) throw new Error('getOrgQuota: creds.imsOrgId is required');
 
@@ -115,37 +121,54 @@ export async function getOrgQuota(creds, { refresh = false } = {}) {
     };
   }
 
-  try {
-    const client = createAdobeClient(creds, undefined);
-    const { data } = await client.get(`${config.aep.gateway}${PATH}`);
-    const shaped = shapeResponse(data);
-    cache.set(orgId, { result: shaped, fetchedAt: now });
-    return {
-      ...shaped,
-      fetchedAt: new Date(now).toISOString(),
-      stale: false,
-      error: null,
-    };
-  } catch (err) {
-    // Fall back to last cached value with a stale warning. If the cache is
-    // older than the 24-hour hard floor — or doesn't exist — propagate the
-    // error so the UI can block submission rather than ship blind. This is
-    // the F-block decision from the 2026-05-15 quota review.
-    const errMsg = err.message || String(err);
-    logger.warn({ orgId, err: errMsg }, 'getOrgQuota: live fetch failed');
-
-    if (cached && (now - cached.fetchedAt) < HARD_FLOOR_MS) {
+  // Live fetch with a bounded outer retry. adobeClient deliberately does NOT
+  // retry timeouts (ECONNABORTED) on a GET, so on a flaky network a single slow
+  // /quota call falls straight through to the stale path — which BLOCKS a
+  // destructive submit (review I15 / R4 #2 refuse-stale). Real 2026-06-01 prod
+  // incident. Coarse outer retries with linear backoff let an INTERMITTENT
+  // timeout self-heal into a FRESH snapshot instead of stalling the operator.
+  const attempts = Math.max(1, Number(liveAttempts) || 1);
+  const client = createAdobeClient(creds, undefined);
+  let lastErr;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      const { data } = await client.get(`${config.aep.gateway}${PATH}`);
+      const shaped = shapeResponse(data);
+      cache.set(orgId, { result: shaped, fetchedAt: now });
       return {
-        ...cached.result,
-        fetchedAt: new Date(cached.fetchedAt).toISOString(),
-        stale: true,
-        error: errMsg,
+        ...shaped,
+        fetchedAt: new Date(now).toISOString(),
+        stale: false,
+        error: null,
       };
+    } catch (err) {
+      lastErr = err;
+      if (attempt < attempts) {
+        logger.warn({ orgId, attempt, attempts, err: err.message },
+          'getOrgQuota: live fetch attempt failed — retrying');
+        await sleep(retryDelayMs * attempt); // linear backoff: 1×, 2×, 3× …
+      }
     }
-    // Either no cache or cache is older than 24h. Surface the error.
-    const e = new Error(`Adobe quota fetch failed and no recent cache: ${errMsg}`);
-    e.code = 'quota_unavailable';
-    e.cause = err;
-    throw e;
   }
+
+  // Every attempt failed. Fall back to last cached value with a stale warning.
+  // If the cache is older than the 24-hour hard floor — or doesn't exist —
+  // propagate the error so the UI can block submission rather than ship blind.
+  // This is the F-block decision from the 2026-05-15 quota review.
+  const errMsg = lastErr?.message || String(lastErr);
+  logger.warn({ orgId, err: errMsg }, 'getOrgQuota: live fetch failed');
+
+  if (cached && (now - cached.fetchedAt) < HARD_FLOOR_MS) {
+    return {
+      ...cached.result,
+      fetchedAt: new Date(cached.fetchedAt).toISOString(),
+      stale: true,
+      error: errMsg,
+    };
+  }
+  // Either no cache or cache is older than 24h. Surface the error.
+  const e = new Error(`Adobe quota fetch failed and no recent cache: ${errMsg}`);
+  e.code = 'quota_unavailable';
+  e.cause = lastErr;
+  throw e;
 }

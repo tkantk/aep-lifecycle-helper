@@ -30,7 +30,7 @@ process.env.OUTPUT_DIR = path.join(os.tmpdir(), `aep-test-jobs-output-${Date.now
 fs.mkdirSync(process.env.UPLOAD_DIR, { recursive: true });
 fs.mkdirSync(process.env.OUTPUT_DIR, { recursive: true });
 
-const { initDb, q } = await import('../src/db.js');
+const { initDb, q, bulkInsertIdentities } = await import('../src/db.js');
 const jobsRouter = (await import('../src/routes/jobs.js')).default;
 const { makeErrorHandler } = await import('../src/middleware/security.js');
 const { logger } = await import('../src/utils/logger.js');
@@ -433,4 +433,44 @@ test('DELETE /api/jobs/:id is OK when uploaded CSV is already missing', async ()
   const jobId = insertJob({ uploadPath });
   const res = await request('DELETE', `/api/jobs/${jobId}`);
   assert.equal(res.status, 200);
+});
+
+// ─── GET /api/jobs/:id — heavy namespace breakdown is opt-in ────────────────
+// 2026-06-01 prod incident: clicking a job "did nothing for a long time, then
+// suddenly opened". GET /:id ran countIdentitiesByNamespace (a nested GROUP-BY
+// over EVERY expanded_identities row for the job — millions on a 1.6M job)
+// SYNCHRONOUSLY on every load, freezing the single-threaded event loop. Only
+// the Expand tab consumes byNamespace, so the hot job-load/switch path must NOT
+// pay for it: it's now opt-in via ?breakdown=1.
+
+test('GET /api/jobs/:id omits byNamespace by default (no heavy scan on the hot path)', async () => {
+  const jobId = insertJob();
+  bulkInsertIdentities([
+    [jobId, 'email', 6, 'a@x.com', 'src1'],
+    [jobId, 'email', 6, 'b@x.com', 'src1'],
+    [jobId, 'phone', 7, '+15551234', 'src1'],
+  ]);
+
+  const res = await request('GET', `/api/jobs/${jobId}`);
+  assert.equal(res.status, 200);
+  assert.equal(res.body.breakdown.byNamespace, null,
+    'byNamespace must be null by default — the heavy GROUP-BY is skipped on the hot path');
+  assert.ok(res.body.breakdown.byWorkOrderStatus,
+    'the cheap work-order-status breakdown is still returned');
+});
+
+test('GET /api/jobs/:id?breakdown=1 includes the byNamespace breakdown', async () => {
+  const jobId = insertJob();
+  bulkInsertIdentities([
+    [jobId, 'email', 6, 'a@x.com', 'src1'],
+    [jobId, 'email', 6, 'b@x.com', 'src1'],
+    [jobId, 'phone', 7, '+15551234', 'src1'],
+  ]);
+
+  const res = await request('GET', `/api/jobs/${jobId}?breakdown=1`);
+  assert.equal(res.status, 200);
+  assert.ok(Array.isArray(res.body.breakdown.byNamespace),
+    'byNamespace must be an array when explicitly requested');
+  const email = res.body.breakdown.byNamespace.find(r => r.namespace === 'email');
+  assert.equal(email.count, 2, 'two distinct email identities');
 });

@@ -284,7 +284,14 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
     const previousMonths = job.projected_months ?? null;
     let quotaSnapshot = null;
     try {
-      quotaSnapshot = await getOrgQuota(creds, { refresh: true });
+      // Retry the live fetch a few times with backoff: adobeClient does NOT
+      // retry timeouts, and a flaky network (2026-06-01 prod incident) would
+      // otherwise block this destructive submit on a single transient timeout.
+      quotaSnapshot = await getOrgQuota(creds, {
+        refresh: true,
+        liveAttempts: config.quotaPreflightAttempts,
+        retryDelayMs: config.quotaPreflightRetryDelayMs,
+      });
     } catch (err) {
       if (err.code === 'quota_unavailable') {
         const e = new Error('Cannot submit: Adobe /quota is unreachable and no recent cache exists.');

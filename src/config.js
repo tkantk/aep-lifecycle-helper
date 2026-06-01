@@ -96,6 +96,14 @@ export const config = {
   monthlyIdentifierLimit: numEnv('MONTHLY_IDENTIFIER_LIMIT', 3_000_000) || 3_000_000,
   requestTimeoutMs: Number(process.env.REQUEST_TIMEOUT_MS) || 60_000,
 
+  // Destructive-submit /quota preflight retry (2026-06-01 flaky-network prod
+  // incident). adobeClient does NOT retry timeouts on a GET, so a single slow
+  // /quota call would block the submit on a stale snapshot. These give the
+  // preflight a few coarse retries with linear backoff so an INTERMITTENT
+  // timeout self-heals into a fresh snapshot instead of stalling the operator.
+  quotaPreflightAttempts: Number(process.env.QUOTA_PREFLIGHT_ATTEMPTS) || 3,
+  quotaPreflightRetryDelayMs: Number(process.env.QUOTA_PREFLIGHT_RETRY_DELAY_MS) || 2000,
+
   // Fraction (0..0.95) of each Adobe quota held back as headroom for CONCURRENT
   // EXTERNAL writers (review R6 #3). This tool's zero-over-ship guarantee covers
   // only ITS OWN accounting: Adobe `/quota` is ORG-WIDE and we snapshot it once

@@ -56,7 +56,16 @@ router.get('/:id', async (req, res, next) => {
     const job = q().getJob.get(req.params.id);
     if (!job) return res.status(404).json({ error: 'job not found' });
 
-    const byNamespace = q().countIdentitiesByNamespace.all(job.id);
+    // countIdentitiesByNamespace is a nested GROUP-BY over EVERY
+    // expanded_identities row for the job (millions on a large job), and
+    // better-sqlite3 runs it SYNCHRONOUSLY — freezing the single-threaded event
+    // loop (UI + monitor) until it finishes. Real 2026-06-01 prod incident:
+    // clicking a 1.6M-identity job "did nothing for a long time, then suddenly
+    // opened". Only the Expand tab consumes byNamespace, so the hot
+    // job-load/switch path skips it by default — opt in with ?breakdown=1.
+    const byNamespace = req.query.breakdown === '1'
+      ? q().countIdentitiesByNamespace.all(job.id)
+      : null;
     const byWorkOrderStatus = q().countWorkOrdersByStatus.all(job.id)
       .reduce((a, r) => ({ ...a, [r.status]: r.count }), {});
 

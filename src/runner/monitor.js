@@ -29,6 +29,26 @@ const POLL_CONCURRENCY = 5;
 // 60 s-timeout polls on the same 6 work orders.
 const POLL_PER_REQUEST_TIMEOUT_MS = 15_000;
 
+// Per-WO poll backoff (in-memory; resets on restart, which is fine). When Adobe
+// is unreachable EVERY poll times out, and without backoff the monitor re-polls
+// all open WOs every 60s — flooding a flaky network and contending with a
+// concurrent destructive Submit's /quota preflight (2026-06-01 prod incident:
+// "monitor tick complete polled=10 failed=10" on repeat). Exponential backoff
+// lets a permatimeouting WO fall back to infrequent polls and snap back to full
+// cadence the instant a poll succeeds. woId -> { fails, nextAt (ms epoch) }.
+const _pollBackoff = new Map();
+const BACKOFF_BASE_MS = POLL_INTERVAL_MS;   // 1 unit = one normal poll interval
+const MAX_BACKOFF_MULT = 16;                // cap: 16 * 60s = 16 min between polls
+
+function _recordPollFailure(woId, now) {
+  const fails = (_pollBackoff.get(woId)?.fails || 0) + 1;
+  const mult = Math.min(2 ** fails, MAX_BACKOFF_MULT); // 1st fail → 2×, then 4×, 8×, 16× …
+  _pollBackoff.set(woId, { fails, nextAt: now + mult * BACKOFF_BASE_MS });
+}
+
+/** Test seam: clear the in-memory poll backoff between cases. */
+export function _clearPollBackoff() { _pollBackoff.clear(); }
+
 let _interval = null;
 let _startupTick = null;
 // Reentrancy guard: a tick is non-blocking from setInterval's perspective,
@@ -55,7 +75,7 @@ export function stopMonitor() {
   if (_startupTick) { clearTimeout(_startupTick);  _startupTick = null; }
 }
 
-async function tick() {
+export async function tick() {
   if (_running) {
     // Previous tick still in flight (Adobe slow / rate-limited). Skip
     // this one entirely instead of stacking duplicate polls on top.
@@ -65,7 +85,27 @@ async function tick() {
   _running = true;
   const tickStart = Date.now();
   try {
-    const open = q().listOpenWorkOrders.all();
+    const now = tickStart;
+    const candidates = q().listOpenWorkOrders.all();   // top 100 by poll cursor
+
+    // Advance the poll cursor for EVERY candidate we look at — including ones we
+    // skip for backoff below. listOpenWorkOrders applies LIMIT 100 in SQL and
+    // orders by last_polled_at, so if a backed-off WO's cursor never advanced it
+    // would freeze at the front of the window and crowd eligible WOs (beyond row
+    // 100) out on orgs with >100 concurrently-open WOs. Stamping here (not only
+    // on a real poll) keeps the window rotating. This replaces the old
+    // per-survivor stamp inside the poll closure.
+    for (const wo of candidates) q().stampWorkOrderPolled.run(wo.id);
+
+    // Drop WOs still inside their failure backoff window. When Adobe is
+    // unreachable every poll fails; without this the monitor re-polls all open
+    // WOs every tick, flooding a flaky network and starving a concurrent
+    // Submit's /quota preflight. A backed-off WO resumes the instant its window
+    // elapses, and a single success clears it entirely (below).
+    const open = candidates.filter((wo) => {
+      const b = _pollBackoff.get(wo.id);
+      return !b || now >= b.nextAt;
+    });
     if (open.length === 0) return;
 
     // Per-tick credential cache. Most ticks hit 1-3 distinct creds_ids across
@@ -84,11 +124,9 @@ async function tick() {
     let succeeded = 0, failed = 0;
     const limit = pLimit(POLL_CONCURRENCY);
     await Promise.all(open.map(wo => limit(async () => {
-      // Stamp the poll cursor on every ATTEMPT (success or failure) so this WO
-      // rotates to the back of listOpenWorkOrders and can't starve others on
-      // jobs with >100 open orders (review finding #9). A permafailing WO
-      // therefore yields to never-polled ones instead of monopolising the tick.
-      q().stampWorkOrderPolled.run(wo.id);
+      // (The poll cursor was already stamped for every candidate above — review
+      // finding #9 rotation — so a permafailing WO yields to never-polled ones
+      // and backed-off WOs can't freeze the LIMIT-100 window.)
       try {
         const creds = await getCreds(wo.j_creds_id);
         const adobe = await getWorkOrder({
@@ -112,8 +150,10 @@ async function tick() {
         // R4.1 behaviour) reopened capacity before the org-wide /quota floor
         // caught up → over-ship. There is no per-tool attribution that proves a
         // terminal WO's count is already in the floor, so we never drop it here.
+        _pollBackoff.delete(wo.id);   // a success snaps the WO back to full cadence
         succeeded++;
       } catch (err) {
+        _recordPollFailure(wo.id, now);   // escalating backoff so a flaky network can't be flooded
         failed++;
         logger.warn({ workOrderId: wo.id, err: err.message }, 'status poll failed - will retry');
       }

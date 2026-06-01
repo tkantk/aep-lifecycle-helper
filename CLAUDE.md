@@ -705,7 +705,14 @@ the maintainer first — they may actually be intended.
   webhooks for work-order status, so polling is the only option. The
   interval is the `POLL_INTERVAL_MS` constant at the top of
   `runner/monitor.js` (not env-configurable today). Edit there if you
-  want a different cadence.
+  want a different cadence. Per-WO exponential backoff (2026-06-01 P1):
+  a failed status poll backs that WO off (2×…16× the interval) and a
+  success resets it, so a flaky-network outage can't make the monitor
+  re-poll every open WO every tick and flood the network / starve a
+  concurrent Submit's `/quota` call. The backoff is DISPLAY-only — it
+  never touches the quota ledger (R5). The poll cursor is stamped for
+  every candidate (incl. backed-off ones) so the `LIMIT 100` window
+  still rotates fairly.
 
 ---
 
@@ -794,8 +801,9 @@ which require `https://platform-{region}.adobe.io` (region ∈ `va7`, `nld2`,
 7. Run `npm test` before suggesting a change is done (use `npm test`, NOT
    `node --test test` — on Node ≥23 the bare `test` arg is treated as a test
    name and silently runs nothing; `npm test` → `scripts/run-tests.mjs` which
-   enumerates `test/*.test.js`). **267 tests should pass** (as of the 2026-06-01
-   R11 delete-safety session — ambiguous-failed + reconciling delete guards).
+   enumerates `test/*.test.js`). **274 tests should pass** (as of the 2026-06-01
+   P1 flaky-network session — /quota preflight retry, monitor poll backoff,
+   opt-in job-detail namespace breakdown).
 8. **After your change**, append a bullet to the current session in
    `docs/CHANGELOG.md` describing what + why. If you changed the module map,
    data flow, Adobe contract, or DB schema, also update `docs/ARCHITECTURE.md`.

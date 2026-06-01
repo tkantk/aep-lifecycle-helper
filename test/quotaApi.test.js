@@ -22,6 +22,10 @@ function mockIms() {
     .reply(200, { access_token: 'tok', token_type: 'bearer', expires_in: 3600 });
 }
 
+// nock.isDone() is useless here because mockIms() persists; check the quota
+// interceptors directly instead.
+const pendingQuotaMocks = () => nock.pendingMocks().filter((m) => m.includes(QUOTA_PATH));
+
 function baseCreds(overrides = {}) {
   return {
     clientId: 'client-q',
@@ -164,4 +168,40 @@ test('getOrgQuota throws when imsOrgId is missing', async () => {
     () => getOrgQuota({ clientId: 'x', clientSecret: 'y' }),
     /imsOrgId is required/i
   );
+});
+
+// ─── Live-fetch retry (intermittent-timeout self-heal) ─────────────────────
+// Real 2026-06-01 prod incident: a flaky corporate network to platform.adobe.io
+// made /quota time out (ECONNABORTED) intermittently. adobeClient deliberately
+// does NOT retry timeouts, so a single slow call fell straight through to stale
+// and BLOCKED a destructive submit. getOrgQuota now retries the live fetch a few
+// times with backoff so a transient timeout self-heals into a FRESH snapshot.
+
+test('getOrgQuota retries a transient live-fetch timeout and returns a FRESH snapshot', async () => {
+  mockIms();
+  // Attempt 1 times out (adobeClient does NOT retry ECONNABORTED); the retry succeeds.
+  nock(AEP_GATEWAY).get(QUOTA_PATH)
+    .replyWithError({ code: 'ECONNABORTED', message: 'timeout of 60000ms exceeded' });
+  nock(AEP_GATEWAY).get(QUOTA_PATH).reply(200, SAMPLE_BODY);
+
+  const r = await getOrgQuota(baseCreds(), { refresh: true, liveAttempts: 3, retryDelayMs: 5 });
+
+  assert.equal(r.stale, false, 'a successful retry must yield a FRESH (non-stale) snapshot');
+  assert.equal(r.daily.consumed, 314);
+  assert.equal(r.error, null);
+  // (can't use nock.isDone() — mockIms() persists. Check the quota interceptors.)
+  assert.equal(pendingQuotaMocks().length, 0, 'both the timed-out attempt and the successful retry must be consumed');
+});
+
+test('getOrgQuota: exhausting every liveAttempt with no cache still raises quota_unavailable', async () => {
+  mockIms();
+  // Two attempts, both time out → no infinite loop, falls through to the hard floor.
+  nock(AEP_GATEWAY).get(QUOTA_PATH).replyWithError({ code: 'ECONNABORTED', message: 'timeout' });
+  nock(AEP_GATEWAY).get(QUOTA_PATH).replyWithError({ code: 'ECONNABORTED', message: 'timeout' });
+
+  await assert.rejects(
+    () => getOrgQuota(baseCreds(), { refresh: true, liveAttempts: 2, retryDelayMs: 5 }),
+    err => { assert.equal(err.code, 'quota_unavailable'); return true; },
+  );
+  assert.equal(pendingQuotaMocks().length, 0, 'exactly liveAttempts attempts should be made, then it gives up');
 });
