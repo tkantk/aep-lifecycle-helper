@@ -583,10 +583,10 @@ function prepared() {
     // release & retry" action (review R7 #1) so a woId from a different job
     // can't be acted on.
     getWorkOrderByIdAndJob: db.prepare(`SELECT * FROM work_orders WHERE id = ? AND job_id = ?`),
-    // Review R9 #1: compare-and-swap support. A reconcile snapshots `attempt`
-    // before its awaited lookup; getWorkOrderAttempt re-reads it just before the
-    // write so a stale lookup result is discarded if the WO changed meanwhile.
-    // bumpWorkOrderAttempt is called by release-absent (a fresh attempt).
+    // Review R9 #1 / R10 #1: compare-and-swap support. release-absent bumps
+    // `attempt` (a fresh attempt). The reconcile CAS itself re-reads via
+    // getWorkOrderReconcileState below (attempt + status + adobe_workorder_id);
+    // getWorkOrderAttempt is the plain attempt read used by direct callers/tests.
     getWorkOrderAttempt: db.prepare(`SELECT attempt FROM work_orders WHERE id = ?`),
     bumpWorkOrderAttempt: db.prepare(`UPDATE work_orders SET attempt = attempt + 1 WHERE id = ?`),
     // Review R10 #1: the reconcile CAS must also require the WO to still be

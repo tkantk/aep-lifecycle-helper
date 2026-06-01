@@ -230,9 +230,10 @@ demo — never for production. See CLAUDE.md I12.
                      adobe_workorder_id). reconcileJobOrphans(jobId) walks
                      every such WO, looks each up via Adobe's list endpoint
                      filtered by the WO's displayName, and applies:
-                       • match found → record Adobe ID + flip to 'submitted'
-                         (markAccepted; if was 'failed', reactivate → active+
-                         accepted, mirroring the real spend — R5)
+                       • match found → record Adobe ID; non-terminal → 'submitted',
+                         terminal Adobe status → local completed/failed + completed_at
+                         (R10 #2); markAccepted (or reactivate if was 'failed' →
+                         active+accepted, mirroring the real spend — R5)
                        • no match + was submitting → INDETERMINATE: hold the
                          reservation, leave in 'submitting' for operator
                          reconciliation. NEVER auto-rolls back (R6 #1) — a no-
@@ -448,8 +449,10 @@ src/
 │                             scans WOs with adobe_workorder_id IS NULL AND
 │                             status ∈ submitting/failed; looks each up in
 │                             Adobe by its persisted displayName; matched →
-│                             record ID + flip to 'submitted' (markAccepted, or
-│                             reactivate if was failed); no-match submitting →
+│                             record ID; non-terminal → 'submitted', terminal
+│                             Adobe status → completed/failed + completed_at
+│                             (R10 #2); markAccepted (or reactivate if was
+│                             failed); no-match submitting →
 │                             INDETERMINATE, held in 'submitting' for operator
 │                             (R6 #1, never auto-rolled-back); no-match failed →
 │                             leave failed; 400 → leave alone. Returns

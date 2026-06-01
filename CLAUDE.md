@@ -114,7 +114,9 @@ src/
 │   │                           POST may still 2xx (over-ship), and a live lookup
 │   │                           may find the WO in Adobe (duplicate on retry).
 │   └── recovery.js             Startup reconciliation of orphan work orders
-│                               (guard + attempt-CAS, R9 #1) + operator
+│                               (refcounted reconcile guard + monotonic
+│                               unresolved-CAS + terminal finalise + bounded-
+│                               parallel lookups, R9/R10) + operator
 │                               release-absent action (R7 #1)
 │
 ├── routes/                     Express route modules

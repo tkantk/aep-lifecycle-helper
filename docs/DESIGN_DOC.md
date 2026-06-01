@@ -384,7 +384,7 @@ its `displayName` prefix and apply one of four outcomes:
 
 | Outcome | Action |
 |---|---|
-| **Match found** — Adobe has the WO under our persisted `display_name` (R6 #2) | Record `adobe_workorder_id` → flip to `submitted` + `markAccepted` (or `reactivate` if it was `failed`). |
+| **Match found** — Adobe has the WO under our persisted `display_name` (R6 #2) | Record `adobe_workorder_id`; non-terminal Adobe status → `submitted`, terminal (completed/failed) → local completed/failed + `completed_at` (R10 #2); `markAccepted` (or `reactivate` if it was `failed`). The write is CAS-guarded so concurrent reconcile results stay monotonic (R10 #1). |
 | **No match** — Adobe returned 200 but our `display_name` is not in the list | INDETERMINATE — a no-match does NOT prove absence (work-order creation is async, no read-after-write guarantee). If status was `submitting`, **leave it in `submitting` with its reservation HELD** — never auto-roll-back (R6 #1), which would risk a duplicate on retry. The operator confirms absence in Adobe's UI, then uses the per-WO **release-absent** action (R7 #1) to release + retry. If status was `failed` (a 4xx rejection), leave as failed. |
 | **Indeterminate** — Adobe rejected the lookup with 4xx | Leave the WO alone; the next reconcile attempt retries. Never roll back on ambiguity. |
 | **Transient lookup error** — network failure during reconcile | Leave the WO alone; retry on next boot or next manual reconcile click. |
