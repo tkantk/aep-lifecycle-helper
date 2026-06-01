@@ -589,6 +589,31 @@ function prepared() {
     // bumpWorkOrderAttempt is called by release-absent (a fresh attempt).
     getWorkOrderAttempt: db.prepare(`SELECT attempt FROM work_orders WHERE id = ?`),
     bumpWorkOrderAttempt: db.prepare(`UPDATE work_orders SET attempt = attempt + 1 WHERE id = ?`),
+    // Review R10 #1: the reconcile CAS must also require the WO to still be
+    // UNRESOLVED — otherwise two concurrent lookups (same attempt) both write and
+    // a slow no-match overwrites a fast match. A write applies only if attempt is
+    // unchanged AND adobe_workorder_id IS NULL AND status is still an orphan
+    // state. This makes concurrent reconcile results monotonic (a resolved WO is
+    // never reverted).
+    getWorkOrderReconcileState: db.prepare(`SELECT attempt, status, adobe_workorder_id FROM work_orders WHERE id = ?`),
+    // Review R10 #2: a reconcile match may find the WO ALREADY terminal in Adobe
+    // (status completed/failed). updateWorkOrderSubmitted hardcodes 'submitted',
+    // which then the monitor never repairs (it excludes terminal adobe_status) —
+    // leaving status='submitted' + completed_at NULL forever, blocking job delete.
+    // This variant normalises a terminal match to the local terminal status +
+    // stamps completed_at (mirrors updateWorkOrderAdobeStatus); a non-terminal
+    // match becomes 'submitted' as before.
+    updateWorkOrderReconciledMatch: db.prepare(`
+      UPDATE work_orders
+         SET adobe_workorder_id = @adobeWorkorderId,
+             adobe_status = @adobeStatus,
+             bundle_id = @bundleId,
+             submitted_at = @submittedAt,
+             status = CASE WHEN @adobeStatus IN ('completed','failed') THEN @adobeStatus ELSE 'submitted' END,
+             completed_at = CASE WHEN @adobeStatus IN ('completed','failed') THEN datetime('now') ELSE completed_at END,
+             updated_at = datetime('now')
+       WHERE id = @id
+    `),
     // Unshipped (planned + deferred) WOs in deterministic creation order.
     // The redistributor consumes this and updates each row's month/day index.
     getUnshippedOrdersForJob: db.prepare(`

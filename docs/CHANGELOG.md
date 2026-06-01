@@ -9,6 +9,56 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-06-01 (R10) — Tenth-round review: recovery-state correctness (consolidated audit)
+
+R9 closed the duplicate-delete race; a consolidated recovery audit then found two
+reproducible state-corruption bugs (no over-ship/duplicate) plus an over-block and
+a doc gap. Suite **256 → 262** pass, audit clean.
+
+### #1 (high) — concurrent reconcile results were not monotonic
+
+`applyIfUnchanged` checked only `attempt`, which TWO concurrent reconciles share
+(neither bumps it). So a fast FOUND (→ submitted) could be overwritten by a slow
+NO-MATCH (→ submitting), leaving `adobe_workorder_id` set but status `submitting`.
+**Fix:** the CAS (`applyIfStillUnresolved`) now also requires the WO to still be
+UNRESOLVED — `attempt` unchanged AND `adobe_workorder_id IS NULL` AND status in
+('submitting','failed'). Once a WO is matched, no concurrent reconcile write
+applies → results are monotonic. Mixed-result tests (found→empty, empty→found,
+terminal-found→empty).
+
+### #2 (high) — recovery couldn't finalise an already-terminal Adobe WO
+
+A reconcile match always wrote local status='submitted' (`updateWorkOrderSubmitted`).
+If Adobe returned a TERMINAL status (completed/failed), the row was stuck
+`submitted` + `completed_at` NULL — the monitor excludes terminal `adobe_status`
+so never repaired it, and job-delete treats `submitted` as in-flight (blocked).
+**Fix:** reconcile matches now use `updateWorkOrderReconciledMatch`, which
+normalises a terminal Adobe status to the local terminal status + stamps
+`completed_at` (mirrors the monitor); non-terminal stays 'submitted'. Startup +
+manual-route tests for completed and failed.
+
+### #3 (medium) — startup reconciliation could over-block operator recovery
+
+Both reconcilers marked every orphan up front then processed SEQUENTIALLY, so one
+slow lookup (a 60s GET timeout + retries) held the reconcile guard for every later
+orphan for minutes (release-absent → 409). **Fix:** the lookups now run in BOUNDED
+PARALLEL (`p-limit` 5); each WO is unguarded as soon as ITS OWN lookup settles.
+Mark-all-upfront is kept (mark-before-own-lookup would reopen the duplicate race —
+the CAS protects local state but can't un-create an Adobe duplicate). Test asserts
+a slow orphan doesn't hold the guard for a fast one.
+
+### #4 (low) — doc sweep
+
+REVIEW/CLAUDE/ARCHITECTURE release-absent guard descriptions now include the R9
+reconciliation guard + the R10 CAS/terminal behaviour.
+
+### Tests
+
++6: three mixed-result monotonicity, two terminal-finalisation (startup + route),
+one parallel non-block. 262 pass / 0 fail.
+
+---
+
 ## 2026-06-01 (R9) — Ninth-round review: release-absent vs. reconcile-lookup duplicate race
 
 R8 closed the live-POST race, but a ninth review found a DISTINCT duplicate-delete

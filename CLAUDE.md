@@ -320,7 +320,12 @@ may have spent), the WO stays `submitting`, and orphan recovery reconciles it by
 its persisted displayName (R6 #2). `services/adobeClient.js`'s retry guard never
 retries the hygiene POST on network errors OR 5xx (see I11), so there is no
 silent double-submit. A genuinely-absent uncertain orphan is resolved by the
-operator via `release-absent` (R7 #1), gated against a still-in-flight POST (R8 #1).
+operator via `release-absent` (R7 #1), gated against a still-in-flight POST
+(R8 #1) AND an in-flight reconciliation lookup (R9 #1, refcounted). Reconcile
+writes are CAS-guarded to apply only while the WO is still an unresolved orphan
+(attempt unchanged + no Adobe ID + status submitting/failed), so concurrent
+reconcile results are monotonic and an already-terminal Adobe match is finalised
+to local completed/failed (R10 #1/#2).
 
 ### I6. Client secrets are encrypted at rest
 
@@ -787,8 +792,8 @@ which require `https://platform-{region}.adobe.io` (region ∈ `va7`, `nld2`,
 7. Run `npm test` before suggesting a change is done (use `npm test`, NOT
    `node --test test` — on Node ≥23 the bare `test` arg is treated as a test
    name and silently runs nothing; `npm test` → `scripts/run-tests.mjs` which
-   enumerates `test/*.test.js`). **256 tests should pass** (as of the 2026-06-01
-   R9 reconcile-lookup race session — refcounted reconcile guard + attempt-CAS).
+   enumerates `test/*.test.js`). **262 tests should pass** (as of the 2026-06-01
+   R10 recovery-state-correctness session — monotonic CAS + terminal finalisation + parallel reconcile).
 8. **After your change**, append a bullet to the current session in
    `docs/CHANGELOG.md` describing what + why. If you changed the module map,
    data flow, Adobe contract, or DB schema, also update `docs/ARCHITECTURE.md`.

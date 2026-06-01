@@ -508,7 +508,7 @@ src/
 
 test/                       node --test (via `npm test` → scripts/run-tests.mjs,
                             which enumerates test/*.test.js and sets a stable
-                            test ENCRYPTION_KEY). 256 tests covering hygiene
+                            test ENCRYPTION_KEY). 262 tests covering hygiene
                             validators,
                             namespace canonicalization, IMS token cache, quota
                             atomicity (incl. monthly-disabled release gating),
@@ -679,8 +679,13 @@ source of truth (CLAUDE.md I15), and monthly is ALWAYS tracked (R4 #4 removed th
   action (R7 #1): after verifying in Adobe's UI (by the persisted displayName)
   that the WO does not exist, the operator releases its held reservation and
   resets it to `planned` for retry. The action is fail-closed — it refuses any
-  WO with an Adobe ID, an accepted reservation, or a still-in-flight POST (R8 #1),
-  and the release + reset run in one transaction (R8 #2).
+  WO with an Adobe ID, an accepted reservation, a still-in-flight POST (R8 #1),
+  or an in-flight reconciliation lookup (R9 #1, refcounted — a lookup may find
+  the WO in Adobe, so releasing+retrying during it would duplicate), and the
+  release + reset run in one transaction (R8 #2). Reconcile writes are themselves
+  CAS-guarded (apply only while the WO is still an unresolved orphan) so
+  concurrent reconcile results are monotonic and an already-terminal Adobe match
+  is finalised to local completed/failed with completed_at (R10 #1/#2).
 - **Single-process only** — running two instances against the same database
   corrupts the WAL. Enforced by a single-process advisory lock (`index.js`):
   a `<dbPath>.lock` file keyed on the canonical resolved `DB_PATH` (not

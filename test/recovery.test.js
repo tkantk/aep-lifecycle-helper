@@ -22,7 +22,7 @@ process.env.OUTPUT_DIR = os.tmpdir();
 
 const { initDb, q, db } = await import('../src/db.js');
 const { storeCreds } = await import('../src/utils/crypto.js');
-const { reconcileOrphanWorkOrders, resumeExpandingJobs } = await import('../src/runner/recovery.js');
+const { reconcileOrphanWorkOrders, reconcileJobOrphans, resumeExpandingJobs } = await import('../src/runner/recovery.js');
 const { reserve, peek } = await import('../src/services/quotaManager.js');
 const { isWorkOrderReconciling } = await import('../src/runner/postingState.js');
 
@@ -193,6 +193,108 @@ test('R9 follow-up: concurrent reconciles keep the WO guarded until BOTH settle 
   await Promise.all([pA, pB]);
   assert.equal(isWorkOrderReconciling(localId), false,
     'guard cleared only after BOTH reconciles settled (refcount back to 0)');
+});
+
+// ─── R10 #1: concurrent reconcile results are monotonic (CAS requires unresolved) ──
+
+// Run two concurrent reconcileOrphanWorkOrders over ONE orphan; first lookup gets
+// `firstReply` (delay 40ms), second gets `secondReply` (delay 200ms). Returns the
+// final WO row.
+async function twoConcurrentReconciles(name, firstReply, secondReply) {
+  const { jobId } = seedCredAndJob({ name });
+  const localId = `wo-mono-${seq}`;
+  seedOrphanWorkOrder(jobId, localId);
+  reserve({ workOrderId: localId, imsOrgId: `org-${seq}@AcmeOrg`, count: 2, dailyLimit: 1_000_000, monthlyLimit: null });
+  nock('https://ims-na1.adobelogin.com').persist().post('/ims/token/v3').reply(200, { access_token: 'tok', expires_in: 86400 });
+  nock(GATEWAY).get(/\/data\/core\/hygiene\/workorder/).query(true).delay(40).reply(200, firstReply(localId, name));
+  nock(GATEWAY).get(/\/data\/core\/hygiene\/workorder/).query(true).delay(200).reply(200, secondReply(localId, name));
+  await Promise.all([reconcileOrphanWorkOrders(), reconcileOrphanWorkOrders()]);
+  return q().getAllOrdersForJob.all(jobId).find(w => w.id === localId);
+}
+
+const FOUND = (status) => (localId, name) => ({ results: [{ workorderId: 'DI-original', displayName: `Delete ${name} - WO ${localId}`, status, createdAt: '2026-06-01T00:00:00Z' }] });
+const EMPTY = () => ({ results: [] });
+
+test('R10 #1: FOUND (fast) then EMPTY (slow) — the match is NOT overwritten to submitting', async () => {
+  const wo = await twoConcurrentReconciles('mono-fe', FOUND('received'), EMPTY);
+  assert.equal(wo.adobe_workorder_id, 'DI-original');
+  assert.equal(wo.status, 'submitted', 'the stale slow no-match must NOT revert the resolved match');
+});
+
+test('R10 #1: EMPTY (fast) then FOUND (slow) — the match still wins', async () => {
+  const wo = await twoConcurrentReconciles('mono-ef', EMPTY, FOUND('received'));
+  assert.equal(wo.adobe_workorder_id, 'DI-original');
+  assert.equal(wo.status, 'submitted', 'a later found result resolves the still-unresolved orphan');
+});
+
+test('R10 #1+#2: terminal FOUND (fast) then EMPTY (slow) — finalised, not reverted', async () => {
+  const wo = await twoConcurrentReconciles('mono-te', FOUND('completed'), EMPTY);
+  assert.equal(wo.adobe_workorder_id, 'DI-original');
+  assert.equal(wo.status, 'completed', 'terminal match finalised; slow no-match discarded');
+  assert.ok(wo.completed_at, 'completed_at stamped');
+});
+
+// ─── R10 #2: reconcile finalises an already-terminal Adobe match ──────────────
+
+test('R10 #2 (startup): a reconcile match returning completed → local completed + completed_at (not stranded submitted)', async () => {
+  const { jobId } = seedCredAndJob({ name: 'term-startup' });
+  const localId = `wo-term-${seq}`;
+  seedOrphanWorkOrder(jobId, localId);
+  reserve({ workOrderId: localId, imsOrgId: `org-${seq}@AcmeOrg`, count: 2, dailyLimit: 1_000_000, monthlyLimit: null });
+  mockIms();
+  nock(GATEWAY).get(/\/data\/core\/hygiene\/workorder/).query(true)
+    .reply(200, { results: [{ workorderId: 'DI-done', displayName: `Delete term-startup - WO ${localId}`, status: 'completed', createdAt: '2026-06-01T00:00:00Z' }] });
+
+  await reconcileOrphanWorkOrders();
+
+  const wo = q().getAllOrdersForJob.all(jobId)[0];
+  assert.equal(wo.adobe_workorder_id, 'DI-done');
+  assert.equal(wo.status, 'completed', 'local status normalised to terminal (not stuck submitted)');
+  assert.equal(wo.adobe_status, 'completed');
+  assert.ok(wo.completed_at, 'completed_at stamped so the monitor/list/delete treat it as terminal');
+});
+
+test('R10 #2 (manual route): reconcileJobOrphans finalises a terminal=failed match', async () => {
+  const { jobId } = seedCredAndJob({ name: 'term-route' });
+  const localId = `wo-termr-${seq}`;
+  seedOrphanWorkOrder(jobId, localId);
+  reserve({ workOrderId: localId, imsOrgId: `org-${seq}@AcmeOrg`, count: 2, dailyLimit: 1_000_000, monthlyLimit: null });
+  mockIms();
+  nock(GATEWAY).get(/\/data\/core\/hygiene\/workorder/).query(true)
+    .reply(200, { results: [{ workorderId: 'DI-failed', displayName: `Delete term-route - WO ${localId}`, status: 'failed', createdAt: '2026-06-01T00:00:00Z' }] });
+
+  const r = await reconcileJobOrphans(jobId);
+  assert.equal(r.matched, 1);
+
+  const wo = q().getAllOrdersForJob.all(jobId)[0];
+  assert.equal(wo.adobe_workorder_id, 'DI-failed');
+  assert.equal(wo.status, 'failed', 'terminal=failed normalised locally');
+  assert.ok(wo.completed_at, 'completed_at stamped');
+});
+
+test('R10 #3: a SLOW lookup for one orphan does not hold the reconcile guard for another (parallel)', async () => {
+  const { jobId } = seedCredAndJob({ name: 'parallel' });
+  const slowId = `wo-slow-${seq}`;
+  const fastId = `wo-fast-${seq}`;
+  seedOrphanWorkOrder(jobId, slowId);
+  seedOrphanWorkOrder(jobId, fastId);
+  reserve({ workOrderId: slowId, imsOrgId: `org-${seq}@AcmeOrg`, count: 1, dailyLimit: 1_000_000, monthlyLimit: null });
+  reserve({ workOrderId: fastId, imsOrgId: `org-${seq}@AcmeOrg`, count: 1, dailyLimit: 1_000_000, monthlyLimit: null });
+
+  nock('https://ims-na1.adobelogin.com').persist().post('/ims/token/v3').reply(200, { access_token: 'tok', expires_in: 86400 });
+  nock(GATEWAY).get(/\/data\/core\/hygiene\/workorder/).query(q => (q.displayName || '').includes(slowId)).delay(300).reply(200, { results: [] });
+  nock(GATEWAY).get(/\/data\/core\/hygiene\/workorder/).query(q => (q.displayName || '').includes(fastId)).delay(20).reply(200, { results: [] });
+
+  const p = reconcileOrphanWorkOrders();
+  // The fast orphan's lookup settles quickly and unguards it, even though the
+  // slow orphan's lookup is still in flight — they run in parallel, so the slow
+  // one can't hold the guard for the fast one (pre-R10 #3 sequential would have).
+  await new Promise(r => setTimeout(r, 120));
+  assert.equal(isWorkOrderReconciling(fastId), false, 'fast orphan unguarded once ITS lookup settled');
+  assert.equal(isWorkOrderReconciling(slowId), true, 'slow orphan still guarded while ITS lookup is in flight');
+
+  await p;
+  assert.equal(isWorkOrderReconciling(slowId), false, 'slow orphan unguarded after its lookup settled');
 });
 
 test('R6 #2: recovery matches a long-job-name orphan via the stored UUID-first display_name', async () => {

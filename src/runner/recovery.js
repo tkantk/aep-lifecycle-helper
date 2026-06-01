@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import pLimit from 'p-limit';
 import { q, db } from '../db.js';
 import { logger } from '../utils/logger.js';
 import { runExpansion } from './expansion.js';
@@ -7,19 +8,34 @@ import { decryptCreds } from '../utils/crypto.js';
 import { reactivate, markAccepted, release } from '../services/quotaManager.js';
 import { isWorkOrderPosting, markReconciling, unmarkReconciling, isWorkOrderReconciling } from './postingState.js';
 
+// Bounded concurrency for reconcile Adobe lookups (review R10 #3). The orphans
+// are marked reconciling UP FRONT, but their lookups run in PARALLEL so one slow
+// lookup (a 60s GET timeout + retries) can't hold the reconcile guard for every
+// later orphan for minutes — each WO is unguarded as soon as ITS OWN lookup
+// settles. Sequential would serialize the guard-release behind the slowest WO.
+const RECONCILE_CONCURRENCY = 5;
+
 /**
- * Compare-and-swap wrapper for a reconcile write (review R9 #1). A reconcile
- * reads the orphan, then AWAITS an Adobe lookup; during that await the operator
- * could release + retry the WO. Applying the (now stale) lookup result would
- * corrupt local state. So every reconcile write goes through here: in one
- * transaction, re-read the WO's `attempt`; only run the writes if it still
- * equals the value snapshotted before the lookup. Returns true if applied,
- * false if the result was stale and discarded.
+ * Compare-and-swap wrapper for a reconcile write (review R9 #1 + R10 #1). A
+ * reconcile reads the orphan, then AWAITS an Adobe lookup; during that await the
+ * operator could release+retry the WO, OR a CONCURRENT reconcile could resolve
+ * it. Applying a stale result would corrupt local state (e.g. a slow no-match
+ * reverting a fast match). So every reconcile write goes through here: in ONE
+ * transaction, re-read the WO and apply the writes ONLY IF it is still the same
+ * UNRESOLVED orphan:
+ *   - attempt unchanged (not released+retried — release-absent bumps attempt),
+ *   - adobe_workorder_id IS NULL (not already matched by a concurrent reconcile),
+ *   - status still 'submitting'/'failed' (not already finalised).
+ * This makes concurrent reconcile results MONOTONIC — a resolved WO is never
+ * reverted. Returns true if applied, false if discarded as stale.
  */
-function applyIfUnchanged(woId, snapshotAttempt, writeFn) {
+function applyIfStillUnresolved(woId, snapshotAttempt, writeFn) {
   return db.transaction(() => {
-    const cur = q().getWorkOrderAttempt.get(woId);
-    if (!cur || cur.attempt !== snapshotAttempt) return false;   // changed during the lookup → stale
+    const cur = q().getWorkOrderReconcileState.get(woId);
+    if (!cur) return false;                                       // gone (force-deleted)
+    if (cur.attempt !== snapshotAttempt) return false;           // released+retried
+    if (cur.adobe_workorder_id != null) return false;            // already resolved by a concurrent match
+    if (cur.status !== 'submitting' && cur.status !== 'failed') return false;  // already finalised
     writeFn();
     return true;
   })();
@@ -117,13 +133,14 @@ export async function reconcileOrphanWorkOrders() {
   const marked = new Set();
   for (const wo of orphans) { markReconciling(wo.id); marked.add(wo.id); }
 
+  const limit = pLimit(RECONCILE_CONCURRENCY);
   try {
-    for (const wo of orphans) {
+    await Promise.all(orphans.map(wo => limit(async () => {
       try {
         // Skip a WO whose POST is still in flight in this process — let it settle
         // (its own 2xx/catch will resolve it); reconciling it now would race the
         // POST. The next reconcile picks it up if still unresolved.
-        if (isWorkOrderPosting(wo.id)) continue;
+        if (isWorkOrderPosting(wo.id)) return;
 
         const snapshotAttempt = wo.attempt ?? 0;
         const creds = await decryptCreds(wo.j_creds_id);
@@ -147,8 +164,8 @@ export async function reconcileOrphanWorkOrders() {
         } else if (found) {
           // CAS: only apply if the WO didn't change during the awaited lookup
           // (operator release+retry would have bumped `attempt`) — review R9 #1.
-          const applied = applyIfUnchanged(wo.id, snapshotAttempt, () => {
-            q().updateWorkOrderSubmitted.run({
+          const applied = applyIfStillUnresolved(wo.id, snapshotAttempt, () => {
+            q().updateWorkOrderReconciledMatch.run({
               id: wo.id,
               adobeWorkorderId: found.workorderId,
               adobeStatus: found.status,
@@ -174,7 +191,7 @@ export async function reconcileOrphanWorkOrders() {
           // irreversible delete (review R6 #1). Treat as INDETERMINATE: hold the
           // reservation, keep the WO in 'submitting'. CAS-guarded so a stale
           // no-match can't revert a WO that changed during the lookup.
-          applyIfUnchanged(wo.id, snapshotAttempt, () => {
+          applyIfStillUnresolved(wo.id, snapshotAttempt, () => {
             q().updateWorkOrderStatus.run('submitting',
               'submission outcome unconfirmed: not yet listed in Adobe (async creation may lag). ' +
               'Left for operator reconciliation — verify in Adobe before any retry.', wo.id);
@@ -191,10 +208,10 @@ export async function reconcileOrphanWorkOrders() {
         // (exactly once; `marked.delete` returns false if already unmarked).
         if (marked.delete(wo.id)) unmarkReconciling(wo.id);
       }
-    }
+    })));
   } finally {
     // Safety net: release this run's hold on any WO not reached by a per-WO
-    // finally (e.g. an unexpected throw in the loop) — each exactly once.
+    // finally (e.g. an unexpected throw) — each exactly once.
     for (const id of marked) unmarkReconciling(id);
   }
   return orphans.length;
@@ -328,10 +345,11 @@ export async function reconcileJobOrphans(jobId) {
   const marked = new Set();
   for (const wo of orphans) { markReconciling(wo.id); marked.add(wo.id); }
 
+  const limit = pLimit(RECONCILE_CONCURRENCY);
   try {
-    for (const wo of orphans) {
+    await Promise.all(orphans.map(wo => limit(async () => {
       try {
-        if (isWorkOrderPosting(wo.id)) continue;     // let an in-flight POST settle
+        if (isWorkOrderPosting(wo.id)) return;       // let an in-flight POST settle
 
         const snapshotAttempt = wo.attempt ?? 0;
         const creds = await decryptCreds(wo.j_creds_id);
@@ -347,13 +365,13 @@ export async function reconcileJobOrphans(jobId) {
           indeterminate++;
           logger.warn({ localId: wo.id, prevStatus: wo.status },
             'reconcile: lookup indeterminate (Adobe rejected list query); leaving as-is');
-          continue;
+          return;
         }
 
         if (found) {
           // CAS: only apply if the WO didn't change during the awaited lookup
           // (operator release+retry would have bumped `attempt`) — review R9 #1.
-          const applied = applyIfUnchanged(wo.id, snapshotAttempt, () => {
+          const applied = applyIfStillUnresolved(wo.id, snapshotAttempt, () => {
             if (wo.status === 'failed') {
               // 'failed' but Adobe actually processed it → re-activate the
               // reservation AS accepted (held until rollover, review R5).
@@ -363,7 +381,7 @@ export async function reconcileJobOrphans(jobId) {
               // still-pending reservation to accepted so it isn't refunded.
               markAccepted(wo.id);
             }
-            q().updateWorkOrderSubmitted.run({
+            q().updateWorkOrderReconciledMatch.run({
               id: wo.id,
               adobeWorkorderId: found.workorderId,
               adobeStatus: found.status,
@@ -379,7 +397,7 @@ export async function reconcileJobOrphans(jobId) {
             logger.warn({ localId: wo.id },
               'reconcile: discarded a STALE lookup result — WO changed during the lookup (R9 #1)');
           }
-          continue;
+          return;
         }
 
         // Not found in Adobe.
@@ -388,7 +406,7 @@ export async function reconcileJobOrphans(jobId) {
           // guarantee). INDETERMINATE — hold the reservation, keep 'submitting'
           // (review R6 #1). CAS-guarded against a stale revert.
           indeterminate++;
-          applyIfUnchanged(wo.id, snapshotAttempt, () => {
+          applyIfStillUnresolved(wo.id, snapshotAttempt, () => {
             q().updateWorkOrderStatus.run('submitting',
               'submission outcome unconfirmed: not yet listed in Adobe (async creation may lag). ' +
               'Verify in Adobe before any retry.', wo.id);
@@ -407,7 +425,7 @@ export async function reconcileJobOrphans(jobId) {
       } finally {
         if (marked.delete(wo.id)) unmarkReconciling(wo.id);
       }
-    }
+    })));
   } finally {
     for (const id of marked) unmarkReconciling(id);
   }
