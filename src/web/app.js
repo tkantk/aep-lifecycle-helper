@@ -1561,6 +1561,17 @@ async function renderSubmit() {
   }
   const totalDays = Math.max(...state.workOrders.map(w => w.day_index), 1);
 
+  // On tab entry, land on the first day that still has un-shipped (planned/
+  // deferred) work, so the operator sees "Submit Day N" for the actual pending
+  // window instead of a fully-shipped earlier day. (2026-06-03: pairs with the
+  // redistributor's day-label continuity so a remaining tail reads as "Day 2",
+  // not a confusing reset to "Day 1".) Runs once per tab entry — it does NOT
+  // fight the Advance/Back navigation, which re-renders via render() not here.
+  const firstPendingDay = state.workOrders
+    .filter(w => w.status === 'planned' || w.status === 'deferred')
+    .reduce((min, w) => Math.min(min, w.day_index), Infinity);
+  if (Number.isFinite(firstPendingDay)) state.currentDay = firstPendingDay;
+
   const render = (wos) => {
     state.workOrders = wos;
     const today = wos.filter(w => w.day_index === state.currentDay);

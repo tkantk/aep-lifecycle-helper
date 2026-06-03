@@ -183,8 +183,15 @@ demo — never for production. See CLAUDE.md I12.
   5. SUBMIT          Pre-submit modal: shows live remaining + planned count;
      │               operator confirms each click (always shown — destructive).
      ▼               Backend then:
-                       a. Re-fetch /quota with refresh: true. On hard failure
-                          (no recent cache), abort with quota_unavailable 503.
+                       a. Re-fetch /quota with refresh: true, RETRYING the live
+                          fetch up to QUOTA_PREFLIGHT_ATTEMPTS (default 3, linear
+                          backoff) — P1, 2026-06-01: adobeClient does NOT retry
+                          timeouts (ECONNABORTED), so on a flaky network one slow
+                          /quota call would fall through to stale and BLOCK the
+                          submit; the retry self-heals a transient timeout into a
+                          FRESH snapshot. On hard failure (all attempts fail and
+                          no recent cache), abort with quota_unavailable 503;
+                          a stale-but-cached snapshot is still REFUSED (I15).
                        b. Re-run redistributor against the fresh numbers
                           (un-shipped WOs may shift to a later month).
                        c. For each planned OR deferred order in the target
@@ -265,6 +272,15 @@ demo — never for production. See CLAUDE.md I12.
                      succeeded=X failed=Y elapsedMs=Z. Per-tick credential
                      cache (Promise-keyed by creds_id) so we don't decrypt
                      the same secret 100x on a single tick.
+                     PER-WO BACKOFF (P1, 2026-06-01): a status poll that FAILS
+                     puts that WO into in-memory exponential backoff (2×…16×
+                     the 60s interval); a SUCCESS clears it. On a flaky network
+                     every poll times out, and without backoff the monitor
+                     re-polled all open WOs every tick — flooding the link and
+                     starving a concurrent Submit's /quota call. DISPLAY-only
+                     (never touches the quota ledger, R5). The poll cursor is
+                     stamped for EVERY candidate (incl. backed-off) so a
+                     backed-off WO can't freeze the LIMIT-100 window.
 
   7. AUTO-RESUME     setInterval(60s). Reads operator-configured settings
      (Phase 3)       (enabled, localTime HH:MM, days). When shouldFireNow()
@@ -383,6 +399,12 @@ src/
 │   │                       secret. Per-tick log: 'monitor tick complete
 │   │                       polled=N succeeded=X failed=Y elapsedMs=Z'.
 │   │                       stopMonitor() exposed for graceful shutdown.
+│   │                       P1 (2026-06-01): per-WO in-memory exponential
+│   │                       backoff (_pollBackoff; 2×…16× interval, reset on
+│   │                       success) so a flaky-network outage can't make the
+│   │                       tick re-poll every open WO every 60s and starve a
+│   │                       Submit's /quota call. Cursor stamped for every
+│   │                       candidate so backed-off WOs can't freeze LIMIT-100.
 │   ├── scheduler.js        Configurable auto-resume scheduler (Phase 3,
 │   │                       2026-05-15). setInterval(60s) tick that fires
 │   │                       when shouldFireNow() agrees with the operator's

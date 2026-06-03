@@ -119,9 +119,20 @@ export function redistributeUnshippedOrders(jobId, quota) {
     return { months: 0, days: 0, totalUnshipped: 0, totalIdentifiers: 0, perMonthCounts: [] };
   }
 
-  let month = 1;
-  let day   = 1;
-  const perMonthCounts = [0];   // index 0 = month 1
+  // CONTINUE numbering past whatever has already shipped, instead of resetting
+  // the un-shipped tail to "Day 1" (2026-06-03 day-label continuity). After a
+  // Day-1 window ships, the remaining work must read as "Day 2", matching the
+  // operator's mental model — otherwise the Submit button appears to go
+  // backwards, which is confusing on a destructive tool. This is a LABEL-only
+  // offset: it changes neither identity content nor the reserve() quota gate, so
+  // the no-over-ship guarantee is untouched. Shipped WOs stay immutable; the
+  // submitter still ships the lowest un-shipped (month, day) bucket first.
+  const shippedMax = q().getMaxShippedWindow.get(jobId);
+  let month = shippedMax ? shippedMax.mm : 1;
+  let day   = shippedMax ? shippedMax.dd + 1 : 1;
+  // perMonthCounts is 0-indexed by (month-1); pad leading months that are fully
+  // shipped (no un-shipped work) so counts land in the right slot.
+  const perMonthCounts = Array(month).fill(0);
   let totalIdentifiers = 0;
 
   const tx = db.transaction(() => {

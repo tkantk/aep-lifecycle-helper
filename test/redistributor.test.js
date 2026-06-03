@@ -232,3 +232,61 @@ test('redistribute: no unshipped WOs is a no-op returning months=0', () => {
   assert.equal(result.months, 0);
   assert.equal(result.totalUnshipped, 0);
 });
+
+// ─── Day-label continuity (2026-06-03) ─────────────────────────────────────
+// Real prod confusion: after Day 1's window shipped, the operator clicked to
+// submit "Day 2" but the button said "Day 1". The redistributor numbered the
+// un-shipped tail from day=1, ignoring already-shipped windows. It must instead
+// CONTINUE numbering past the highest shipped window so the label stays "Day 2".
+
+/** Mark a WO shipped in (month, day): set its label + an Adobe id. */
+function seedShippedWorkOrder(jobId, month, day, size) {
+  const id = uuid();
+  q().insertWorkOrder.run({
+    id, jobId, dayIndex: day, datasetIds: 'ALL', targetServicesJson: null,
+    namespacesIdentities: '[]', identifierCount: size, status: 'planned',
+  });
+  q().setOrderMonthDay.run(month, day, id);
+  q().updateWorkOrderSubmitted.run({
+    id, adobeWorkorderId: `DI-${id}`, adobeStatus: 'received', bundleId: null,
+    submittedAt: '2026-05-29T00:00:00Z',
+  });
+  return id;
+}
+
+test('redistribute: un-shipped tail continues to Day 2 (does NOT reset to Day 1)', () => {
+  const jobId = seedJob({ dailyLimit: 1_000_000, monthlyLimit: 5_000_000 });
+  // 10 shipped WOs of 100k = the 1,000,000 already sent as "Day 1".
+  const shipped = [];
+  for (let i = 0; i < 10; i++) shipped.push(seedShippedWorkOrder(jobId, 1, 1, 100_000));
+  // 7 un-shipped WOs ≈ 607k — fits one fresh day.
+  seedWorkOrders(jobId, Array(7).fill(86_769));   // 607,383 < 1,000,000
+
+  redistributeUnshippedOrders(jobId, {
+    daily:   { remaining: 1_000_000, quota: 1_000_000 },
+    monthly: { remaining: 5_000_000, quota: 5_000_000 },
+  });
+
+  const unshipped = q().getUnshippedOrdersForJob.all(jobId);
+  assert.equal(unshipped.length, 7);
+  for (const wo of unshipped) {
+    assert.equal(wo.month_index, 1, 'stays in month 1');
+    assert.equal(wo.day_index, 2, 'continues to Day 2 — not reset to Day 1');
+  }
+  // Shipped WOs are immutable (still Day 1).
+  for (const id of shipped) {
+    const wo = db.prepare('SELECT day_index FROM work_orders WHERE id = ?').get(id);
+    assert.equal(wo.day_index, 1, 'shipped WO label is immutable');
+  }
+});
+
+test('redistribute: with NO shipped WOs, numbering still starts at Day 1', () => {
+  const jobId = seedJob({ dailyLimit: 1_000_000, monthlyLimit: 5_000_000 });
+  seedWorkOrders(jobId, Array(5).fill(100_000));   // 500k, one day
+  redistributeUnshippedOrders(jobId, {
+    daily:   { remaining: 1_000_000, quota: 1_000_000 },
+    monthly: { remaining: 5_000_000, quota: 5_000_000 },
+  });
+  const unshipped = q().getUnshippedOrdersForJob.all(jobId);
+  for (const wo of unshipped) assert.equal(wo.day_index, 1, 'fresh job starts at Day 1');
+});

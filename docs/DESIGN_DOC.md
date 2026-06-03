@@ -5,12 +5,23 @@
 
 | Field        | Value                                           |
 |--------------|-------------------------------------------------|
-| Version      | 3.0.0                                           |
-| Date         | 2026-05-30                                      |
+| Version      | 3.1.0                                           |
+| Date         | 2026-06-03                                      |
 | Status       | Production-ready                                |
 | Author       | Tushar Kant Kar (Adobe)                         |
 | Audience     | Client teams, platform architects, reviewers    |
 | Diagrams     | Rendered via Mermaid CLI (sources in `docs/diagrams/*.mmd`, PNGs in `docs/diagrams/*.png`) |
+
+> **3.1.0 (2026-06-03) — flaky-network resilience (P1).** After a live prod
+> incident on an intermittent Wi-Fi link to Adobe: (1) the `/quota` submit
+> preflight now retries the live fetch (default 3×, backoff) so a transient
+> timeout self-heals into a fresh snapshot instead of blocking the submit —
+> the fail-closed refuse-stale boundary (I15) is unchanged; (2) the status
+> monitor applies per-WO exponential backoff so an outage can't flood the link
+> or starve a concurrent submit (DISPLAY-only, never touches the quota ledger);
+> (3) `GET /jobs/:id` no longer runs the heavy namespace GROUP-BY on the hot
+> path (opt-in via `?breakdown=1`), fixing the "click freezes then opens" lag.
+> See `docs/CHANGELOG.md` → 2026-06-01 (P1).
 
 ---
 
@@ -472,6 +483,18 @@ The identity content (`namespaces_identities` JSON) of any existing WO
 **never changes** — only the bucket labels do. This is the "if someone
 else's app consumed 300 k of your daily quota since you planned, push
 our remaining work to a later window" behaviour the operator can rely on.
+
+> **Day-label continuity (2026-06-03).** The redistributor previously numbered
+> the *un-shipped* tail from `day = 1` each run, ignoring already-shipped
+> windows — so after a Day-1 window shipped, a remaining tail that fits one
+> fresh day was re-labelled **"Day 1 of 1"** even though the operator was on
+> "Day 2", which read as the Submit button going backwards. It now seeds the
+> starting `(month, day)` from the highest **shipped** window
+> (`db.getMaxShippedWindow`) and continues past it, so the remainder stays
+> **"Day 2"**. The UI also lands on the first day that still has pending work.
+> This is purely a **label** change — it touches neither identity content nor
+> the `reserve()` quota gate, so the no-over-ship guarantee is preserved, and
+> shipped WOs remain immutable. Tests in `test/redistributor.test.js`.
 
 ---
 

@@ -629,6 +629,18 @@ function prepared() {
        WHERE job_id = ? AND status IN ('planned','deferred')
        ORDER BY rowid
     `),
+    // Highest (month, day) window that has ALREADY shipped to Adobe, so the
+    // redistributor can CONTINUE numbering the un-shipped tail past it instead
+    // of resetting to Day 1 (2026-06-03 day-label continuity). Returns the max
+    // shipped month and the max day within it; no rows → nothing shipped yet.
+    getMaxShippedWindow: db.prepare(`
+      SELECT COALESCE(month_index, 1) AS mm, MAX(COALESCE(day_index, 1)) AS dd
+        FROM work_orders
+       WHERE job_id = ? AND adobe_workorder_id IS NOT NULL
+       GROUP BY COALESCE(month_index, 1)
+       ORDER BY mm DESC
+       LIMIT 1
+    `),
     setOrderMonthDay: db.prepare(`
       UPDATE work_orders SET month_index = ?, day_index = ?, updated_at = datetime('now') WHERE id = ?
     `),
