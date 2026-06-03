@@ -1011,6 +1011,11 @@ async function switchToJob(jobId) {
     if (meta) await meta.render();
   } catch (err) {
     showToast(`Could not load job: ${err.message}`, { kind: 'error' });
+    // Don't leave the "Loading job…" spinner stuck (it was painted above for
+    // immediate click feedback). Re-render the current tab so it recovers to
+    // the jobs picker / previous state instead of a dead spinner.
+    const meta = STEPS[state.step];
+    if (meta) await meta.render();
   }
 }
 
