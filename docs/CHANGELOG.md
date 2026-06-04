@@ -9,6 +9,39 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-06-04 — Reviewer findings: day-label edge fix + diagram/screenshot corrections
+
+External review of the day-label + diagram work. All four findings verified
+against the code and fixed; suite 276 → **277**.
+
+- **(High · Backend) Day-2 → Day-3 jump when today's daily.remaining = 0.** The
+  day-label continuity fix offset the *start day* past shipped windows but still
+  initialised `dayRem` from the live `daily.remaining`. If Day 1 shipped TODAY and
+  Adobe reports `remaining = 0`, the pending tail's first (NEW-day) window failed
+  the day-fit check and bumped from Day 2 to Day 3. Fix: when shipped work exists,
+  the tail's first window starts with a FRESH daily cap (`dailyFresh`) — today's
+  depleted remaining belongs to the shipped work; only the no-shipped first plan
+  still uses live `daily.remaining`. Monthly still respects shipped consumption.
+  Label-only (reserve() unchanged), so no over-ship. `runner/redistributor.js`;
+  test `test/redistributor.test.js` (+1, `remaining=0 → Day 2`).
+- **(Medium · Docs) Submit/reconcile diagram contradicted R11.** Frame 08 (Figma +
+  Mermaid + PNG export) said a failed no-match → "leave as failed (4xx — Adobe
+  never processed it)". That's wrong: recovery.js leaves it **ambiguous** (a
+  no-match doesn't prove absence — R6 #1 / R11). Corrected in
+  `docs/diagrams/08-submit-reconcile-flow.mmd`, the Figma frame, and the re-exported
+  `docs/diagrams/figma/08-…png`.
+- **(Medium · Docs) Screen walkthrough not client-ready.** Screenshots showed
+  real-company-looking labels and a quota panel reading "used 0" while 10/17 were
+  submitted. Re-seeded with fully fabricated data (Acme Retail · placeholder org ·
+  `prod-demo` sandbox · generic CSV) and seeded the quota ledger so the panel reads
+  daily used 1,000,000 (consistent with the shipped Day 1). Re-captured all 6
+  screens; corrected the misleading "no customer data" note in `docs/SCREENS.md`.
+- **(Low · Docs) Expansion diagram named the wrong helper.** Said
+  `bulkInsertIdentities()`; production uses `insertIdentitiesAndCount()`
+  (`expansion.js:197`, rows + counters in one tx). Fixed in
+  `docs/diagrams/07-expansion-data-flow.mmd`, the Figma frame, and the re-exported
+  PNG.
+
 ## 2026-06-01 (P1) — Flaky-network prod incident: quota-preflight retry, monitor backoff, instant job-load
 
 Live prod incident on a Windows box behind a flaky corporate network to Adobe.

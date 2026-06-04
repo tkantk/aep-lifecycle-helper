@@ -98,9 +98,22 @@ export function redistributeUnshippedOrders(jobId, quota) {
     safeInt(job.monthly_limit, config.monthlyIdentifierLimit)
   );
 
-  // First-period remainders — live values from Adobe if we have them,
-  // otherwise full fresh caps.
-  let dayRem   = Number.isFinite(quota?.daily?.remaining)   ? Number(quota.daily.remaining)   : dailyFresh;
+  // Highest (month, day) window that has ALREADY shipped to Adobe. Drives both
+  // the day-label continuity offset (below) AND the first-day remainder choice
+  // (right here): when shipped work exists, the un-shipped tail begins in a NEW
+  // day window, so today's depleted daily.remaining (which belongs to the
+  // SHIPPED work) must NOT cap it — otherwise a remaining of 0 bumps the tail
+  // from Day 2 to Day 3 (reviewer finding). A fresh day starts with the full
+  // daily cap; reserve() at submit time still enforces the real live quota.
+  const shippedMax = q().getMaxShippedWindow.get(jobId);
+
+  // First-period remainders. DAILY resets every UTC midnight, so a shipped tail
+  // (a future day) starts fresh; only the no-shipped first plan uses today's
+  // live remaining. MONTHLY is shared across the calendar month, so the tail
+  // ALWAYS respects what shipped work already consumed this month.
+  let dayRem = shippedMax
+    ? dailyFresh
+    : (Number.isFinite(quota?.daily?.remaining) ? Number(quota.daily.remaining) : dailyFresh);
   let monthRem = monthlyFresh == null
     ? null
     : (Number.isFinite(quota?.monthly?.remaining) ? Number(quota.monthly.remaining) : monthlyFresh);
@@ -127,7 +140,7 @@ export function redistributeUnshippedOrders(jobId, quota) {
   // offset: it changes neither identity content nor the reserve() quota gate, so
   // the no-over-ship guarantee is untouched. Shipped WOs stay immutable; the
   // submitter still ships the lowest un-shipped (month, day) bucket first.
-  const shippedMax = q().getMaxShippedWindow.get(jobId);
+  // (shippedMax was fetched above, where it also drives the fresh-day remainder.)
   let month = shippedMax ? shippedMax.mm : 1;
   let day   = shippedMax ? shippedMax.dd + 1 : 1;
   // perMonthCounts is 0-indexed by (month-1); pad leading months that are fully

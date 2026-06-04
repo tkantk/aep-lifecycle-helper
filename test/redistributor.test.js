@@ -280,6 +280,28 @@ test('redistribute: un-shipped tail continues to Day 2 (does NOT reset to Day 1)
   }
 });
 
+test('redistribute: un-shipped tail stays Day 2 even when today’s daily.remaining is 0 (shipped consumed it)', () => {
+  // Edge case (reviewer finding): if Day 1 shipped TODAY and Adobe reports
+  // daily.remaining = 0, the pending tail must still read Day 2 — not jump to
+  // Day 3 because today's depleted remaining (which belongs to the shipped
+  // work) double-penalised the tail's first, NEW-day window.
+  const jobId = seedJob({ dailyLimit: 1_000_000, monthlyLimit: 5_000_000 });
+  for (let i = 0; i < 10; i++) seedShippedWorkOrder(jobId, 1, 1, 100_000);   // Day 1 = 1,000,000 shipped
+  seedWorkOrders(jobId, Array(7).fill(86_769));                              // 607,383 pending
+
+  redistributeUnshippedOrders(jobId, {
+    daily:   { remaining: 0,          quota: 1_000_000 },   // today's daily fully consumed by Day 1
+    monthly: { remaining: 4_000_000,  quota: 5_000_000 },   // monthly still has room
+  });
+
+  const unshipped = q().getUnshippedOrdersForJob.all(jobId);
+  assert.equal(unshipped.length, 7);
+  for (const wo of unshipped) {
+    assert.equal(wo.month_index, 1, 'stays in month 1');
+    assert.equal(wo.day_index, 2, 'the next day window is Day 2, not bumped to Day 3 by an exhausted remaining');
+  }
+});
+
 test('redistribute: with NO shipped WOs, numbering still starts at Day 1', () => {
   const jobId = seedJob({ dailyLimit: 1_000_000, monthlyLimit: 5_000_000 });
   seedWorkOrders(jobId, Array(5).fill(100_000));   // 500k, one day

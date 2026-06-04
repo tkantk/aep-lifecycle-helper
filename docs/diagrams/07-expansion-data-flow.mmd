@@ -26,7 +26,7 @@ flowchart LR
 
   Canonical["<b>canonicalize</b><br/>resolve ns_code ↔ ns_id<br/>from registry"]
 
-  Insert["<b>bulkInsertIdentities()</b><br/>db.transaction() prepared stmt<br/>plain INSERT (no UNIQUE)<br/>~100k rows/sec"]
+  Insert["<b>insertIdentitiesAndCount()</b><br/>rows + job counters in ONE db.transaction()<br/>plain INSERT (no UNIQUE)<br/>~100k rows/sec"]
 
   SQLite[("<b>expanded_identities</b><br/>SQLite WAL<br/>(deferred dedup at plan time<br/>via GROUP BY)")]
 

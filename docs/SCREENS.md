@@ -4,9 +4,12 @@ A guided tour of the AEP Data Lifecycle Helper UI — what each screen does, its
 key controls, and the safety behaviour behind it. Screens are listed in the
 order an operator works through them (left-hand nav, top to bottom).
 
-> Screenshots are captured from a seeded demo job modelled on a real ~1.6 M
-> identity batch (Day 1 of 1,000,000 already shipped; Day 2 of 607,383 pending).
-> Secrets are masked; no live credentials or customer data appear.
+> Screenshots use **entirely fabricated demo data** — a fictional "Acme Retail"
+> credential, a placeholder IMS org, a `prod-demo` sandbox, and a generic CSV
+> name. No real company, credentials, sandbox, or customer identifiers appear,
+> and the client secret is masked. The scenario (a 1,607,384-identifier job with
+> Day 1 of 1,000,000 already shipped and Day 2 of 607,383 pending) is illustrative;
+> the quota panel is seeded to stay internally consistent with it.
 
 ---
 

@@ -46,7 +46,7 @@ flowchart TB
 
     Lookup -->|"found in Adobe"| FixIt["record Adobe WO ID<br/>flip to <b>SUBMITTED</b><br/>markAccepted (reactivate if was failed)"]
     Lookup -->|"no match + was submitting"| Indet["<b>INDETERMINATE</b><br/>leave in SUBMITTING<br/>HOLD reservation<br/>(absence unproven — R6 #1)"]
-    Lookup -->|"no match + was failed"| Stay["leave as failed<br/>(4xx — never processed)"]
+    Lookup -->|"no match + was failed"| Stay["leave as failed — AMBIGUOUS<br/>(no-match ≠ absence; R6 #1 / R11)<br/>operator verifies, then ?force=true"]
     Lookup -->|"Adobe 400 / network"| Leave["leave as-is<br/>(retry on next boot)"]
   end
 
