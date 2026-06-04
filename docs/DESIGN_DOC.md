@@ -10,7 +10,7 @@
 | Status       | Production-ready                                |
 | Author       | Tushar Kant Kar (Adobe)                         |
 | Audience     | Client teams, platform architects, reviewers    |
-| Diagrams     | Rendered via Mermaid CLI (sources in `docs/diagrams/*.mmd`, PNGs in `docs/diagrams/*.png`) |
+| Diagrams     | [Figma design file](https://www.figma.com/design/G9tjo1Uq1JSfCHGfzBMrZe) → [`docs/DIAGRAMS.md`](DIAGRAMS.md) (PNGs in `docs/diagrams/figma/`); Mermaid fallback in `docs/diagrams/*.mmd`/`*.png` |
 
 > **3.1.0 (2026-06-03) — flaky-network resilience (P1).** After a live prod
 > incident on an intermittent Wi-Fi link to Adobe: (1) the `/quota` submit
@@ -42,18 +42,19 @@
 11. [Known Limitations & Extension Points](#11-known-limitations--extension-points)
 12. [Appendix — File Map](#12-appendix--file-map)
 
-> **Diagrams** in this document are available in three forms:
+> **Diagrams** in this document are available in several forms:
 >
-> 1. **Inline PNG renders** (embedded below each section) — produced by
->    Mermaid CLI from the `.mmd` sources in `docs/diagrams/`. Show in
->    GitHub markdown view and in `DESIGN_DOC.docx`.
-> 2. **Live editable FigJam** — every diagram below is also available
->    as a FigJam board you can pan, zoom, comment, and edit:
->    **[Open in FigJam](https://www.figma.com/board/j6ATXKYO19VSEk4vx4IU7a)**.
->    This is the canonical view for client presentations and live
->    review sessions.
-> 3. **Mermaid source** — `docs/diagrams/*.mmd`, version-controlled so
->    every diagram can be regenerated identically.
+> 1. **High-quality Figma design file** *(primary, 2026-06-03)* — branded
+>    block & flow diagrams with a consistent AEP-Spectrum visual system. PNG
+>    exports live in `docs/diagrams/figma/` and are collected in
+>    **[`docs/DIAGRAMS.md`](DIAGRAMS.md)**. Live, editable source:
+>    **[Open in Figma](https://www.figma.com/design/G9tjo1Uq1JSfCHGfzBMrZe)** —
+>    the canonical view for client presentations and live review.
+> 2. **Inline Mermaid PNG renders** (embedded below each section) — produced by
+>    Mermaid CLI from the `.mmd` sources in `docs/diagrams/`. Retained as a
+>    text-diffable fallback that also shows in `DESIGN_DOC.docx`.
+> 3. **Mermaid source** — `docs/diagrams/*.mmd`, version-controlled so the
+>    fallback renders can be regenerated identically.
 
 ---
 

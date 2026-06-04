@@ -3,6 +3,7 @@
 > **Read this first** before proposing any change. Also skim `CHANGELOG.md` for
 > what's changed recently, and `CLAUDE.md` for the full list of invariants. If
 > your change touches an Adobe payload, read the relevant section of `REVIEW.md`.
+> For visual block & flow diagrams, see **[`DIAGRAMS.md`](DIAGRAMS.md)** (Figma).
 
 ---
 
