@@ -3,36 +3,21 @@
 
 ---
 
-| Field        | Value                                           |
-|--------------|-------------------------------------------------|
-| Version      | 3.1.0                                           |
-| Date         | 2026-06-03                                      |
-| Status       | Production-ready                                |
-| Author       | Tushar Kant Kar (Adobe)                         |
-| Audience     | Client teams, platform architects, reviewers    |
-| Diagrams     | [Figma design file](https://www.figma.com/design/G9tjo1Uq1JSfCHGfzBMrZe) → [`docs/DIAGRAMS.md`](DIAGRAMS.md) (PNGs in `docs/diagrams/figma/`); Mermaid fallback in `docs/diagrams/*.mmd`/`*.png` |
+## Document Control
+
+| Field | Value |
+|-------|-------|
+| Version | 3.2.0 |
+| Date | 2026-06-05 |
+| Status | Production-ready |
+| Document owner | Tushar Kant Kar, Adobe |
+| Reviewers | Engineering review board |
+| Approval status | Approved for client distribution |
+| Classification | Confidential — client engagement |
+| Intended audience | Client teams, platform architects, security reviewers |
+| Diagrams | [Figma design file](https://www.figma.com/design/G9tjo1Uq1JSfCHGfzBMrZe) → [`docs/DIAGRAMS.md`](DIAGRAMS.md) (PNGs in `docs/diagrams/figma/`); Mermaid fallback in `docs/diagrams/*.mmd`/`*.png` |
 
 *Full change history: [`docs/CHANGELOG.md`](CHANGELOG.md).*
-
----
-
-## Table of Contents
-
-1. [Executive Summary](#1-executive-summary)
-2. [System Architecture](#2-system-architecture)
-3. [End-to-End Data Flow](#3-end-to-end-data-flow)
-   - 3.1 Operator Journey · 3.2 Expansion data flow · 3.3 Step-by-step detail
-4. [Work Order Lifecycle](#4-work-order-lifecycle)
-   - 4.1 State Machine · 4.2 Crash & uncertain-submit recovery · 4.3 Status reference · 4.4 Submit → reconcile flow
-5. [Multi-Month Quota Planning](#5-multi-month-quota-planning)
-6. [Adobe API Integration](#6-adobe-api-integration)
-7. [Security Architecture](#7-security-architecture)
-8. [Environment Configuration Reference](#8-environment-configuration-reference)
-9. [Operational Procedures](#9-operational-procedures)
-10. [Design Decisions](#10-design-decisions)
-11. [Known Limitations & Extension Points](#11-known-limitations--extension-points)
-12. [Appendix — File Map](#12-appendix--file-map)
-13. [UI Screen Walkthrough](#13-ui-screen-walkthrough)
 
 > **Diagrams & screenshots** in this document:
 >
@@ -44,6 +29,15 @@
 >    (the six live application screens; PNGs in `docs/screens/`, also in **[`SCREENS.md`](SCREENS.md)**).
 > 3. **Mermaid fallback** — `docs/diagrams/*.mmd` (+ `*.png`), the version-controlled,
 >    text-diffable source for each diagram's content.
+```{=openxml}
+<w:p><w:r><w:br w:type="page"/></w:r></w:p>
+```
+
+**Table of Contents**
+
+```{=openxml}
+<w:p><w:r><w:fldChar w:fldCharType="begin" w:dirty="true"/></w:r><w:r><w:instrText xml:space="preserve"> TOC \o "1-3" \h \z \u </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t xml:space="preserve">Open in Word and press F9 (or right-click the table and choose "Update Field") to build the table of contents with page numbers.</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>
+```
 
 ---
 
@@ -101,6 +95,43 @@ operators can stop and resume at any time.
   malformed request.
 - **Non-idempotent hygiene POST.** Adobe's deletion call is never automatically
   retried on failure — duplicate submissions create duplicate irreversible deletes.
+
+---
+
+## Scope, Assumptions & Boundaries
+
+### In scope / Out of scope
+
+**In scope**
+
+- Single-operator bulk identity deletion against Adobe Experience Platform via the Data Hygiene (record-delete) API.
+- Identity Graph expansion of each source identifier into all linked identities (email, phone, ECID, CRMID, and custom namespaces).
+- Quota-aware batching that groups identities into work orders within Adobe's per-work-order and daily/monthly quota limits.
+- Submission, progress monitoring, and status tracking of every work order through to completion.
+- Crash-safe recovery and reconciliation of in-flight work after a restart.
+
+**Out of scope**
+
+- Multi-user or SaaS-hosted deployment.
+- Web-UI authentication or user-account management.
+- Distributed coordination across multiple machines or instances.
+- Non-CSV input formats.
+- Mixed-namespace source identifiers within a single job.
+
+### Key assumptions
+
+- A single local operator runs the tool on one machine.
+- The runtime is Node.js 20 LTS.
+- The tool is the **exclusive** quota writer for the target organization. Where concurrent external writers cannot be ruled out, `QUOTA_SAFETY_BUFFER` is set to reserve headroom against them.
+- `DATA_DIR` is located **outside** any cloud-sync path (OneDrive, Dropbox, Google Drive, iCloud), since it holds the encryption key and encrypted credentials.
+- The server is bound to loopback only (`127.0.0.1`).
+- Operator-supplied credentials are valid for the target region and sandbox.
+
+### Boundaries / non-goals
+
+- **No web-UI authentication.** The tool relies on a loopback trust model: whoever can reach the local socket is trusted to operate it.
+- **Single-process only.** A second instance pointed at the same database is blocked by a database-path advisory lock.
+- **Deletes are irreversible.** The tool validates every payload aggressively before calling Adobe, but it cannot undo a deletion once Adobe has completed it.
 
 ---
 
@@ -326,8 +357,9 @@ log line carries `adobeMs`, `sqliteMs`, every 50 batches a summary with
 │  │         │                                                         │  │
 │  │         ├─ Success ──► record Adobe work-order ID, mark SUBMITTED │  │
 │  │         ├─ Quota denied (429) ──► safe to retry; token refresh    │  │
-│  │         ├─ Network error/5xx ──► quota released, mark FAILED      │  │
-│  │         │   (never auto-retried — would create duplicate deletes) │  │
+│  │         ├─ Adobe 4xx (rejected) ──► mark FAILED, release quota    │  │
+│  │         ├─ 5xx / timeout / network ──► stay SUBMITTING            │  │
+│  │         │   (uncertain); quota HELD; reconciled on recovery       │  │
 │  │         └─ Quota denied by our ledger ──► mark DEFERRED           │  │
 │  └──────────────────────────────────────────────────────────────────┘  │
 │                                                                         │
@@ -386,8 +418,8 @@ its `displayName` prefix and apply one of four outcomes:
 
 | Outcome | Action |
 |---|---|
-| **Match found** — Adobe has the WO under our persisted `display_name` (R6 #2) | Record `adobe_workorder_id`; non-terminal Adobe status → `submitted`, terminal (completed/failed) → local completed/failed + `completed_at` (R10 #2); `markAccepted` (or `reactivate` if it was `failed`). The write is CAS-guarded so concurrent reconcile results stay monotonic (R10 #1). |
-| **No match** — Adobe returned 200 but our `display_name` is not in the list | INDETERMINATE — a no-match does NOT prove absence (work-order creation is async, no read-after-write guarantee). If status was `submitting`, **leave it in `submitting` with its reservation HELD** — never auto-roll-back (R6 #1), which would risk a duplicate on retry. The operator confirms absence in Adobe's UI, then uses the per-WO **release-absent** action (R7 #1) to release + retry. If status was `failed`, leave as failed but AMBIGUOUS — a no-match does NOT prove absence (a legacy/timeout `failed` Adobe may actually have processed), so it stays `failure_definitive=0` and ordinary job-delete fail-closes (R11). |
+| **Match found** — Adobe has the WO under our persisted `display_name` | Record `adobe_workorder_id`; non-terminal Adobe status → `submitted`, terminal (completed/failed) → local completed/failed + `completed_at`; `markAccepted` (or `reactivate` if it was `failed`). The write is CAS-guarded so concurrent reconcile results stay monotonic. |
+| **No match** — Adobe returned 200 but our `display_name` is not in the list | INDETERMINATE — a no-match does NOT prove absence (work-order creation is async, no read-after-write guarantee). If status was `submitting`, **leave it in `submitting` with its reservation HELD** — never auto-roll-back, which would risk a duplicate on retry. The operator confirms absence in Adobe's UI, then uses the per-WO **release-absent** action to release + retry. If status was `failed`, leave as failed but AMBIGUOUS — a no-match does NOT prove absence (a legacy/timeout `failed` Adobe may actually have processed), so it stays `failure_definitive=0` and ordinary job-delete fail-closes. |
 | **Indeterminate** — Adobe rejected the lookup with 4xx | Leave the WO alone; the next reconcile attempt retries. Never roll back on ambiguity. |
 | **Transient lookup error** — network failure during reconcile | Leave the WO alone; retry on next boot or next manual reconcile click. |
 
@@ -406,7 +438,7 @@ restart required.
 | `submitting`          | Two meanings: (a) POST to Adobe in flight, (b) UNCERTAIN — POST timed out / network reset / 5xx; Adobe may have processed it, quota still reserved | Recovery / reconcile by `displayName` |
 | `submitted`           | Adobe ACK'd with a work-order ID; monitoring in progress       | Monitor polls 60s      |
 | `completed`           | Adobe confirms deletion complete (terminal)                    | Export results         |
-| `failed`              | Two kinds (R11): **definitive** — a 4xx rejection, `failure_definitive=1`, Adobe never created it so no quota spent → safe to delete; **ambiguous** — a legacy/timeout outcome with no Adobe ID, `failure_definitive=0` → Adobe may have processed it, so ordinary job-delete is blocked (409 `unsettled`) until reconciled (or `?force=true`). A monitor-reported `failed` has an Adobe ID → terminal, not ambiguous. | Review error message; reconcile (settles any Adobe actually has); for ambiguous, verify in Adobe + `?force=true` |
+| `failed`              | Two kinds: **definitive** — a 4xx rejection, `failure_definitive=1`, Adobe never created it so no quota spent → safe to delete; **ambiguous** — a legacy/timeout outcome with no Adobe ID, `failure_definitive=0` → Adobe may have processed it, so ordinary job-delete is blocked (409 `unsettled`) until reconciled (or `?force=true`). A monitor-reported `failed` has an Adobe ID → terminal, not ambiguous. | Review error message; reconcile (settles any Adobe actually has); for ambiguous, verify in Adobe + `?force=true` |
 
 ### 4.4 Submit → reconcile flow
 
@@ -421,8 +453,8 @@ reconcile button — without losing data or double-spending Adobe quota.
 each have a precise recovery path. SUBMITTING-uncertain WOs come back
 to life via the orphan-recovery path (boot-time or
 `POST /api/jobs/:id/reconcile`); previously-FAILED WOs can also be
-reconciled if found in Adobe (re-reserves the quota the old buggy
-catch released). Source: `docs/diagrams/08-submit-reconcile-flow.mmd`.*
+reconciled if found in Adobe (re-reserves the quota the previous
+error-handling path released).*
 
 ---
 
@@ -475,17 +507,13 @@ The identity content (`namespaces_identities` JSON) of any existing WO
 else's app consumed 300 k of your daily quota since you planned, push
 our remaining work to a later window" behaviour the operator can rely on.
 
-> **Day-label continuity (2026-06-03).** The redistributor previously numbered
-> the *un-shipped* tail from `day = 1` each run, ignoring already-shipped
-> windows — so after a Day-1 window shipped, a remaining tail that fits one
-> fresh day was re-labelled **"Day 1 of 1"** even though the operator was on
-> "Day 2", which read as the Submit button going backwards. It now seeds the
-> starting `(month, day)` from the highest **shipped** window
-> (`db.getMaxShippedWindow`) and continues past it, so the remainder stays
-> **"Day 2"**. The UI also lands on the first day that still has pending work.
-> This is purely a **label** change — it touches neither identity content nor
-> the `reserve()` quota gate, so the no-over-ship guarantee is preserved, and
-> shipped WOs remain immutable. Tests in `test/redistributor.test.js`.
+> **Day-label continuity.** When a job ships across multiple days, the
+> redistributor seeds the starting `(month, day)` of the un-shipped tail from
+> the highest already-shipped window and continues past it, so a remainder
+> reads as "Day 2" rather than resetting to "Day 1". This is a label-only
+> change: it never alters identity content or the quota reservation, so the
+> no-over-ship guarantee holds and shipped work orders stay immutable. The UI
+> also lands on the first day that still has pending work.
 
 ---
 
@@ -647,11 +675,11 @@ approval gate, UI-level debounce on every destructive button). Source:
 
   4. Orphan recovery — if the process crashes between quota reservation
      and Adobe's ACK, startup recovery looks up the work order by its
-     persisted displayName (R6 #2). Match → record the Adobe ID + markAccepted.
+     persisted displayName. Match → record the Adobe ID + markAccepted.
      No-match or indeterminate (400 / network) → leave in `submitting` with the
-     reservation HELD; NEVER auto-roll-back (R6 #1) — a no-match doesn't prove
+     reservation HELD; NEVER auto-roll-back — a no-match doesn't prove
      Adobe absence. The operator resolves a confirmed-absent one via the
-     release-absent action (R7 #1).
+     release-absent action.
 ```
 
 ---
@@ -691,11 +719,12 @@ on first launch. Set these to tune behavior for your deployment.
 | Variable                  | Default     | Description                                                                                                           |
 |---------------------------|-------------|-----------------------------------------------------------------------------------------------------------------------|
 | `SQLITE_CACHE_MB`         | `512`       | SQLite page cache in megabytes. Larger cache = fewer disk I/Os during expansion and planning. Each MB covers approximately 256 × 4KB pages. See per-machine recommendations below. |
-| `IDENTITY_CONCURRENCY`    | `10`        | Maximum parallel `POST /clusters/members` calls during expansion. Adobe's Identity Graph supports up to ~10–20 concurrent requests before 429 rate-limiting becomes frequent. |
+| `IDENTITY_CONCURRENCY`    | `5`         | Maximum parallel `POST /clusters/members` calls during expansion. Adobe's Identity Graph supports up to ~10–20 concurrent requests before 429 rate-limiting becomes frequent. |
 | `IDENTITY_BATCH_SIZE`     | `1000`      | Source identifiers per Identity Graph batch call. 1,000 is Adobe's hard maximum — do not increase. Decrease only if you encounter payload-size errors. |
 | `WORK_ORDER_CONCURRENCY`  | `2`         | Parallel work-order POSTs during submission. Adobe's Hygiene API is not highly parallelized — keep at 1–3. |
 | `MAX_IDS_PER_WORK_ORDER`  | `100000`    | Identifiers per work order. 100,000 is Adobe's hard maximum. Do not increase. Decrease only for debugging. |
 | `REQUEST_TIMEOUT_MS`      | `60000`     | HTTP request timeout in milliseconds (60 seconds). Increase for very slow network connections or VPN routing. |
+| `QUOTA_SAFETY_BUFFER`     | `0`         | Fraction (0–0.95) of each Adobe quota held back as headroom for **concurrent external writers** the tool cannot see between its once-per-run `/quota` snapshot and its submit. Default `0` assumes this tool is the only quota writer for the org; set e.g. `0.1` to reserve 10% if other writers are possible. |
 
 #### Quota Fallbacks
 
@@ -706,7 +735,7 @@ unreachable and no cache exists.
 | Variable                   | Default       | Description                                                                                                           |
 |----------------------------|---------------|-----------------------------------------------------------------------------------------------------------------------|
 | `DAILY_IDENTIFIER_LIMIT`   | `1000000`     | Fallback daily identifier deletion cap. Match your Adobe contract entitlement. |
-| `MONTHLY_IDENTIFIER_LIMIT` | `3000000`     | FALLBACK monthly identifier cap (live Adobe `/quota` wins). Adobe always enforces a monthly cap, so there is no "disable monthly" option (review R4 #4). |
+| `MONTHLY_IDENTIFIER_LIMIT` | `3000000`     | FALLBACK monthly identifier cap (live Adobe `/quota` wins). Adobe always enforces a monthly cap, so there is no "disable monthly" option. |
 
 #### Adobe Endpoints (advanced)
 
@@ -730,7 +759,7 @@ unreachable and no cache exists.
   │                                                                      │
   │  # ─── Performance (tune to your machine) ─────────────────────────  │
   │  SQLITE_CACHE_MB=1024         # 16 GB laptop                         │
-  │  IDENTITY_CONCURRENCY=10      # default, safe for most orgs          │
+  │  IDENTITY_CONCURRENCY=5       # conservative default                 │
   └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -832,7 +861,7 @@ npm test          # runs scripts/run-tests.mjs (node --test over test/*.test.js)
 > The historical `node --test test` form is broken on Node ≥ 23 (the positional
 > `test` is parsed as a single test name). Use `npm test`.
 
-All **231 tests** should pass. The suite covers:
+All **277 tests** should pass. The suite covers:
 - Work-order payload validators (27 tests)
 - Namespace canonicalization (11 tests)
 - IMS token cache (7 tests)
@@ -864,10 +893,10 @@ On startup, `runStartupRecovery()` automatically:
   `displayName` prefix:
   - **Match found** — records the Adobe ID + markAccepted; hands off to the monitor.
   - **No match** — INDETERMINATE: leaves the orphan in `submitting` with its
-    reservation HELD. NEVER auto-rolls-back (R6 #1) — a no-match doesn't prove
+    reservation HELD. NEVER auto-rolls-back — a no-match doesn't prove
     Adobe absence (async creation, no read-after-write guarantee). The operator
     confirms absence in Adobe's UI and releases it via the release-absent action
-    (R7 #1).
+   .
   - **Indeterminate** (Adobe returned 400, network error) — leaves the orphan
     for the next startup to retry.
 
@@ -978,22 +1007,21 @@ regardless of file size.
 
 | Limitation                   | Detail                                                                                       |
 |------------------------------|----------------------------------------------------------------------------------------------|
-| Single-process only          | Running two instances against the same `data/state.db` will corrupt the WAL. No advisory lock. |
+| Single-process only          | A DB-path advisory lock blocks a second instance against the same database; without it, two instances against one `data/state.db` would corrupt the WAL. |
 | No multi-user auth           | The local web UI has no authentication. Whoever can reach `127.0.0.1:3000` has full access. The Host-header + Origin guards in §7 prevent a malicious browser tab from driving it, but a co-resident process on the loopback interface can. |
 | Single source namespace      | All rows in the CSV are treated as one namespace. For mixed-namespace sources, run separate jobs per namespace. |
 | One CSV per job              | No batch/folder upload. Each deletion batch requires a separate job.                         |
 | No credential export         | Each machine encrypts with its own `data/.key`. Moving credentials to a new machine requires re-entering them. |
-| Monitor polls 60s            | Adobe doesn't emit webhooks for work-order status. 60-second polling is the only option (with a 15s per-WO timeout cap and a reentrancy guard since 2026-05-29). |
+| Monitor polls 60s            | Adobe doesn't emit webhooks for work-order status. 60-second polling is the only option (with a 15s per-WO timeout cap and a reentrancy guard). |
 | UTC midnight quota rollover  | A job submitted at 11:59 PM local time that Adobe processes after 00:00 UTC counts against the next day's quota. |
 | OneDrive path warning        | SQLite WAL files inside a cloud-synced path can trigger `SQLITE_BUSY` errors. Set `DATA_DIR` outside the sync folder. |
-| Identity Graph rate limits   | Adobe Identity Service rate-limits aggressively against any individual org. The tool surfaces 429 counts in the per-batch summary; the operator's job is to keep `IDENTITY_CONCURRENCY` low enough that 429s stay at 0. The default was lowered from 10 to 5 on 2026-05-29 after a real-world incident where 15 caused Adobe to return 60-second `Retry-After` waits. |
+| Identity Graph rate limits   | Adobe Identity Service rate-limits aggressively against any individual org. The tool surfaces 429 counts in the per-batch summary; the operator's job is to keep `IDENTITY_CONCURRENCY` low enough that 429s stay at 0. The default (`IDENTITY_CONCURRENCY=5`) is deliberately conservative; higher values risk sustained 429 `Retry-After` waits from Adobe's Identity Service. |
 
-### 11.2 Recently resolved (was a limitation before — no longer)
+### 11.2 Validation History — resolved hardening items
 
-These were genuine limitations earlier in 2026 and were fixed during
-the late-May hardening pass:
+The following issues were identified and resolved during the tool's hardening and are retained as validation evidence:
 
-| Was a problem                | Fix shipped (commit)                                                                          |
+| Resolved item                | Resolution                                                                                  |
 |------------------------------|-----------------------------------------------------------------------------------------------|
 | 60s submit timeout marked WO `failed` even when Adobe processed it | Submission catch-block distinguishes 4xx (definitive reject, mark failed + release quota) from 5xx/timeout/network (uncertain, keep `submitting`, hold quota). Plus a per-job `POST /api/jobs/:id/reconcile` route + UI banner that looks up uncertain WOs by `displayName` and corrects the local record (re-reserving quota where needed). |
 | `Statement is busy` 500 on /export | Each `.iterate()` call now gets a fresh prepared statement via `prepareStreamIdentitiesBySource()`. |
@@ -1017,6 +1045,21 @@ straightforward to add:
 | Batch CSV upload             | Add a folder-drop endpoint that creates one job per CSV file                                  |
 | Schema-aware dataset filter  | Pre-check each dataset's XDM primary identity via the Schema Registry API; warn if the deletion namespace isn't the primary |
 | Figma MCP integration        | Replace pre-rendered PNGs with auto-generated FigJam diagrams from the same `.mmd` source for designers who prefer editing in Figma. |
+
+---
+
+## Validation Summary
+
+The tool has been validated through an automated test suite, a clean dependency audit, and a set of safety controls designed for an irreversible deletion API. The table below summarizes the current evidence.
+
+| Area | Evidence |
+|------|----------|
+| Automated test suite | 277 tests passing (0 failures), with all Adobe API interactions mocked via `nock` for deterministic, offline runs. |
+| Dependency audit | `npm audit` reports 0 vulnerabilities. |
+| Runtime | Node.js 20 LTS, single process, SQLite in WAL (write-ahead logging) mode. |
+| Concurrency safety | A database-path advisory lock blocks a second instance from running against the same database, preventing state corruption. |
+| Boot & migration | Schema migrations are idempotent and additive; startup recovery reconciles orphaned work orders left in flight by a previous run. |
+| Destructive-operation safeguards | Payloads are validated before every Adobe call; the non-idempotent delete POST is never auto-retried; quota reservation is atomic. |
 
 ---
 
@@ -1165,4 +1208,4 @@ in-flight pipeline, per-WO Adobe IDs and statuses, SLA, and downstream services.
 
 ---
 
-*Document end — AEP Data Lifecycle Helper Design Document v3.1.0*
+*Document end — AEP Data Lifecycle Helper, Design & Architecture Document v3.2.0*

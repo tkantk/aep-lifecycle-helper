@@ -18,9 +18,9 @@ flowchart LR
 
   Buffer["<b>buffer</b><br/>fill to IDENTITY_BATCH_SIZE<br/>(1000 source IDs — Adobe hard cap)"]
 
-  Wave{"<b>wave scheduler</b><br/>WAVE_SIZE = concurrency × 2<br/>(default 10 × 2 = 20)"}
+  Wave{"<b>wave scheduler</b><br/>WAVE_SIZE = concurrency × 2<br/>(default 5 × 2 = 10)"}
 
-  Limit["<b>p-limit(IDENTITY_CONCURRENCY)</b><br/>default 5 (was 10) after<br/>2026-05-29 rate-limit incident"]
+  Limit["<b>p-limit(IDENTITY_CONCURRENCY)</b><br/>conservative default 5<br/>(raise only if 0 429s)"]
 
   Adobe[("<b>Adobe Identity Service</b><br/>POST /clusters/members<br/>15-30s p95<br/>429 → axios-retry + Retry-After")]
 
@@ -44,7 +44,7 @@ flowchart LR
   Insert --> SQLite
   Insert -.-> Progress
 
-  Note["<b>2026-05-29 fix</b><br/>each pushed batch is given<br/>.catch(()=>{}) BEFORE drainWave,<br/>so an ECONNRESET inside the wave<br/>can't become an unhandled rejection<br/>that crashes the process at 96%."]
+  Note["<b>Crash-safety</b><br/>each pushed batch is given<br/>.catch(()=>{}) BEFORE drainWave,<br/>so an ECONNRESET inside the wave<br/>can't become an unhandled rejection<br/>that crashes the process at 96%."]
 
   classDef src   fill:#FFF4D6,stroke:#F29423,stroke-width:2px,color:#1A1A1A
   classDef proc  fill:#E8F2FF,stroke:#1473E6,stroke-width:2px,color:#1A1A1A

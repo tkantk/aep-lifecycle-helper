@@ -131,7 +131,7 @@ export async function runExpansion({
   // data continuously across the run. Critical for multi-million-ID jobs on
   // memory-constrained Windows laptops.
   const limit = pLimit(config.identityConcurrency);
-  const WAVE_SIZE = config.identityConcurrency * 2; // 20 batches max in-flight
+  const WAVE_SIZE = config.identityConcurrency * 2; // 2× concurrency in-flight (10 at the default 5)
   let buffer = [];
   let wave   = [];
   let aborted = false;
@@ -218,7 +218,7 @@ export async function runExpansion({
         // Snapshot the 429 counter across this window. Non-zero means Adobe
         // throttled us — the climbing adobeMs you'll see is the client
         // sleeping on Retry-After, not Adobe being slow. Fix: lower
-        // IDENTITY_CONCURRENCY (5 is conservative; 10 is the default).
+        // IDENTITY_CONCURRENCY (5 is the conservative default; raise only if 0 429s).
         const rateLimitHits = snapshotAndResetRateLimitHits();
         logger.info({
           jobId,

@@ -670,7 +670,7 @@ npm install        # compiles better-sqlite3 native binding
 npm start          # runs src/index.js, opens browser
 npm run dev        # auto-restart on file changes
 npm test           # integration tests (mocked Adobe)
-npm run docs:docx  # regenerate docs/DESIGN_DOC.docx from DESIGN_DOC.md (needs pandoc;
+npm run docs:docx  # regenerate docs/DESIGN_DOC.docx (needs pandoc + python3;
                    #   --resource-path=docs makes the Figma diagrams + screenshots embed)
 
 # Reset all state (deletes creds + jobs + encryption key):

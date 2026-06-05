@@ -86,7 +86,10 @@ export const config = {
   sqliteCacheMb: Number(process.env.SQLITE_CACHE_MB) || 512,
 
   identityBatchSize: Number(process.env.IDENTITY_BATCH_SIZE) || 1000,
-  identityConcurrency: Number(process.env.IDENTITY_CONCURRENCY) || 10,
+  // Default 5 (conservative) after the 2026-05-29 rate-limit incident where a
+  // higher value drew sustained 429 Retry-After waits from Adobe's Identity
+  // Service. Raise toward 10–15 only if you observe zero 429s for your org.
+  identityConcurrency: Number(process.env.IDENTITY_CONCURRENCY) || 5,
   workOrderConcurrency: Number(process.env.WORK_ORDER_CONCURRENCY) || 2,
   maxIdsPerWorkOrder: Number(process.env.MAX_IDS_PER_WORK_ORDER) || 100_000,
   dailyIdentifierLimit: Number(process.env.DAILY_IDENTIFIER_LIMIT) || 1_000_000,

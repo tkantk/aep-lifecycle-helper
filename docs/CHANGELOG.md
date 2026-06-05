@@ -9,6 +9,38 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-06-05 (v3.2.0) — Client-readiness pass on DESIGN_DOC (team review)
+
+A team review of `DESIGN_DOC.docx` found stale safety claims, internal review
+language, and Word-packaging gaps. Addressed as a v3.2.0 client-facing pass. All
+six findings verified against the code first.
+
+- **(High · Backend + Docs) Concurrency default reconciled to 5.** The code
+  defaulted `IDENTITY_CONCURRENCY` to 10 while the docs/diagram said it was lowered
+  to 5 after the rate-limit incident. Aligned the code (`config.js` → 5, the
+  conservative/safer value) and made every reference consistent (`expansion.js`
+  comments, the env table, the expansion diagram). Suite 277/277.
+- **(High · Docs) Stale submit-failure statement.** The §3 data-flow box said
+  "Network error/5xx → quota released, mark FAILED" — contradicting the
+  held-until-rollover model. Corrected: 4xx → FAILED+release; 5xx/timeout/network
+  → stays SUBMITTING (uncertain), quota HELD, reconciled on recovery.
+- **(High · Docs) False "No advisory lock" claim.** `index.js` acquires a DB-path
+  advisory lock; the limitation entry now states it correctly.
+- **(Medium · Docs)** Test count 231 → 277; added the missing `QUOTA_SAFETY_BUFFER`
+  to the environment reference (documents the external-writer assumption).
+- **(Medium · Docs) Internal language scrubbed.** Removed all review-round markers
+  (`R6 #1`, `R7 #1`, `R10 #2`, `R11`, "review R4 #4"), "Fix shipped", "real-world
+  incident", and dated session markers; renamed "Recently resolved" → "Validation
+  History". CHANGELOG/REVIEW (internal) keep their markers.
+- **(Medium · Docs/Build) Word packaging standardized.** Deleted the legacy
+  `scripts/md-to-docx.py` (python-docx; rendered images as text) — pandoc is now the
+  single path. Added `scripts/docx_finalize.py` (run by `npm run docs:docx`) which
+  sets the document title/author/subject properties (were blank) and a centred
+  page-number footer. Added a cover page break and a Word auto-TOC field (page
+  numbers on field update). Verified: all docx XML well-formed, 0 oversized images.
+- **(Docs) New client sections:** Document Control, Scope/Assumptions/Boundaries,
+  and a Validation Summary; version bumped to 3.2.0.
+
 ## 2026-06-04 — Reviewer findings: day-label edge fix + diagram/screenshot corrections
 
 External review of the day-label + diagram work. All four findings verified
