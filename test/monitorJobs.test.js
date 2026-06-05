@@ -181,15 +181,15 @@ test('listMonitorJobs: aggregate counts (submitted, in_flight, completed, failed
 });
 
 test('listMonitorJobs: search filter is case-insensitive substring on job name', () => {
-  const jobA = seedJob('Coca-Cola Monthly Wipe');
-  seedWorkOrder(jobA, { adobeWorkorderId: 'DI-coke', adobeStatus: 'received' });
+  const jobA = seedJob('Acme Retail Monthly Wipe');
+  seedWorkOrder(jobA, { adobeWorkorderId: 'DI-acme', adobeStatus: 'received' });
 
-  const jobB = seedJob('PepsiCo Quarterly');
-  seedWorkOrder(jobB, { adobeWorkorderId: 'DI-pepsi', adobeStatus: 'received' });
+  const jobB = seedJob('Globex Foods Quarterly');
+  seedWorkOrder(jobB, { adobeWorkorderId: 'DI-globex', adobeStatus: 'received' });
 
-  const cocaResults = q().listMonitorJobs.all({ limit: 50, search: 'cocA', sandbox: '' });
-  assert.ok(cocaResults.some(r => r.id === jobA));
-  assert.ok(!cocaResults.some(r => r.id === jobB));
+  const acmeResults = q().listMonitorJobs.all({ limit: 50, search: 'acmE', sandbox: '' });
+  assert.ok(acmeResults.some(r => r.id === jobA));
+  assert.ok(!acmeResults.some(r => r.id === jobB));
 
   const allResults = q().listMonitorJobs.all({ limit: 50, search: '', sandbox: '' });
   assert.ok(allResults.some(r => r.id === jobA));

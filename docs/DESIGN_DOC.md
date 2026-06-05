@@ -198,8 +198,9 @@ fills to `IDENTITY_BATCH_SIZE=1000` → **wave scheduler** caps in-flight
 batches at `IDENTITY_CONCURRENCY × 2` (default 5 × 2 = 10) → `p-limit`
 sends each batch through `POST /clusters/members` (axios-retry honours
 `Retry-After` on 429) → canonicalize ns_code ↔ ns_id from the registry
-→ `bulkInsertIdentities` writes inside `db.transaction()` (one fsync
-per batch). Plain INSERT — dedup is deferred to plan time. Per-batch
+→ `insertIdentitiesAndCount` writes the rows + job counters inside
+`db.transaction()` (one fsync per batch). Plain INSERT — dedup is deferred
+to plan time. Per-batch
 log line carries `adobeMs`, `sqliteMs`, every 50 batches a summary with
 `p50` / `p95` / `rateLimitHits`. Source: `docs/diagrams/07-expansion-data-flow.mmd`.*
 

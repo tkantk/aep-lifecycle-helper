@@ -1953,7 +1953,7 @@ sandbox's registry — see CLAUDE.md "Single source namespace per job"
 limitation, which clarifies that any single namespace is supported, just
 not multiple at once). The `hashedKocid` references read as factual claims
 about what the tool does, which would mislead any operator running it
-against a non-Coca-Cola sandbox.
+against a non-Acme-Retail sandbox.
 
 ### Frontend — copy generalisation
 
@@ -2591,7 +2591,7 @@ Test count 83 → 95.
 Context: user asked the UI to look closer to the production AEP web UI, wanted
 the placeholder red "A" replaced with the official AEP mark, flagged that the
 top-right "DE" avatar circle had no explanation and did nothing on click, and
-asked for a configurable client name (e.g. "Coca-Cola") since this helper is
+asked for a configurable client name (e.g. "Acme Retail") since this helper is
 generic and reused across orgs.
 
 ### Frontend — top bar
@@ -2624,7 +2624,7 @@ generic and reused across orgs.
   New `updateClientNameDisplay()` updates both the top-bar text block and the
   avatar initials; called from `updateEnvChip()` so the display stays in sync
   as the user types. `initialsFor()` takes first letters of first two
-  whitespace/dash/underscore/dot-separated words (e.g. "Coca-Cola" → "CC",
+  whitespace/dash/underscore/dot-separated words (e.g. "Acme-Retail" → "AR",
   "Acme Corp" → "AC"); falls back to first two characters for single-word
   names. When no client name is configured the avatar falls back to "AEP" and
   the top-bar text block is hidden entirely.

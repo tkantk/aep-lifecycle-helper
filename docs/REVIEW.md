@@ -727,8 +727,9 @@ Full DDL in `src/db.js::initDb()`. Summary:
 - Each task:
   - Calls Adobe once (via retry-wrapped axios).
   - Builds a row array.
-  - Calls `bulkInsertIdentities(rows)` which runs a single SQLite
-    transaction. Plain `INSERT` (no `OR IGNORE`) — O(1) per row.
+  - Calls `insertIdentitiesAndCount(rows, …)` which writes the rows AND
+    bumps the job counters in one SQLite transaction. Plain `INSERT`
+    (no `OR IGNORE`) — O(1) per row.
 - After all waves complete, `countDistinctIdentities` computes the true
   deduped total and `setFoundCount` overwrites `found_count` on the job row.
 
@@ -1095,10 +1096,10 @@ Please consider these explicitly in your audit:
    same `running` flag?
 
 ### Concurrency
-10. `bulkInsertIdentities` is wrapped in `db.transaction(...)`.
+10. `insertIdentitiesAndCount` is wrapped in `db.transaction(...)`.
     better-sqlite3 transactions are synchronous but our caller is async.
     Is there any code path where two async tasks could call
-    `bulkInsertIdentities` simultaneously and confuse better-sqlite3?
+    `insertIdentitiesAndCount` simultaneously and confuse better-sqlite3?
     (With deferred dedup, simultaneous inserts of the same identity are
     now allowed — both rows land. Dedup happens in `streamIdentitiesBySource`
     at planning time. Is there a scenario where this two-step dedup could
