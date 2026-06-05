@@ -12,16 +12,7 @@
 | Audience     | Client teams, platform architects, reviewers    |
 | Diagrams     | [Figma design file](https://www.figma.com/design/G9tjo1Uq1JSfCHGfzBMrZe) → [`docs/DIAGRAMS.md`](DIAGRAMS.md) (PNGs in `docs/diagrams/figma/`); Mermaid fallback in `docs/diagrams/*.mmd`/`*.png` |
 
-> **3.1.0 (2026-06-03) — flaky-network resilience (P1).** After a live prod
-> incident on an intermittent Wi-Fi link to Adobe: (1) the `/quota` submit
-> preflight now retries the live fetch (default 3×, backoff) so a transient
-> timeout self-heals into a fresh snapshot instead of blocking the submit —
-> the fail-closed refuse-stale boundary (I15) is unchanged; (2) the status
-> monitor applies per-WO exponential backoff so an outage can't flood the link
-> or starve a concurrent submit (DISPLAY-only, never touches the quota ledger);
-> (3) `GET /jobs/:id` no longer runs the heavy namespace GROUP-BY on the hot
-> path (opt-in via `?breakdown=1`), fixing the "click freezes then opens" lag.
-> See `docs/CHANGELOG.md` → 2026-06-01 (P1).
+*Full change history: [`docs/CHANGELOG.md`](CHANGELOG.md).*
 
 ---
 
