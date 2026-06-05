@@ -41,20 +41,18 @@
 10. [Design Decisions](#10-design-decisions)
 11. [Known Limitations & Extension Points](#11-known-limitations--extension-points)
 12. [Appendix — File Map](#12-appendix--file-map)
+13. [UI Screen Walkthrough](#13-ui-screen-walkthrough)
 
-> **Diagrams** in this document are available in several forms:
+> **Diagrams & screenshots** in this document:
 >
-> 1. **High-quality Figma design file** *(primary, 2026-06-03)* — branded
->    block & flow diagrams with a consistent AEP-Spectrum visual system. PNG
->    exports live in `docs/diagrams/figma/` and are collected in
->    **[`docs/DIAGRAMS.md`](DIAGRAMS.md)**. Live, editable source:
->    **[Open in Figma](https://www.figma.com/design/G9tjo1Uq1JSfCHGfzBMrZe)** —
->    the canonical view for client presentations and live review.
-> 2. **Inline Mermaid PNG renders** (embedded below each section) — produced by
->    Mermaid CLI from the `.mmd` sources in `docs/diagrams/`. Retained as a
->    text-diffable fallback that also shows in `DESIGN_DOC.docx`.
-> 3. **Mermaid source** — `docs/diagrams/*.mmd`, version-controlled so the
->    fallback renders can be regenerated identically.
+> 1. **Figma diagrams — embedded inline below each section.** Branded block &
+>    flow diagrams with a consistent AEP-Spectrum visual system. Live, editable
+>    source: **[Open in Figma](https://www.figma.com/design/G9tjo1Uq1JSfCHGfzBMrZe)**;
+>    PNG exports in `docs/diagrams/figma/`, gallery in **[`DIAGRAMS.md`](DIAGRAMS.md)**.
+> 2. **UI screenshots — see [§13 · UI Screen Walkthrough](#13-ui-screen-walkthrough)** at the end of this document
+>    (the six live application screens; PNGs in `docs/screens/`, also in **[`SCREENS.md`](SCREENS.md)**).
+> 3. **Mermaid fallback** — `docs/diagrams/*.mmd` (+ `*.png`), the version-controlled,
+>    text-diffable source for each diagram's content.
 
 ---
 
@@ -124,7 +122,7 @@ There is no cloud infrastructure — all data, state, and secrets live
 locally. The only outbound traffic is HTTPS calls to Adobe's documented
 APIs.
 
-![System Architecture](diagrams/01-system-architecture.png)
+![System Architecture](diagrams/figma/01-system-architecture.png)
 
 *Browser ↔ loopback HTTP ↔ Node.js Express process (Routes + Background
 Runners + Adobe Service Layer + Security middleware) ↔ HTTPS to Adobe
@@ -174,7 +172,7 @@ Source: `docs/diagrams/01-system-architecture.mmd`.*
 
 ### 3.1 Operator Journey Overview
 
-![Operator Journey](diagrams/02-operator-journey.png)
+![Operator Journey](diagrams/figma/02-operator-journey.png)
 
 *Seven steps left-to-right: **Configure → Upload → Expand → Plan →
 Approve → Submit → Monitor**. Approve is a per-month gate (Month 1 ships
@@ -190,7 +188,7 @@ The expansion pipeline turns a streamed CSV into deduplicated rows in
 `expanded_identities`, calling Adobe Identity Graph in bounded waves
 along the way. Every step is rate-limit-aware and crash-safe.
 
-![Expansion data flow](diagrams/07-expansion-data-flow.png)
+![Expansion data flow](diagrams/figma/07-expansion-data-flow.png)
 
 *Upload → `sniffUpload()` rejects non-CSV payloads (ZIP/XLSX, UTF-16,
 MIP-encrypted, etc.) before fast-csv runs → row-by-row stream → buffer
@@ -375,7 +373,7 @@ The work-order lifecycle is a strict state machine. Every state
 transition is logged. Terminal states (`completed`, `failed`) never
 move backward.
 
-![Work-order state machine](diagrams/03-work-order-state-machine.png)
+![Work-order state machine](diagrams/figma/03-work-order-state-machine.png)
 
 *Entry from `POST /api/jobs/:id/plan` produces **PLANNED** (Month 1)
 or **AWAITING_APPROVAL** (Month 2+). The per-month approval gate flips
@@ -425,7 +423,7 @@ End-to-end view of a single submit, including how an uncertain failure
 gets resolved either by startup recovery or by the operator-triggered
 reconcile button — without losing data or double-spending Adobe quota.
 
-![Submit and reconcile flow](diagrams/08-submit-reconcile-flow.png)
+![Submit and reconcile flow](diagrams/figma/08-submit-reconcile-flow.png)
 
 *Quota reserve gates the POST; the four post-POST outcomes
 (**SUBMITTED** / **DEFERRED** / **FAILED** / **SUBMITTING-uncertain**)
@@ -456,7 +454,7 @@ see the full timeline before any work is submitted.
 For a job of 2,500,000 expanded identifiers against the typical Adobe
 caps (1,000,000/day, 3,000,000/month), the planner produces:
 
-![Multi-month planning](diagrams/04-multi-month-planning.png)
+![Multi-month planning](diagrams/figma/04-multi-month-planning.png)
 
 *Month 1 (blue) ships immediately when the operator clicks Submit on
 Day 1. Month 2 (orange) stays in `awaiting_approval` until the
@@ -525,7 +523,7 @@ alive. This is the single worst failure mode in the system, so the
 region routing is a per-credential field validated by a server-side
 allowlist.
 
-![Region architecture](diagrams/05-region-architecture.png)
+![Region architecture](diagrams/figma/05-region-architecture.png)
 
 *Each credential row carries its own `region`. The URL builder
 templates `https://platform-${region}.adobe.io` from that field — never
@@ -588,7 +586,7 @@ submits **irreversible** deletes, and a malicious browser tab the
 operator already has open must not be able to drive that API. Six
 layers protect against it.
 
-![Defense-in-depth](diagrams/06-defense-in-depth.png)
+![Defense-in-depth](diagrams/figma/06-defense-in-depth.png)
 
 *Layers 1-5 are network → HTTP → allowlist → credential → asset
 isolation. Layer 6 covers the destructive-API specific safety
@@ -1127,4 +1125,53 @@ aep-lifecycle-helper/
 
 ---
 
-*Document end — AEP Data Lifecycle Helper Design Document v2.0.0*
+## 13. UI Screen Walkthrough
+
+The six screens an operator works through, left-nav top to bottom. All data is
+**fabricated** (a fictional "Acme Retail" credential, a placeholder IMS org, a
+`prod-demo` sandbox, a generic CSV); the client secret is masked and no real
+company, credentials, or customer identifiers appear. Full captions:
+[`SCREENS.md`](SCREENS.md).
+
+### 13.1 Environment — credentials & sandbox
+IMS server-to-server credential (encrypted at rest), region, sandbox, deletion
+mode, and daily/monthly caps. **Test Connection** validates auth and pulls live quota.
+
+![Environment configuration](screens/01-config.png)
+
+### 13.2 Source CSV — upload identifiers
+Single-column CSV of source identifiers, streamed to disk (up to ~4 GB, never
+fully in memory), with the source-namespace selector.
+
+![Upload source identities](screens/02-upload.png)
+
+### 13.3 Expansion — resolve the identity graph
+Streams each source ID through `POST /clusters/members` (1,000 per call) and
+dedups into SQLite. Shows batches, identities found, expansion ratio, and the
+per-namespace breakdown.
+
+![Identity graph expansion](screens/03-expand.png)
+
+### 13.4 Batch Planning — group into work orders
+Packs identities into ≤100,000-identifier work orders bucketed by day/month
+under the live quota. Re-plan is blocked once any work order has shipped.
+
+![Work order batch planning](screens/04-plan.png)
+
+### 13.5 Submit — ship work orders to Adobe
+Submits the current day's window, gated by an atomic quota reservation. Here Day 1
+(1,000,000) has shipped and the screen has landed on **Day 2** for the remaining
+607,383; the quota panel (daily used 1,000,000 / remaining 0) is consistent with
+the 10/17 submitted.
+
+![Submit work orders](screens/05-submit.png)
+
+### 13.6 Monitor — track Adobe-side progress
+Polls every Adobe-acked work order (60 s, with per-WO backoff) and shows the
+in-flight pipeline, per-WO Adobe IDs and statuses, SLA, and downstream services.
+
+![Work order monitor](screens/06-monitor.png)
+
+---
+
+*Document end — AEP Data Lifecycle Helper Design Document v3.1.0*
