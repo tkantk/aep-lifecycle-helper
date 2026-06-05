@@ -274,7 +274,7 @@ log line carries `adobeMs`, `sqliteMs`, every 50 batches a summary with
 │  │  └─────┬──────┘  └─────┬──────┘  └─────┬──────┘  └────┬───────┘ │  │
 │  │        │               │               │               │         │  │
 │  │        └───────────────┴───────────────┴───────────────┘         │  │
-│  │                         │ p-limit(10) concurrent                  │  │
+│  │                         │ p-limit(5)  concurrent                  │  │
 │  │                         ▼                                         │  │
 │  │              POST /identity/clusters/members                      │  │
 │  │              (region-specific host per credential)                │  │
@@ -290,7 +290,7 @@ log line carries `adobeMs`, `sqliteMs`, every 50 batches a summary with
 │  │               dedup performed at planning time via GROUP BY)      │  │
 │  └──────────────────────────────────────────────────────────────────┘  │
 │                                                                         │
-│  Wave scheduling: batches processed in waves of 20 (concurrency × 2)  │
+│  Wave scheduling: batches processed in waves of 10 (concurrency × 2)  │
 │  to keep memory constant regardless of file size.                       │
 │                                                                         │
 │  On completion: COUNT DISTINCT identities → set job.found_count         │
@@ -861,24 +861,12 @@ npm test          # runs scripts/run-tests.mjs (node --test over test/*.test.js)
 > The historical `node --test test` form is broken on Node ≥ 23 (the positional
 > `test` is parsed as a single test name). Use `npm test`.
 
-All **277 tests** should pass. The suite covers:
-- Work-order payload validators (27 tests)
-- Namespace canonicalization (11 tests)
-- IMS token cache (7 tests)
-- Quota manager — daily, monthly, null-monthly release gating (12 tests)
-- Planner — cluster packing, replan guard, deferred tolerance, factory statement (13 tests)
-- Startup recovery — orphan reconciliation, 400-indeterminate handling (6 tests)
-- Adobe client — error enrichment, idempotency-aware retries (11 tests)
-- Per-credential region routing (3 tests)
-- Credentials routes — PATCH non-secret safety, DELETE 409 (7 tests)
-- Monitor feed — sorting, filters, aggregates, sandbox filter (11 tests)
-- Approve-month gate (9 tests)
-- Jobs routes — DELETE, force-delete, cascade, in-flight guard (9 tests)
-- Wave-drain regression — concurrent rejections without unhandled rejection (3 tests)
-- CSV sniffer — accept UTF-8, reject XLSX / UTF-16 / binary / empty (6 tests)
-- Security middleware — host guard, Origin guard, allowlists, CSV formula sanitiser (15 tests)
-- Quota API live snapshot, redistributor, scheduler (rest)
-- End-to-end integration with fully-mocked Adobe (3 tests)
+All **277 automated tests pass** (0 failures). The suite covers work-order
+payload validation, namespace canonicalization, the quota ledger, the planner
+and live redistributor, startup recovery and reconciliation, the auto-resume
+scheduler, the security middleware (host-header and Origin/Referer guards,
+region/environment allowlists, and the CSV-injection sanitiser), and
+end-to-end integration with Adobe fully mocked via `nock`.
 
 ### 9.4 Recovering From a Crash
 
@@ -895,8 +883,7 @@ On startup, `runStartupRecovery()` automatically:
   - **No match** — INDETERMINATE: leaves the orphan in `submitting` with its
     reservation HELD. NEVER auto-rolls-back — a no-match doesn't prove
     Adobe absence (async creation, no read-after-write guarantee). The operator
-    confirms absence in Adobe's UI and releases it via the release-absent action
-   .
+    confirms absence in Adobe's UI and releases it via the release-absent action.
   - **Indeterminate** (Adobe returned 400, network error) — leaves the orphan
     for the next startup to retry.
 
@@ -1115,19 +1102,19 @@ aep-lifecycle-helper/
 │       └── fonts/                  Self-hosted Source Sans 3 (.woff2, OFL-licensed)
 │
 ├── test/
-│   ├── hygiene.test.js             Work-order payload validators (27 tests)
-│   ├── namespaces.test.js          Namespace canonicalization + index (11 tests)
-│   ├── imsAuth.test.js             Token cache + thundering-herd + nock (7 tests)
-│   ├── quotaManager.test.js        Daily + monthly ledgers + null-monthly gate (12 tests)
-│   ├── planWorkOrders.test.js      Cluster packing + replan guard + deferred (12 tests)
-│   ├── recovery.test.js            Orphan reconciliation + 400-indeterminate (6 tests)
-│   ├── adobeClient.test.js         Error enrichment + idempotency-aware retries (11 tests)
-│   ├── region.test.js              Per-credential region routing (3 tests)
-│   ├── deferred.test.js            Deferred-row surfacing in submission (1 test)
-│   ├── credentialsRoutes.test.js   PATCH non-secret-only + DELETE 409 (7 tests)
-│   ├── monitorJobs.test.js         Monitor feed: sort, filter, aggregates (11 tests)
-│   ├── approveMonth.test.js        Per-month approval gate (9 tests)
-│   └── integration.test.js         End-to-end with fully-mocked Adobe (3 tests)
+│   ├── hygiene.test.js             Work-order payload validators
+│   ├── namespaces.test.js          Namespace canonicalization + index
+│   ├── imsAuth.test.js             Token cache + thundering-herd + nock
+│   ├── quotaManager.test.js        Daily + monthly ledgers + null-monthly gate
+│   ├── planWorkOrders.test.js      Cluster packing + replan guard + deferred
+│   ├── recovery.test.js            Orphan reconciliation + 400-indeterminate
+│   ├── adobeClient.test.js         Error enrichment + idempotency-aware retries
+│   ├── region.test.js              Per-credential region routing
+│   ├── deferred.test.js            Deferred-row surfacing in submission
+│   ├── credentialsRoutes.test.js   PATCH non-secret-only + DELETE 409
+│   ├── monitorJobs.test.js         Monitor feed: sort, filter, aggregates
+│   ├── approveMonth.test.js        Per-month approval gate
+│   └── integration.test.js         End-to-end with fully-mocked Adobe
 │
 ├── data/                           Created at runtime — NOT committed
 │   ├── state.db                    SQLite database (WAL mode)
