@@ -172,7 +172,7 @@ Source: `docs/diagrams/01-system-architecture.mmd`.*
 
 ### 3.1 Operator Journey Overview
 
-![Operator Journey](diagrams/figma/02-operator-journey.png)
+![Operator Journey](diagrams/figma/02-operator-journey.png){width=3.6in}
 
 *Seven steps left-to-right: **Configure → Upload → Expand → Plan →
 Approve → Submit → Monitor**. Approve is a per-month gate (Month 1 ships
@@ -188,7 +188,7 @@ The expansion pipeline turns a streamed CSV into deduplicated rows in
 `expanded_identities`, calling Adobe Identity Graph in bounded waves
 along the way. Every step is rate-limit-aware and crash-safe.
 
-![Expansion data flow](diagrams/figma/07-expansion-data-flow.png)
+![Expansion data flow](diagrams/figma/07-expansion-data-flow.png){width=4.1in}
 
 *Upload → `sniffUpload()` rejects non-CSV payloads (ZIP/XLSX, UTF-16,
 MIP-encrypted, etc.) before fast-csv runs → row-by-row stream → buffer
@@ -373,7 +373,7 @@ The work-order lifecycle is a strict state machine. Every state
 transition is logged. Terminal states (`completed`, `failed`) never
 move backward.
 
-![Work-order state machine](diagrams/figma/03-work-order-state-machine.png)
+![Work-order state machine](diagrams/figma/03-work-order-state-machine.png){width=5in}
 
 *Entry from `POST /api/jobs/:id/plan` produces **PLANNED** (Month 1)
 or **AWAITING_APPROVAL** (Month 2+). The per-month approval gate flips
@@ -423,7 +423,7 @@ End-to-end view of a single submit, including how an uncertain failure
 gets resolved either by startup recovery or by the operator-triggered
 reconcile button — without losing data or double-spending Adobe quota.
 
-![Submit and reconcile flow](diagrams/figma/08-submit-reconcile-flow.png)
+![Submit and reconcile flow](diagrams/figma/08-submit-reconcile-flow.png){width=4.15in}
 
 *Quota reserve gates the POST; the four post-POST outcomes
 (**SUBMITTED** / **DEFERRED** / **FAILED** / **SUBMITTING-uncertain**)
@@ -454,7 +454,7 @@ see the full timeline before any work is submitted.
 For a job of 2,500,000 expanded identifiers against the typical Adobe
 caps (1,000,000/day, 3,000,000/month), the planner produces:
 
-![Multi-month planning](diagrams/figma/04-multi-month-planning.png)
+![Multi-month planning](diagrams/figma/04-multi-month-planning.png){width=4.35in}
 
 *Month 1 (blue) ships immediately when the operator clicks Submit on
 Day 1. Month 2 (orange) stays in `awaiting_approval` until the
