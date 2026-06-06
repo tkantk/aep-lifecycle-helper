@@ -84,8 +84,16 @@ def main(path):
     #    count and drop the page count so Word recomputes it on open.
     if "docProps/app.xml" in parts:
         app = parts["docProps/app.xml"].decode("utf8")
-        words = len(re.findall(r"\S+", " ".join(re.findall(r"<w:t[^>]*>([^<]*)</w:t>", doc))))
+        text = " ".join(re.findall(r"<w:t[^>]*>([^<]*)</w:t>", doc))
+        words = len(re.findall(r"\S+", text))
+        chars_with = len(text)
+        chars_no = len(text.replace(" ", ""))
+        paras = doc.count("<w:p ") + doc.count("<w:p>")
         app = re.sub(r"<Words>\d+</Words>", f"<Words>{words}</Words>", app)
+        app = re.sub(r"<Characters>\d+</Characters>", f"<Characters>{chars_no}</Characters>", app)
+        app = re.sub(r"<CharactersWithSpaces>\d+</CharactersWithSpaces>", f"<CharactersWithSpaces>{chars_with}</CharactersWithSpaces>", app)
+        app = re.sub(r"<Paragraphs>\d+</Paragraphs>", f"<Paragraphs>{paras}</Paragraphs>", app)
+        # Layout-dependent counts: drop so Word recomputes them on open.
         app = re.sub(r"<Pages>\d+</Pages>", "", app)
         app = re.sub(r"<Lines>\d+</Lines>", "", app)
         app = re.sub(r"<TotalTime>\d+</TotalTime>", "<TotalTime>0</TotalTime>", app)

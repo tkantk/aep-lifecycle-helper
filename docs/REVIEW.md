@@ -50,8 +50,8 @@ plus UUID validation on every `:id` / `:credsId` path param.
 `quota_usage`, `quota_usage_monthly`, `app_settings`.
 
 **Concurrency**: all work happens in the event loop. Identity-graph
-expansion uses `p-limit(10)` for 10 parallel Adobe calls with a
-wave-based scheduler (WAVE_SIZE = 20) so peak heap stays bounded
+expansion uses `p-limit(5)` for 5 parallel Adobe calls with a
+wave-based scheduler (WAVE_SIZE = 10) so peak heap stays bounded
 regardless of job size; work-order submission uses `p-limit(2)`;
 monitor status polling uses `p-limit(5)` over up to 100 open WOs per
 tick. Two `setInterval(60s)` background tickers — the monitor (status
@@ -112,7 +112,7 @@ with auto-populated forms and live quota banners.
        ▼
 ┌──────────────┐  Load namespace registry once → build byCode/byId index.
 │ 3. Expansion │  For each 1000-ID buffer:
-│ (p-limit 10) │    POST /data/core/identity/clusters/members
+│ (p-limit 5)  │    POST /data/core/identity/clusters/members
 │              │    (region from creds, NOT process default; allowlist
 │              │     defence-in-depth in services/namespaces.js +
 │              │     services/identityGraph.js).

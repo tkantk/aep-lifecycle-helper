@@ -286,15 +286,15 @@
           <ol style="padding-left: 18px; margin: 0">
             <li>Stream source IDs from disk</li>
             <li>Chunk into 1000-ID batches</li>
-            <li>POST each batch in parallel (concurrency 10)</li>
+            <li>POST each batch in parallel (concurrency 5)</li>
             <li>Dedup + insert to SQLite</li>
           </ol>
         </div>
         <div class="panel">
           <div class="panel-title">Throughput</div>
-          <div class="metric"><span>Concurrency</span><b>10</b></div>
+          <div class="metric"><span>Concurrency</span><b>5</b></div>
           <div class="metric"><span>Batch size</span><b>1,000</b></div>
-          <div class="metric"><span>Target</span><b>~10k IDs/sec</b></div>
+          <div class="metric"><span>Target</span><b>~5k IDs/sec</b></div>
         </div>
       </div>
     </div>

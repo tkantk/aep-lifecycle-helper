@@ -145,9 +145,9 @@ Node.js async I/O on a single machine saturates Adobe's rate limits.
 
 **Example runs (on a 2020 MacBook Pro):**
 
-- 100,000 source IDs → expanded in ~15 seconds
-- 1,000,000 source IDs → expanded in ~90 seconds
-- 10,000,000 source IDs → expanded in ~17 minutes (Adobe then caps at 1M/day
+- 100,000 source IDs → expanded in ~20 seconds
+- 1,000,000 source IDs → expanded in ~3.5 minutes
+- 10,000,000 source IDs → expanded in ~33 minutes (Adobe then caps at 1M/day
   submissions; with a 2M/mo entitlement, deletion completes over 5 months)
 
 Turn the concurrency dial up from the conservative default of 5 (e.g.

@@ -9,6 +9,21 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-06-06 (2) — Concurrency mismatch sweep (third team review)
+
+The default concurrency dropped to 5 but a few user-visible surfaces still showed 10.
+
+- **(Medium) Expansion UI + screenshot.** `src/web/index.html` (the "How it works"
+  and Throughput panels) said concurrency 10 / ~10k IDs/sec → now 5 / ~5k. Re-captured
+  `docs/screens/03-expand.png` and regenerated `DESIGN_DOC.docx` so the embedded
+  screenshot matches.
+- **(Low/Medium) README example timings.** Recalculated for the default of 5
+  (~5,000 IDs/sec): 100k ≈ 20s, 1M ≈ 3.5 min, 10M ≈ 33 min.
+- **(Low) REVIEW.md** (internal) `p-limit(10)` / `WAVE_SIZE = 20` → 5 / 10.
+- **(Low) DOCX app properties.** `scripts/docx_finalize.py` now also sets real
+  Characters / CharactersWithSpaces / Paragraphs (were the pandoc-template
+  475 / 583 / 8); Pages/Lines still dropped for Word to recompute.
+
 ## 2026-06-06 — Client-readiness follow-ups (second team review)
 
 - **(Medium) Word TOC now populated.** The TOC was a Word field showing the
