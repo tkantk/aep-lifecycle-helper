@@ -9,6 +9,19 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-06-06 (3) — High-resolution diagram re-export (print quality)
+
+Addressed the standing reviewer caveat that the diagram PNGs (500–820px) were
+fine for screen but soft for print. Re-exported all 8 at **3×** resolution
+(now 1500–2460px wide). The display size in the doc is unchanged (width caps
+preserved) — they're simply ~3× crisper.
+
+- Method: Figma `get_screenshot` only renders at native size, so each frame was
+  cloned, `rescale(3)`-d (which scales fonts too), captured at full resolution,
+  and the clones deleted — keeping the source frames pristine and fonts perfect.
+- `docs/diagrams/figma/*.png` re-exported (≈256–384KB each). `DESIGN_DOC.docx`
+  regenerated (2.97 → 4.35MB); still 0 oversized images, all XML well-formed.
+
 ## 2026-06-06 (2) — Concurrency mismatch sweep (third team review)
 
 The default concurrency dropped to 5 but a few user-visible surfaces still showed 10.
