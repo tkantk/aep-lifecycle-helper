@@ -9,6 +9,24 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-06-06 — Client-readiness follow-ups (second team review)
+
+- **(Medium) Word TOC now populated.** The TOC was a Word field showing the
+  "open in Word and press F9" placeholder (this machine has no Word/LibreOffice to
+  render fields headless). Replaced it with a real, populated, **hyperlinked** TOC
+  built from pandoc's actual heading anchors (all 15 validated against the .docx),
+  so the committed file shows clickable section links with no placeholder.
+- **(Medium) Concurrency drift in repo docs.** README (`p-limit(10)`, the `.env`
+  example, the throughput table, the security box) and `ARCHITECTURE.md` topology
+  box still said 10; aligned them to the new default of 5 (the "dial up to 10 if
+  you have bandwidth" tuning note is kept intentionally).
+- **(Low) Stale Word app-properties.** `scripts/docx_finalize.py` now also rewrites
+  `docProps/app.xml`: real word count (was the pandoc-template `83`), Pages dropped
+  so Word recomputes, and a truthful `Application` value.
+- **(Caveat) Figma link.** Softened the client doc's Figma references — the embedded
+  PNGs are stated as canonical and the editable Figma file is "internal, shareable
+  on request", so the doc no longer depends on a client having live Figma access.
+
 ## 2026-06-05 (v3.2.0) — Client-readiness pass on DESIGN_DOC (team review)
 
 A team review of `DESIGN_DOC.docx` found stale safety claims, internal review

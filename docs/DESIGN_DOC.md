@@ -15,16 +15,16 @@
 | Approval status | Approved for client distribution |
 | Classification | Confidential — client engagement |
 | Intended audience | Client teams, platform architects, security reviewers |
-| Diagrams | [Figma design file](https://www.figma.com/design/G9tjo1Uq1JSfCHGfzBMrZe) → [`docs/DIAGRAMS.md`](DIAGRAMS.md) (PNGs in `docs/diagrams/figma/`); Mermaid fallback in `docs/diagrams/*.mmd`/`*.png` |
+| Diagrams | Embedded inline (canonical, exported to `docs/diagrams/figma/`). Editable source: Figma design file — internal to the engineering team, shareable on request. Mermaid fallback in `docs/diagrams/*.mmd`. |
 
 *Full change history: [`docs/CHANGELOG.md`](CHANGELOG.md).*
 
 > **Diagrams & screenshots** in this document:
 >
-> 1. **Figma diagrams — embedded inline below each section.** Branded block &
->    flow diagrams with a consistent AEP-Spectrum visual system. Live, editable
->    source: **[Open in Figma](https://www.figma.com/design/G9tjo1Uq1JSfCHGfzBMrZe)**;
->    PNG exports in `docs/diagrams/figma/`, gallery in **[`DIAGRAMS.md`](DIAGRAMS.md)**.
+> 1. **Figma diagrams — embedded inline below each section** (canonical). Branded
+>    block & flow diagrams with a consistent AEP-Spectrum visual system, exported to
+>    `docs/diagrams/figma/` (gallery in **[`DIAGRAMS.md`](DIAGRAMS.md)**). The editable
+>    Figma source is internal to the engineering team and shareable on request.
 > 2. **UI screenshots — see [§13 · UI Screen Walkthrough](#13-ui-screen-walkthrough)** at the end of this document
 >    (the six live application screens; PNGs in `docs/screens/`, also in **[`SCREENS.md`](SCREENS.md)**).
 > 3. **Mermaid fallback** — `docs/diagrams/*.mmd` (+ `*.png`), the version-controlled,
@@ -35,9 +35,21 @@
 
 **Table of Contents**
 
-```{=openxml}
-<w:p><w:r><w:fldChar w:fldCharType="begin" w:dirty="true"/></w:r><w:r><w:instrText xml:space="preserve"> TOC \o "1-3" \h \z \u </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t xml:space="preserve">Open in Word and press F9 (or right-click the table and choose "Update Field") to build the table of contents with page numbers.</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>
-```
+- [1. Executive Summary](#executive-summary)
+- [Scope, Assumptions & Boundaries](#scope-assumptions-boundaries)
+- [2. System Architecture](#system-architecture)
+- [3. End-to-End Data Flow](#end-to-end-data-flow)
+- [4. Work Order Lifecycle](#work-order-lifecycle)
+- [5. Multi-Month Quota Planning](#multi-month-quota-planning)
+- [6. Adobe API Integration](#adobe-api-integration)
+- [7. Security Architecture](#security-architecture)
+- [8. Environment Configuration Reference](#environment-configuration-reference)
+- [9. Operational Procedures](#operational-procedures)
+- [10. Design Decisions](#design-decisions)
+- [11. Known Limitations & Extension Points](#known-limitations-extension-points)
+- [Validation Summary](#validation-summary)
+- [12. Appendix — File Map](#appendix-file-map)
+- [13. UI Screen Walkthrough](#ui-screen-walkthrough)
 
 ---
 

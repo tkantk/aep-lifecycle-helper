@@ -38,7 +38,7 @@ Verify with `node --version` (must print `v20.x.x` or higher) before `npm instal
                 │                                                         │
   ┌─────────┐   │  ┌──────────────┐      ┌──────────────────────────┐    │
   │ Browser │◀──┼─▶│  Express API │◀────▶│   In-process runners      │    │
-  │ UI (JS) │   │  │  /api/*      │      │  • expansion (p-limit 10) │    │
+  │ UI (JS) │   │  │  /api/*      │      │  • expansion (p-limit 5)  │    │
   │         │   │  │              │      │  • submission (p-limit 2) │    │
   │  HTML/  │   │  │              │      │  • redistributor          │    │
   │  CSS/JS │   │  │              │      │    (Phase 2; runs inside  │    │

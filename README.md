@@ -138,7 +138,7 @@ Node.js async I/O on a single machine saturates Adobe's rate limits.
 
 | Work type           | Pattern                                        | Throughput                 |
 | ------------------- | ---------------------------------------------- | -------------------------- |
-| Identity expansion  | `p-limit(10)` concurrent Adobe API calls       | ~10,000 IDs/sec            |
+| Identity expansion  | `p-limit(5)` concurrent Adobe API calls        | ~5,000 IDs/sec             |
 | Work-order submit   | Quota-gated at Adobe's 1M/day cap              | Adobe-bounded, not local   |
 | CSV read/write      | Node streams                                   | Memory stays flat          |
 | SQLite inserts      | Batch transactions (WAL mode)                  | ~100,000 rows/sec          |
@@ -150,8 +150,8 @@ Node.js async I/O on a single machine saturates Adobe's rate limits.
 - 10,000,000 source IDs → expanded in ~17 minutes (Adobe then caps at 1M/day
   submissions; with a 2M/mo entitlement, deletion completes over 5 months)
 
-Turn the concurrency dial in `.env` (`IDENTITY_CONCURRENCY=10`) if you have
-fast bandwidth and aren't getting 429'd.
+Turn the concurrency dial up from the conservative default of 5 (e.g.
+`IDENTITY_CONCURRENCY=10`) if you have fast bandwidth and aren't getting 429'd.
 
 ---
 
@@ -219,7 +219,7 @@ HOST=127.0.0.1                # default; never expose to LAN unless tunneled
 AEP_IDENTITY_REGION=va7        # va7 | nld2 | aus5 | can2
 
 # Throughput
-IDENTITY_CONCURRENCY=10
+IDENTITY_CONCURRENCY=5
 IDENTITY_BATCH_SIZE=1000
 WORK_ORDER_CONCURRENCY=2
 MAX_IDS_PER_WORK_ORDER=100000
@@ -365,7 +365,7 @@ All under `/api/` on `http://127.0.0.1:3000`.
 │  │ Express server │   │ In-process        │   │ Background timers │   │
 │  │ • Serves UI    │◀─▶│ runners           │   │ • Monitor 60s     │   │
 │  │ • REST /api/*  │   │ • expansion       │   │   poll Adobe      │   │
-│  │ • CSP + Host   │   │   p-limit(10)     │   │ • Scheduler 60s   │   │
+│  │ • CSP + Host   │   │   p-limit(5)      │   │ • Scheduler 60s   │   │
 │  │   guard + CSRF │   │ • submission      │   │   auto-resume     │   │
 │  │   origin check │   │   p-limit(2)      │   │   tick (Phase 3)  │   │
 │  └────────┬───────┘   └────────┬──────────┘   └─────────┬─────────┘   │

@@ -79,6 +79,19 @@ def main(path):
     doc = doc[:at] + f'<w:footerReference w:type="default" r:id="{rid}"/>' + doc[at:]
     parts["word/document.xml"] = doc.encode("utf8")
 
+    # 4) Extended app properties: pandoc copies its template's stale values
+    #    (Words=83, Pages=1, Application="Microsoft Word 12.0.0"). Set a real word
+    #    count and drop the page count so Word recomputes it on open.
+    if "docProps/app.xml" in parts:
+        app = parts["docProps/app.xml"].decode("utf8")
+        words = len(re.findall(r"\S+", " ".join(re.findall(r"<w:t[^>]*>([^<]*)</w:t>", doc))))
+        app = re.sub(r"<Words>\d+</Words>", f"<Words>{words}</Words>", app)
+        app = re.sub(r"<Pages>\d+</Pages>", "", app)
+        app = re.sub(r"<Lines>\d+</Lines>", "", app)
+        app = re.sub(r"<TotalTime>\d+</TotalTime>", "<TotalTime>0</TotalTime>", app)
+        app = re.sub(r"<Application>[^<]*</Application>", "<Application>pandoc + docx_finalize</Application>", app)
+        parts["docProps/app.xml"] = app.encode("utf8")
+
     tmp = path + ".tmp"
     with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as z:
         for name, data in parts.items():
