@@ -533,16 +533,21 @@ our remaining work to a later window" behaviour the operator can rely on.
 
 ### 6.1 API Summary
 
-| Method | Endpoint                                                    | Purpose                        | Host                          |
-|--------|-------------------------------------------------------------|--------------------------------|-------------------------------|
-| POST   | `/ims/token/v3`                                             | IMS bearer token               | ims-na1.adobelogin.com        |
-| GET    | `/data/foundation/sandbox-management/`                      | List active sandboxes          | platform.adobe.io             |
-| GET    | `/data/foundation/catalog/dataSets`                         | List Identity-enabled datasets | platform.adobe.io             |
-| GET    | `/data/core/idnamespace/identities`                         | List identity namespaces       | platform-{region}.adobe.io    |
-| POST   | `/data/core/identity/clusters/members`                      | Expand identity cluster        | platform-{region}.adobe.io    |
-| POST   | `/data/core/hygiene/workorder`                              | Create record-delete WO        | platform.adobe.io             |
-| GET    | `/data/core/hygiene/workorder/{id}`                         | Poll work-order status         | platform.adobe.io             |
-| GET    | `/data/core/hygiene/quota`                                  | Live daily + monthly quota     | platform.adobe.io             |
+| Method    | Endpoint                                  | Purpose                          |
+|-----------|-------------------------------------------|----------------------------------|
+| POST      | `/ims/token/v3`                           | IMS bearer token                 |
+| GET       | `/data/foundation/sandbox-management/`    | List active sandboxes            |
+| GET       | `/data/foundation/catalog/dataSets`       | List Identity-enabled datasets   |
+| GET       | `/data/core/idnamespace/identities`       | List identity namespaces         |
+| POST      | `/data/core/identity/clusters/members`    | Expand identity cluster          |
+| POST      | `/data/core/hygiene/workorder`            | Create record-delete work order  |
+| GET       | `/data/core/hygiene/workorder/{id}`       | Poll work-order status           |
+| GET       | `/data/core/hygiene/quota`                | Live daily + monthly quota       |
+
+> **Hosts:** the IMS token call is on `ims-na1.adobelogin.com`; the two Identity
+> Service endpoints (`/idnamespace/identities` and `/clusters/members`) are
+> regionally sharded on `platform-{region}.adobe.io` (see §6.2); every other
+> endpoint is on `platform.adobe.io`.
 
 ### 6.2 Region Architecture
 
@@ -784,9 +789,9 @@ unreachable and no cache exists.
 
 ### 8.3 Development / Testing
 
-| Variable      | Default | Description                                                                                                           |
-|---------------|---------|-----------------------------------------------------------------------------------------------------------------------|
-| `SMOKE_SUBMIT`| *(unset)* | Set to `1` to allow the live smoke test (`test/smoke.live.js`) to submit actual work orders to Adobe. **Requires real credentials in environment variables.** Never set this in CI unless you intend live deletions. |
+| Variable      | Default    | Description                                                        |
+|---------------|------------|--------------------------------------------------------------------|
+| `SMOKE_SUBMIT` | *(unset)*  | Set to `1` to allow the live smoke test (`test/smoke.live.js`) to submit actual work orders to Adobe. **Requires real credentials in environment variables.** Never set this in CI unless you intend live deletions. |
 
 ### 8.4 Sample `.env` Files
 
