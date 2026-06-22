@@ -1,0 +1,54 @@
+{
+  "_README": [
+    "Example config for scripts/build_branded_docx.py — copy to",
+    "scripts/branded_docx.config.json (git-ignored) and edit, or point at it",
+    "with --config / BRANDED_DOCX_CONFIG.",
+    "",
+    "The 'needle' keys in coverReplacements/chromeReplacements/footerReplacements",
+    "must match the EXACT placeholder text inside your reference .docx (the one",
+    "you pass via --template / BRANDED_TEMPLATE). Cover/header/footer needles are",
+    "spliced into raw document XML, so a value may contain literal XML (e.g.",
+    "</w:t>). The tokens {title} {subtitle} {date} {author} expand to the",
+    "metadata below (XML-escaped in the XML maps, raw in the table rows).",
+    "Leave a map as {} to skip that surgery. Metadata also accepts DOC_TITLE /",
+    "DOC_SUBTITLE / DOC_DATE / DOC_AUTHOR / DOC_SUBJECT / DOC_KEYWORDS env overrides."
+  ],
+
+  "title": "Your Project Name",
+  "subtitle": "Design & Architecture Document",
+  "date": "Month YYYY",
+  "author": "Your Name (Org)",
+  "subject": "Short document subject",
+  "keywords": "Confidential",
+
+  "coverReplacements": {
+    ">REPLACE WITH YOUR TEMPLATE'S COVER TITLE PLACEHOLDER<": ">{title}<",
+    ">REPLACE WITH YOUR TEMPLATE'S COVER DATE PLACEHOLDER<": ">{date}<"
+  },
+
+  "chromeReplacements": {
+    "REPLACE WITH YOUR TEMPLATE'S RUNNING-HEADER TEXT": "{title}"
+  },
+
+  "footerReplacements": {
+    "OLD FOOTER COPYRIGHT YEAR": "CURRENT YEAR"
+  },
+
+  "documentControl": [
+    ["Document Title", "{title} — {subtitle}"],
+    ["Authors", "{author}"],
+    ["Document Purpose", "One-line purpose of this document."],
+    ["Status", "Draft | Production-ready"],
+    ["Classification", "Confidential"],
+    ["Intended Audience", "Architects, security reviewers, operators"]
+  ],
+
+  "versionControl": [
+    ["1.0.0", "{date}", "{author}", "Initial release."]
+  ],
+
+  "references": [
+    ["1", "—", "{date}", "{author}", "ARCHITECTURE.md — living system overview"],
+    ["2", "—", "{date}", "{author}", "CHANGELOG.md — full change history"]
+  ]
+}
