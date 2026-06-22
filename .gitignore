@@ -28,3 +28,10 @@ CLAUDE.md
 # permission grants — never shared. (.claude/settings.json, if added later for
 # shared team config, is intentionally NOT ignored.)
 .claude/settings.local.json
+
+# Client deliverables: per-engagement branded design-doc builds (embed the
+# reference template's licensed fonts + client house styling). Generated on
+# demand into dist/ and handed to the client; never committed. Living here
+# (not docs/DESIGN_DOC.docx) stops a plain `npm run docs:docx` rebuild from
+# clobbering the branded deliverable.
+dist/
