@@ -9,6 +9,48 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-06-09 — Optional house-style branded DESIGN_DOC build
+
+Added an optional **branded** build of `docs/DESIGN_DOC.docx` that re-skins the
+committed plain build into any organisation's Word house style (cover page,
+control tables, embedded fonts, theme colours, confidential footer with logo +
+page numbers). The committed `DESIGN_DOC.docx` stays the unbranded `docs:docx`
+build; the branded one is generated per engagement and not committed. The
+**content/data is unchanged** — same `DESIGN_DOC.md`; only the wrapper changed.
+
+- **Docs.** New `scripts/build_branded_docx.py` (+ `npm run docs:docx:branded`). Pipeline:
+  pandoc renders `DESIGN_DOC.md` with `--reference-doc=<template>` (inheriting the
+  template's styles, theme, embedded fonts and every header/footer part — pandoc
+  preserves their relationship IDs, so the splice needs no rId remapping), then the
+  script splices in the template's real cover page + Document Control / Version
+  Control / References tables + a section break, restores the template body section
+  properties (Confidential footer), and edits the cover/tables/running header to our
+  document's data.
+  - **Heading numbers.** The body's `##` sections are shifted to Heading 1
+    (`--shift-heading-level-by=-1`) so they render as the template's numbered
+    Heading 1; the template's heading **auto-numbering is stripped** from the styles
+    (`<w:numPr>`) because our headings carry manual numbers (`1.`, `2.1`, …) that the
+    inline cross-references depend on — otherwise Word renders `1. 1. Executive Summary`.
+  - **Table of Contents.** The template's stale cached TOC (still listing the
+    reference document's own sections) is replaced with a clean `TOC \o "1-3"` field, and
+    `settings.xml/updateFields` is set so Word rebuilds it from our headings on open.
+    The redundant manual markdown TOC + the title/Document-Control block are stripped
+    from the body (they now live on the cover / in the control tables).
+  - **Control tables.** Cells are cleared down to `<w:tcPr>` and rebuilt, because the
+    template's value cells use property-bound content controls (`<w:sdt>` bound to
+    Title/Subject) and multi-paragraph cells; a naive run edit left the old text and
+    let Word's field update double it up.
+  - Verified by rendering to PDF via Word COM (46 pp): cover, control tables, TOC,
+    diagrams + screenshots, headers/footers all correct; zero stale template
+    placeholder strings in the package; all relationship IDs + image embeds resolve.
+- **Client-neutral by design.** The script names no client: the reference `.docx`,
+  the document title/author/date, the cover/header search-replace needles, and the
+  three control tables all come from a **git-ignored** `scripts/branded_docx.config.json`
+  (shape shown in `scripts/branded_docx.config.example.json`) or `DOC_*` env vars;
+  supply the template via `BRANDED_TEMPLATE`. `docs:docx` (plain pandoc +
+  `docx_finalize`) remains the committed/unbranded build; `_build_tmp/`,
+  `*reference-template*.docx`, and the local config are git-ignored.
+
 ## 2026-06-06 (3) — High-resolution diagram re-export (print quality)
 
 Addressed the standing reviewer caveat that the diagram PNGs (500–820px) were

@@ -4,3 +4,27 @@ data/
 .env.local
 *.log
 .DS_Store
+
+# Python bytecode cache (from scripts/*.py, e.g. the branded-docx build)
+__pycache__/
+*.pyc
+
+# docs build scratch (pandoc output, render previews, template backups)
+_build_tmp/
+# Branded reference templates are not committed (third-party branding + licensed
+# embedded fonts). Supply via the BRANDED_TEMPLATE env var at build time.
+*reference-template*.docx
+# Local, engagement-specific config for the branded-docx build (identifies the
+# client + carries template-specific needles). The committed .example.json shows
+# the shape; the real one stays local.
+scripts/branded_docx.config.json
+
+# Internal AI-assistant working instructions. Kept locally so Claude Code / other
+# agents still read it, but not shipped to forks (untracked going forward; prior
+# history retains it). See the "client distribution" note below.
+CLAUDE.md
+
+# Per-user Claude Code settings: contains local absolute paths and personal
+# permission grants — never shared. (.claude/settings.json, if added later for
+# shared team config, is intentionally NOT ignored.)
+.claude/settings.local.json
