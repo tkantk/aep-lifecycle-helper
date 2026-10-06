@@ -80,7 +80,10 @@ function seedOrphanWorkOrder(jobId, localId, displayName = null) {
     identifierCount: 2,
     status: 'submitting',   // stuck mid-submit
   });
-  if (displayName) q().setWorkOrderSubmittingWithName.run({ id: localId, displayName });
+  // Store the name the orphan's POST carried. Written directly: the production
+  // setWorkOrderSubmittingWithName is a planned/deferred → submitting CAS and
+  // (correctly) refuses a row that is already 'submitting'.
+  if (displayName) db.prepare('UPDATE work_orders SET display_name = ? WHERE id = ?').run(displayName, localId);
 }
 
 function mockIms() {

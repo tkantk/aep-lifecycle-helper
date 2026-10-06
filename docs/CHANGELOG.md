@@ -9,6 +9,97 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-10-06 — Batching review before the ~6.8M deletion: Submit ships exactly what was confirmed
+
+A review prompted by "batches are not created properly" ahead of a ~6.8M-profile
+deletion. The planner's GROUPING was verified correct (synthetic jobs up to 25.9M
+identities: every identity in exactly one work order, ≤100k each, clusters kept
+together). Every defect was in how batches are bucketed into days/months and how
+Submit picks them — each reproduced by driving the real planner/runSubmission
+against a mocked Adobe across simulated days before fixing. Suite **277 → 327**.
+
+**Root cause of the 2026-05-30 incident (verified):** replaying Day 2 on the
+May-29 code (00dd9fd) gives `submitted=0 deferred=0 failed=0`, 0 POSTs.
+`runSubmission` re-bucketed every un-shipped work order FIRST, then selected the
+`(month, day)` the UI had sent — the 7 orders had just been relabelled Day 2 → Day 1.
+eb74529 (day-label continuity) removed that trigger; month rollover, a
+`QUOTA_SAFETY_BUFFER`, or a partly-shipped day still hit the same mechanism.
+
+- **Backend — Submit ships the confirmed IDs (fix 1).** `POST /api/jobs/:id/submit
+  {workOrderIds}` (1..1000 UUIDs of this job, else 400 `invalid_work_order_ids`).
+  `runSubmission` resolves explicit selections (IDs, or a legacy `{monthIndex,
+  dayIndex}`) BEFORE re-labelling, ships only planned/deferred ones, re-checks each
+  order's status right before `reserve()`, and reports `skipped`. Nothing eligible →
+  `job.last_error` explains and the job is NOT flipped to `submitted`.
+  `setWorkOrderSubmittingDurable` is now a planned/deferred → submitting CAS that
+  returns false if nothing changed (no POST for a vanished/settled row). The identity
+  list is loaded per order only right before its POST; an unreadable payload is
+  refunded and marked definitively failed instead of being left `submitting`.
+  `src/runner/submission.js`, `src/routes/jobs.js`, `src/db.js`.
+- **Backend — one capacity model (fix 2).** The redistributor now sizes buckets with
+  the numbers `reserve()` gates on: caps × (1 − `QUOTA_SAFETY_BUFFER`) and
+  `quotaManager.projectedUsage()` = MAX(stored floor, live consumed) + held
+  reservations. Previously it used Adobe's raw `remaining`, so a 10 % buffer deferred
+  one order every day and held reservations deferred whole planned days. A day label
+  is never left empty. `src/runner/redistributor.js`, `src/services/quotaManager.js`.
+- **Backend — calendar months, awaiting re-bucketed (fix 3).** `jobs.plan_anchor_month`
+  (stamped at plan time; derived for legacy jobs) makes "Month N" a calendar month —
+  after a rollover the tail is "Month 2, Day 1", not "Month 1, Day 4".
+  `awaiting_approval` orders are re-bucketed after the approved work (never into
+  Month 1), matching CLAUDE.md I10.
+- **Backend — plan only a finished expansion; resume a failed one (fix 4).**
+  `planWorkOrders` throws `PlanNotReadyError` (409 `not_expanded`) unless the job is
+  expanded/ready/submitting/submitted/partial — planning a running or failed
+  expansion planned a partial set, disabled the "still expanding" submit guard, and
+  (re-plan being forbidden after shipping) stranded the rest. New
+  `POST /api/jobs/:id/resume-expansion` continues a failed expansion (no work orders,
+  upload present), skipping processed sources with a per-row indexed lookup
+  (`hasProcessedSource`) instead of a multi-GB Set; live progress is cumulative.
+- **Backend — rejected orders (fix 5).** Only 400/401/403/404/405/406/411/413/414/415/
+  422/429 (or a pre-network validation error) are DEFINITIVE; 408/409/other 4xx are
+  UNCERTAIN (held, reconciled) — a proxy 408 after forwarding does not prove Adobe
+  didn't create the order. New `POST /api/jobs/:id/work-orders/:woId/retry-rejected`
+  re-queues a definitive rejection; it refuses anything unproven, including legacy rows
+  recorded as HTTP 408/409 (pre-change code marked every 4xx definitive).
+- **Backend — scale (fix 6).** `work_orders.ns_summary_json` (written at plan time,
+  back-filled once for legacy rows). `GET /work-orders` (polled every 2 s), the
+  monitor, submit selection and job delete use metadata-only queries. Measured at
+  6.8M profiles (25.9M identities, 260 WOs): the poll cost 1.4–1.6 s per call
+  parsing 1.57 GB of JSON before this change.
+- **Frontend.** Submit tab shows one (month, day) batch with Previous / Next /
+  "Go to next batch to ship", sends that batch's exact IDs, and follows them across
+  re-labels; rejected-orders banner with Retry; reconcile banner limited to
+  uncertain orders; 2 s poll never overlaps. Plan tab offers "Build plan" only for a
+  finished expansion and shows calendar month names. Expand tab no longer shows a
+  FAILED expansion as "complete" with a Plan button — it offers Resume. New
+  `src/web/buckets.js` (pure, node-tested).
+- **Not changed (decision pending):** R5 hold-until-rollover still counts this tool's
+  accepted work twice in the current month (Adobe's consumed + the held reservation),
+  so ~half of the monthly entitlement is usable per month. The PLAN now models it:
+  each day window's work is charged a second time against the month from the next
+  day on (`quotaManager.SHIPPED_WORK_COUNTS_TWICE_UNTIL_MONTH_END`), so a 10M month
+  plans ~5M and the rest becomes Month 2 (with its approval gate) instead of planned
+  October days that would defer. If R5 is changed, flip that constant with it.
+- **Final-review fixes (fresh reviewer, "with fixes"; all test-first).**
+  - Expansion: a batch failing in ANY wave now marks the job `failed` with the reason
+    (`streamIds` was outside the try, so a mid-stream failure left it `expanding`
+    forever — un-resumable). `src/runner/expansion.js`.
+  - Day windows are bounded by the UTC days left in each calendar month (a plan made
+    on Oct 29 no longer labels "Month 1 (Oct) · Day 4-7").
+  - Submit tab never offers a batch whose calendar month hasn't started ("Ships from
+    Nov 1, 2026", disabled) — that click could only defer.
+  - `POST /submit` returns 409 `submission_in_progress` while a run for the job is
+    still in flight (and 409 `expansion_running`), instead of `{ok:true}` + a silent
+    no-op; the UI toasts it.
+- **Tests.** New `workOrdersMeta`, `submitConfirmedIds`, `redistributorCapacity`,
+  `planGate`, `resumeExpansion`, `retryRejected`, `webBuckets`. `planWorkOrders` helper
+  marks jobs `expanded`; a recovery fixture writes `display_name` directly (the CAS
+  correctly refuses an already-submitting row). Browser smoke test (Playwright, real
+  app + mock Adobe) 19/19; full 6.8M daily-click simulations: 0 silent no-ops, 0
+  unconfirmed shipments, 0 duplicate POSTs.
+
+---
+
 ## 2026-06-09 — Optional house-style branded DESIGN_DOC build
 
 Added an optional **branded** build of `docs/DESIGN_DOC.docx` that re-skins the

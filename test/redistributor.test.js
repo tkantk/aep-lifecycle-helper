@@ -18,6 +18,15 @@ import { v4 as uuid } from 'uuid';
 const dbPath = path.join(os.tmpdir(), `aep-test-redist-${Date.now()}.db`);
 process.env.DB_PATH = dbPath;
 
+// Day windows are bounded by the days left in the calendar month (2026-10-06),
+// so pin "now" mid-month: these scenarios need at most 2 windows in Month 1.
+const RealDate = Date;
+const PINNED = new RealDate('2026-05-12T09:00:00Z').getTime() - RealDate.now();
+globalThis.Date = class extends RealDate {
+  constructor(...a) { if (a.length === 0) super(RealDate.now() + PINNED); else super(...a); }
+  static now() { return RealDate.now() + PINNED; }
+};
+
 const { initDb, db, q } = await import('../src/db.js');
 const { redistributeUnshippedOrders } = await import('../src/runner/redistributor.js');
 
@@ -72,7 +81,10 @@ beforeEach(() => {
 
 // ─── 100k WOs, fresh org, 1M/day, 2M/month ────────────────────────────────
 
-test('redistribute: 4M identifiers (40×100k) with 2M/mo cap → spans 2 months', () => {
+// Under the R5 hold (SHIPPED_WORK_COUNTS_TWICE_UNTIL_MONTH_END) work shipped in a
+// month counts twice in reserve()'s view for the rest of it: after Day 1 ships
+// 1M, a 2M month reads 1M (Adobe) + 1M (held) = full. So a 2M cap ships 1M/month.
+test('redistribute: 4M identifiers (40×100k) with 2M/mo cap → spans 4 months under the R5 hold', () => {
   const jobId = seedJob();
   seedWorkOrders(jobId, Array(40).fill(100_000));   // 40 × 100k = 4M
 
@@ -82,12 +94,12 @@ test('redistribute: 4M identifiers (40×100k) with 2M/mo cap → spans 2 months'
   };
   const result = redistributeUnshippedOrders(jobId, quota);
 
-  assert.equal(result.months, 2);
+  assert.equal(result.months, 4);
   assert.equal(result.totalUnshipped, 40);
   assert.equal(result.totalIdentifiers, 4_000_000);
 
-  // Per-month: 20 WOs × 100k = 2M each.
-  assert.deepEqual(result.perMonthCounts, [2_000_000, 2_000_000]);
+  // Per-month: 10 WOs × 100k = 1M each (Day 1 of each month; Day 2 would see the month full).
+  assert.deepEqual(result.perMonthCounts, [1_000_000, 1_000_000, 1_000_000, 1_000_000]);
 
   // Spot-check that DB rows have month_index set correctly.
   const rows = q().getAllOrdersForJob.all(jobId);
@@ -95,11 +107,11 @@ test('redistribute: 4M identifiers (40×100k) with 2M/mo cap → spans 2 months'
     acc[r.month_index] = (acc[r.month_index] || 0) + 1;
     return acc;
   }, {});
-  assert.equal(monthCount[1], 20);
-  assert.equal(monthCount[2], 20);
+  assert.equal(monthCount[1], 10);
+  assert.equal(monthCount[2], 10);
 });
 
-test('redistribute: 10M (100×100k) with 2M/mo cap → 5 months, 2 days each', () => {
+test('redistribute: 10M (100×100k) with 2M/mo cap → 10 months, 1 day each (R5 hold)', () => {
   const jobId = seedJob();
   seedWorkOrders(jobId, Array(100).fill(100_000));
 
@@ -108,16 +120,16 @@ test('redistribute: 10M (100×100k) with 2M/mo cap → 5 months, 2 days each', (
     monthly: { remaining: 2_000_000, quota: 2_000_000 },
   };
   const result = redistributeUnshippedOrders(jobId, quota);
-  assert.equal(result.months, 5);
-  assert.deepEqual(result.perMonthCounts, [2_000_000, 2_000_000, 2_000_000, 2_000_000, 2_000_000]);
+  assert.equal(result.months, 10);
+  assert.deepEqual(result.perMonthCounts, Array(10).fill(1_000_000));
 
   const rows = q().getAllOrdersForJob.all(jobId);
-  // Each month should have 2 distinct day_index values (Day 1 = 10 WOs, Day 2 = 10 WOs).
-  for (let m = 1; m <= 5; m++) {
+  // Each month holds one 1M day (10 WOs) — a 2nd day would see the month full.
+  for (let m = 1; m <= 10; m++) {
     const inMonth = rows.filter(r => r.month_index === m);
-    assert.equal(inMonth.length, 20, `Month ${m}: 20 WOs`);
+    assert.equal(inMonth.length, 10, `Month ${m}: 10 WOs`);
     const days = new Set(inMonth.map(r => r.day_index));
-    assert.deepEqual([...days].sort(), [1, 2], `Month ${m}: days 1 and 2 only`);
+    assert.deepEqual([...days], [1], `Month ${m}: day 1 only`);
   }
 });
 
@@ -134,10 +146,10 @@ test('redistribute: month-1 remaining of 500k pushes excess to month 2', () => {
   };
   const result = redistributeUnshippedOrders(jobId, quota);
 
-  // Month 1 only has 500k remaining → 5 WOs. Month 2 fresh 2M → 20 WOs.
-  // Month 3 holds the remaining 5 WOs (500k).
-  assert.equal(result.months, 3);
-  assert.deepEqual(result.perMonthCounts, [500_000, 2_000_000, 500_000]);
+  // Month 1 only has 500k remaining → 5 WOs. Each later 2M month ships 1M
+  // (R5 hold), so 10 + 10 WOs, and Month 4 holds the last 5 (500k).
+  assert.equal(result.months, 4);
+  assert.deepEqual(result.perMonthCounts, [500_000, 1_000_000, 1_000_000, 500_000]);
 });
 
 test('redistribute: when daily.remaining is partial, today fits less than tomorrow', () => {
@@ -150,14 +162,15 @@ test('redistribute: when daily.remaining is partial, today fits less than tomorr
   };
   const result = redistributeUnshippedOrders(jobId, quota);
 
-  // All in month 1 (1.5M ≤ 2M monthly remaining).
-  assert.equal(result.months, 1);
-  // Days: day 1 = 3 WOs (300k), day 2 = 10 WOs (1M), day 3 = 2 WOs (200k).
-  const rows = q().getAllOrdersForJob.all(jobId).filter(r => r.month_index === 1);
-  const byDay = rows.reduce((a, r) => { a[r.day_index] = (a[r.day_index] || 0) + 1; return a; }, {});
+  // Day 1 = 3 WOs (300k, today's remainder), Day 2 = 10 WOs (1M). By Day 3 the
+  // 2M month reads 1.3M shipped twice (R5 hold) = full → the last 2 go to Month 2.
+  assert.equal(result.months, 2);
+  const rows = q().getAllOrdersForJob.all(jobId);
+  const byDay = rows.filter(r => r.month_index === 1)
+    .reduce((a, r) => { a[r.day_index] = (a[r.day_index] || 0) + 1; return a; }, {});
   assert.equal(byDay[1], 3);
   assert.equal(byDay[2], 10);
-  assert.equal(byDay[3], 2);
+  assert.equal(rows.filter(r => r.month_index === 2).length, 2);
 });
 
 // ─── Shipped WOs are untouched ────────────────────────────────────────────
@@ -213,14 +226,14 @@ test('redistribute: monthly is ALWAYS tracked — falls back to config cap (revi
 
 test('redistribute: writes projected_months to the jobs row', () => {
   const jobId = seedJob();
-  seedWorkOrders(jobId, Array(30).fill(100_000));   // 3M / 2M = 2 months
+  seedWorkOrders(jobId, Array(30).fill(100_000));   // 3M at 1M/month (2M cap, R5 hold) = 3 months
   const quota = {
     daily:   { remaining: 1_000_000, quota: 1_000_000 },
     monthly: { remaining: 2_000_000, quota: 2_000_000 },
   };
   redistributeUnshippedOrders(jobId, quota);
   const job = q().getJob.get(jobId);
-  assert.equal(job.projected_months, 2);
+  assert.equal(job.projected_months, 3);
 });
 
 test('redistribute: no unshipped WOs is a no-op returning months=0', () => {

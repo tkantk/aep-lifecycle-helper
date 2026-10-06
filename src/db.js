@@ -281,6 +281,15 @@ export function initDb() {
     // to 0 = ambiguous, so ordinary job-delete fails closed on them (they could
     // represent real Adobe spend; deleting their tracking risks over-ship).
     { table: 'work_orders', column: 'failure_definitive', type: 'INTEGER NOT NULL DEFAULT 0' },
+    // 2026-10-06 scale fix: per-namespace counts ([{code,id,count}]) written at
+    // plan time so list/poll paths never read or parse namespaces_identities
+    // (~6 MB per 100k-identifier work order). NULL on rows planned before this
+    // column existed; GET /work-orders computes it once and back-fills.
+    { table: 'work_orders', column: 'ns_summary_json', type: 'TEXT' },
+    // 2026-10-06: calendar anchor ('YYYY-MM', UTC) for month labels — Month N
+    // means anchor + (N-1) calendar months. Stamped at plan time; NULL on jobs
+    // planned earlier (the redistributor derives + persists one on first use).
+    { table: 'jobs', column: 'plan_anchor_month', type: 'TEXT' },
   ];
   for (const { table, column, type } of additiveColumns) {
     try {
@@ -328,6 +337,19 @@ export function initDb() {
 }
 
 // ─── Prepared statements ────────────────────────────────────────────────
+
+// Every work_orders column EXCEPT namespaces_identities (the identity list,
+// ~6 MB per 100k-identifier order). List, poll and selection queries use this
+// so a 260-order job doesn't drag ~1.5 GB of JSON through the event loop on
+// every Submit-tab poll; the payload is fetched per order (getWorkOrderPayload)
+// only when it is actually POSTed. Keep in sync with the work_orders schema.
+const WO_META_COLS = `
+  id, job_id, day_index, month_index, dataset_ids, target_services_json,
+  identifier_count, status, adobe_workorder_id, adobe_status, bundle_id,
+  product_status_details, last_error, submitted_at, completed_at, created_at,
+  updated_at, last_polled_at, display_name, attempt, failure_definitive,
+  ns_summary_json`;
+
 let stmts = null;
 function prepared() {
   if (stmts) return stmts;
@@ -586,6 +608,30 @@ function prepared() {
     getAllOrdersForJob: db.prepare(`
       SELECT * FROM work_orders WHERE job_id = ? ORDER BY COALESCE(month_index, 1), day_index, rowid
     `),
+    // ─── Metadata-only reads (no identity list) — see WO_META_COLS ──────
+    listWorkOrderMetaForJob: db.prepare(`
+      SELECT ${WO_META_COLS} FROM work_orders WHERE job_id = ? ORDER BY COALESCE(month_index, 1), day_index, rowid
+    `),
+    // Same set + order as getPlannedOrders (the scheduler's "next window" pick).
+    listApprovedUnshippedMeta: db.prepare(`
+      SELECT ${WO_META_COLS} FROM work_orders
+       WHERE job_id = ? AND status IN ('planned','deferred')
+       ORDER BY month_index NULLS FIRST, day_index, rowid
+    `),
+    // Same set + order as getOrdersByMonthAndDay / getOrdersByDay.
+    listBucketMeta: db.prepare(`
+      SELECT ${WO_META_COLS} FROM work_orders
+       WHERE job_id = ? AND COALESCE(month_index, 1) = ? AND COALESCE(day_index, 1) = ?
+       ORDER BY rowid
+    `),
+    listDayMeta: db.prepare(`
+      SELECT ${WO_META_COLS} FROM work_orders WHERE job_id = ? AND day_index = ? ORDER BY rowid
+    `),
+    getWorkOrderPayload: db.prepare(`SELECT namespaces_identities FROM work_orders WHERE id = ?`),
+    getWorkOrderStatusById: db.prepare(`SELECT status, adobe_workorder_id FROM work_orders WHERE id = ?`),
+    // Cache fill only — deliberately does NOT bump updated_at (that drives the
+    // Monitor's "latest activity" ordering, and a summary back-fill isn't activity).
+    setWorkOrderNsSummary: db.prepare(`UPDATE work_orders SET ns_summary_json = ? WHERE id = ?`),
     // Single WO scoped to its job — used by the operator "confirmed absent →
     // release & retry" action (review R7 #1) so a woId from a different job
     // can't be acted on.
@@ -595,6 +641,13 @@ function prepared() {
     // getWorkOrderReconcileState below (attempt + status + adobe_workorder_id);
     // getWorkOrderAttempt is the plain attempt read used by direct callers/tests.
     getWorkOrderAttempt: db.prepare(`SELECT attempt FROM work_orders WHERE id = ?`),
+    // Operator "retry rejected" (2026-10-06 fix 5) — CAS: only a definitively
+    // rejected, never-accepted order goes back to 'planned'.
+    resetRejectedWorkOrder: db.prepare(`
+      UPDATE work_orders
+         SET status = 'planned', last_error = NULL, failure_definitive = 0, updated_at = datetime('now')
+       WHERE id = ? AND status = 'failed' AND failure_definitive = 1 AND adobe_workorder_id IS NULL
+    `),
     bumpWorkOrderAttempt: db.prepare(`UPDATE work_orders SET attempt = attempt + 1 WHERE id = ?`),
     // Review R10 #1: the reconcile CAS must also require the WO to still be
     // UNRESOLVED — otherwise two concurrent lookups (same attempt) both write and
@@ -645,6 +698,15 @@ function prepared() {
       UPDATE work_orders SET month_index = ?, day_index = ?, updated_at = datetime('now') WHERE id = ?
     `),
     setProjectedMonths: db.prepare(`UPDATE jobs SET projected_months = ?, updated_at = datetime('now') WHERE id = ?`),
+    setPlanAnchorMonth: db.prepare(`UPDATE jobs SET plan_anchor_month = ? WHERE id = ?`),
+    // Month 2+ work awaiting operator approval, in creation order — re-bucketed
+    // after the approved (planned/deferred) work so its labels stay current.
+    getAwaitingOrdersForJob: db.prepare(`
+      SELECT id, identifier_count, day_index, month_index, status
+        FROM work_orders
+       WHERE job_id = ? AND status = 'awaiting_approval'
+       ORDER BY rowid
+    `),
     updateWorkOrderStatus: db.prepare(`
       UPDATE work_orders SET status = ?, last_error = ?, updated_at = datetime('now') WHERE id = ?
     `),
@@ -657,12 +719,15 @@ function prepared() {
     // Durable pre-POST checkpoint (review R6 #2): set status='submitting' AND the
     // exact displayName that will be sent to Adobe. COALESCE keeps an existing
     // display_name when @displayName is null (the legacy/no-name durable path).
+    // Compare-and-swap (2026-10-06): only a still-shippable (planned/deferred)
+    // row flips to 'submitting'. 0 changes ⇒ the row vanished (force-deleted
+    // job) or was settled elsewhere ⇒ the caller must NOT POST.
     setWorkOrderSubmittingWithName: db.prepare(`
       UPDATE work_orders
          SET status = 'submitting', last_error = NULL,
              display_name = COALESCE(@displayName, display_name),
              updated_at = datetime('now')
-       WHERE id = @id
+       WHERE id = @id AND status IN ('planned', 'deferred')
     `),
     updateWorkOrderSubmitted: db.prepare(`
       UPDATE work_orders
@@ -687,8 +752,11 @@ function prepared() {
     // observed even when more than 100 are in flight (review finding #9 —
     // starvation). The monitor stamps last_polled_at on every attempt, so a
     // polled WO rotates to the back of the queue.
+    // Explicit columns, NOT w.* — w.* would read every open order's identity
+    // list (~6 MB each) on every 60 s tick just to poll its status.
     listOpenWorkOrders: db.prepare(`
-      SELECT w.*, j.creds_id AS j_creds_id, j.sandbox_name AS j_sandbox_name
+      SELECT w.id, w.job_id, w.status, w.adobe_workorder_id, w.adobe_status, w.last_polled_at,
+             j.creds_id AS j_creds_id, j.sandbox_name AS j_sandbox_name
         FROM work_orders w JOIN jobs j ON j.id = w.job_id
        WHERE w.adobe_workorder_id IS NOT NULL
          AND (w.adobe_status IS NULL OR w.adobe_status NOT IN ('completed','failed'))
@@ -791,6 +859,13 @@ function prepared() {
     listExpandingJobs: db.prepare(`SELECT * FROM jobs WHERE status = 'expanding'`),
     processedSourceIdsForJob: db.prepare(`
       SELECT DISTINCT source_id FROM expanded_identities WHERE job_id = ?
+    `),
+    // Per-row resume check (2026-10-06): an indexed point lookup on
+    // idx_ei_job_source instead of materialising every processed source id in a
+    // JS Set — ~1 GB of heap at 6.8M sources, on a box whose Node heap may be
+    // ~2-4 GB. Every processed source has at least its own source row.
+    hasProcessedSource: db.prepare(`
+      SELECT 1 FROM expanded_identities WHERE job_id = ? AND source_id = ? LIMIT 1
     `),
     // Work orders stuck mid-submission: process was killed after quota reserve
     // but before (or during) the Adobe POST. Adobe may or may not have received
@@ -930,8 +1005,11 @@ export const q = () => prepared();
  * server for the duration of a long CSV export (review #6). An fsync-on-commit
  * does not block on readers.
  *
- * Returns true on success; false (caller fails closed, does not POST) only if
- * the write itself errors.
+ * Returns true only when exactly this row was durably flipped from
+ * planned/deferred to 'submitting'. False (caller fails closed, does not POST)
+ * if the write errors OR changed nothing — the row was deleted (e.g. a
+ * force-deleted job while its later orders were still queued) or is no longer
+ * waiting to ship (2026-10-06).
  */
 export function setWorkOrderSubmittingDurable(workOrderId, displayName = null) {
   const prev = db.pragma('synchronous', { simple: true });   // numeric (1 = NORMAL)
@@ -939,8 +1017,8 @@ export function setWorkOrderSubmittingDurable(workOrderId, displayName = null) {
     db.pragma('synchronous = FULL');
     // Persist status='submitting' AND the exact displayName to be POSTed, so
     // orphan recovery can match Adobe's stored value even after a crash (R6 #2).
-    prepared().setWorkOrderSubmittingWithName.run({ id: workOrderId, displayName });
-    return true;
+    const { changes } = prepared().setWorkOrderSubmittingWithName.run({ id: workOrderId, displayName });
+    return changes === 1;
   } catch {
     return false;
   } finally {

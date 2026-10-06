@@ -40,7 +40,11 @@ export async function runExpansion({
   const creds = await decryptCreds(credsId);
   const job = q().getJob.get(jobId);
   const total = job.total_source_ids;
-  const progress = { processed: 0, total, found: 0 };
+  // A resume continues the job's persisted (cumulative) counters, so the live
+  // progress the UI polls reads e.g. "4.9M / 6.8M" — not "0 / 6.8M".
+  const progress = skipSourceIds
+    ? { processed: job.processed_count || 0, total, found: job.found_count || 0 }
+    : { processed: 0, total, found: 0 };
   liveProgress.set(jobId, progress);
 
   q().updateJobStatus.run('expanding', null, jobId);
@@ -284,33 +288,38 @@ export async function runExpansion({
     wave.push(task);
   };
 
-  // onRow is async so that csv.js's `await onRow(...)` provides natural
-  // backpressure — the CSV stream pauses at each wave boundary until the
-  // in-flight Adobe calls complete.
-  await streamIds(uploadPath, {
-    column,
-    onRow: async (value) => {
-      if (aborted) return;
-      if (skipSourceIds?.has(value)) { skipped++; return; }
-      buffer.push(value);
-      if (buffer.length >= config.identityBatchSize) {
-        pushBatch(buffer);
-        buffer = [];
-        if (wave.length >= WAVE_SIZE) {
-          await drainWave(); // blocks CSV stream until this wave clears
-        }
-      }
-    },
-  });
-
-  if (skipSourceIds && skipped > 0) {
-    logger.info({ jobId, skipped }, 'resumed expansion: skipped already-processed source ids');
-  }
-
-  // Flush any remaining partial buffer and the last partial wave.
-  if (buffer.length > 0) pushBatch(buffer);
-
+  // ONE try around the whole stream (2026-10-06): a failing batch surfaces via
+  // drainWave() INSIDE onRow, i.e. out of streamIds itself. With only the
+  // final drain inside the try, a failure in any earlier wave left the job
+  // 'expanding' with no reason and frozen progress — un-plannable (correct) but
+  // also un-resumable, recoverable only by restarting the app.
   try {
+    // onRow is async so that csv.js's `await onRow(...)` provides natural
+    // backpressure — the CSV stream pauses at each wave boundary until the
+    // in-flight Adobe calls complete.
+    await streamIds(uploadPath, {
+      column,
+      onRow: async (value) => {
+        if (aborted) return;
+        if (skipSourceIds?.has(value)) { skipped++; return; }
+        buffer.push(value);
+        if (buffer.length >= config.identityBatchSize) {
+          pushBatch(buffer);
+          buffer = [];
+          if (wave.length >= WAVE_SIZE) {
+            await drainWave(); // blocks CSV stream until this wave clears
+          }
+        }
+      },
+    });
+
+    if (skipSourceIds && skipped > 0) {
+      logger.info({ jobId, skipped }, 'resumed expansion: skipped already-processed source ids');
+    }
+
+    // Flush any remaining partial buffer and the last partial wave.
+    if (buffer.length > 0) pushBatch(buffer);
+
     await drainWave();
 
     // FAIL CLOSED on an all-empty graph (review finding #2). When the job
@@ -345,6 +354,10 @@ export async function runExpansion({
     q().updateJobStatus.run('expanded', null, jobId);
     logger.info({ jobId, processed: progress.processed, found: distinct }, 'expansion complete');
   } catch (err) {
+    // Let any batch still in flight settle first, so nothing writes rows or
+    // counters after the job is recorded 'failed' (a resume could start then).
+    aborted = true;
+    await Promise.allSettled(wave);
     q().updateJobStatus.run('failed', err.message, jobId);
     throw err;
   } finally {

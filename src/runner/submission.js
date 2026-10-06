@@ -14,6 +14,24 @@ import { markPosting, unmarkPosting } from './postingState.js';
 // same job in the same process (e.g. user double-clicks the Submit button).
 const inFlight = new Set();
 
+/** True while a runSubmission for this job is running. The submit route
+ *  refuses a new request then (409) — runSubmission itself would return an
+ *  empty result, which the operator would never see (2026-10-06 review). */
+export function isSubmissionInFlight(jobId) {
+  return inFlight.has(jobId);
+}
+
+// HTTP statuses on the hygiene POST that prove Adobe refused the request BEFORE
+// processing it, so no work order was created and no quota was spent
+// (2026-10-06 fix 5). Deliberately an allow-list: every other 4xx — notably 408
+// (a corporate proxy timing out after it already forwarded the request) and 409
+// — is treated as UNCERTAIN, like a 5xx or a timeout. A "definitive" failure can
+// be refunded and retried; an uncertain one never is without reconciliation.
+const DEFINITIVE_REJECTION_STATUSES = new Set([400, 401, 403, 404, 405, 406, 411, 413, 414, 415, 422, 429]);
+export function isDefinitiveRejection(status) {
+  return DEFINITIVE_REJECTION_STATUSES.has(status);
+}
+
 
 /**
  * Work-order planning and submission.
@@ -52,7 +70,40 @@ export class ReplanForbiddenError extends Error {
   constructor(message) { super(message); this.name = 'ReplanForbiddenError'; this.status = 409; }
 }
 
+// Job statuses that prove expansion FINISHED successfully: 'expanded' is only
+// ever set by runExpansion on success, and the rest only follow it (plan →
+// 'ready', submit → 'submitting' / 'submitted' / 'partial'). Never 'created',
+// 'expanding' or 'failed' — planning those plans a PARTIAL identity set.
+export const PLANNABLE_JOB_STATUSES = new Set(['expanded', 'ready', 'submitting', 'submitted', 'partial']);
+
+export class PlanNotReadyError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'PlanNotReadyError';
+    this.status = 409;
+    this.code = 'not_expanded';
+    this.publicMessage = message;
+  }
+}
+
+/** Throws PlanNotReadyError unless the job's expansion has finished. */
+export function assertPlannable(job) {
+  if (PLANNABLE_JOB_STATUSES.has(job?.status)) return;
+  const why = job?.status === 'failed'
+    ? `its identity expansion failed${job.last_error ? ` (${job.last_error})` : ''} — resume the expansion first`
+    : job?.status === 'expanding'
+      ? 'its identity expansion is still running — wait for it to finish'
+      : `its identity expansion has not completed (status "${job?.status ?? 'unknown'}")`;
+  throw new PlanNotReadyError(
+    `Cannot plan this job: ${why}. Planning now would build work orders from a partial set of ` +
+    `identities, and once any of them ship the rest could never be planned.`);
+}
+
 export function planWorkOrders({ jobId, datasetIds, dailyLimit, targetServices, quota = null }) {
+  // Expansion must have FINISHED (2026-10-06 fix 4): a plan built from a
+  // still-running or failed expansion silently covers only part of the job.
+  assertPlannable(q().getJob.get(jobId));
+
   // SAFETY: refuse to re-plan if any non-planned/non-deferred work orders exist
   // for this job. Otherwise re-running planning would re-emit work orders for
   // identities that were ALREADY submitted to Adobe, causing duplicate
@@ -136,14 +187,19 @@ export function planWorkOrders({ jobId, datasetIds, dailyLimit, targetServices, 
 
     const groups = [...current.byNs.values()];
     pendingOrders.push({
-      id: uuid(),
-      jobId,
-      dayIndex,
-      datasetIds,
-      targetServicesJson,
-      namespacesIdentities: JSON.stringify(groups),
-      identifierCount: current.total,
-      status: 'planned',
+      row: {
+        id: uuid(),
+        jobId,
+        dayIndex,
+        datasetIds,
+        targetServicesJson,
+        namespacesIdentities: JSON.stringify(groups),
+        identifierCount: current.total,
+        status: 'planned',
+      },
+      // Per-namespace counts for list/poll paths (2026-10-06 scale fix) so
+      // they never have to read or parse namespacesIdentities.
+      nsSummaryJson: JSON.stringify(summarizeNamespaceGroups(groups)),
     });
     planned++;
     current = makeEmptyOrder();
@@ -180,7 +236,10 @@ export function planWorkOrders({ jobId, datasetIds, dailyLimit, targetServices, 
   flushOrder();
 
   db.transaction(() => {
-    for (const wo of pendingOrders) q().insertWorkOrder.run(wo);
+    for (const { row, nsSummaryJson } of pendingOrders) {
+      q().insertWorkOrder.run(row);
+      q().setWorkOrderNsSummary.run(nsSummaryJson, row.id);
+    }
   })();
 
   q().setPlannedOrders.run(planned, jobId);
@@ -192,6 +251,10 @@ export function planWorkOrders({ jobId, datasetIds, dailyLimit, targetServices, 
   // dailyIndex computed above is a rough sketch — redistribute is the
   // authoritative numbering and the one the Plan UI reads.
   const previousMonths = q().getJob.get(jobId)?.projected_months ?? null;
+  // Month labels are calendar months counted from the month the plan starts in
+  // (UTC). Re-stamped on every (re-)plan — a re-plan is only allowed before
+  // anything has shipped, so no shipped label is ever re-interpreted.
+  q().setPlanAnchorMonth.run(new Date().toISOString().slice(0, 7), jobId);
   const distribution = redistributeUnshippedOrders(jobId, quota);
   const shifted = previousMonths != null && distribution.months > previousMonths;
 
@@ -218,6 +281,20 @@ export function planWorkOrders({ jobId, datasetIds, dailyLimit, targetServices, 
 }
 
 function makeEmptyOrder() { return { byNs: new Map(), total: 0 }; }
+
+/**
+ * Per-namespace counts for one work order's namespacesIdentities groups:
+ * [{ code, id, count }] in group order. Single source of truth for both the
+ * planner (written to work_orders.ns_summary_json) and the GET /work-orders
+ * back-fill for legacy rows, so the UI sees identical shapes either way.
+ */
+export function summarizeNamespaceGroups(groups) {
+  return groups.map(g => ({
+    code: g.namespace?.code || null,
+    id: g.namespace?.id ?? null,
+    count: g.ids.length,
+  }));
+}
 
 function addToOrder(order, row) {
   // row: { ns_code, ns_id, identity_id, source_id }
@@ -252,10 +329,10 @@ function addToOrder(order, row) {
  *   - Returns extra metadata about the redistribution so callers can
  *     surface "your plan shifted from N to M months" notifications.
  */
-export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
+export async function runSubmission({ jobId, dayIndex, monthIndex, workOrderIds } = {}) {
   if (inFlight.has(jobId)) {
     logger.warn({ jobId }, 'submission already in progress, skipping duplicate call');
-    return { submitted: 0, deferred: 0, failed: 0 };
+    return { submitted: 0, deferred: 0, failed: 0, skipped: 0 };
   }
   inFlight.add(jobId);
 
@@ -269,7 +346,7 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
     // adding identities in the same process (crash + restart edge case).
     if (job.status === 'expanding') {
       logger.info({ jobId }, 'runSubmission: job is still expanding — skipping');
-      return { submitted: 0, deferred: 0, failed: 0 };
+      return { submitted: 0, deferred: 0, failed: 0, skipped: 0 };
     }
 
     const creds = await decryptCreds(job.creds_id);
@@ -332,34 +409,44 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
       throw e;
     }
 
+    // ─── WHAT to ship: resolved BEFORE re-bucketing (2026-10-06 fix 1) ──
+    // An explicit request — the operator's confirmed work-order IDs, or a
+    // legacy (month, day) bucket — names orders by what the operator SAW.
+    // Re-bucketing first (the old order) re-labelled them, so the bucket lookup
+    // that followed shipped nothing (the 2026-05-30 prod incident) or a
+    // different batch than the confirmation dialog listed. Resolve the selection
+    // from the current rows first; re-bucketing below only refreshes labels.
+    // Only planned/deferred orders are ever eligible (deferred = denied quota
+    // on an earlier run, never sent to Adobe).
+    const isShippable = (w) => (w.status === 'planned' || w.status === 'deferred') && !w.adobe_workorder_id;
+    const explicitIds = Array.isArray(workOrderIds) && workOrderIds.length > 0
+      ? [...new Set(workOrderIds)] : null;
+    const useMonth = Number(monthIndex) || null;
+    const useDay   = Number(dayIndex)   || null;
+    let orders = null;     // null → no explicit request: pick the next window after re-bucketing
+    let skipped = 0;
+    if (explicitIds) {
+      // Ship in the job's (month, day, insertion) order, whatever order the IDs came in.
+      const wanted = new Set(explicitIds);
+      orders = q().listWorkOrderMetaForJob.all(jobId).filter(w => wanted.has(w.id) && isShippable(w));
+      skipped = explicitIds.length - orders.length;   // shipped already, awaiting approval, or not this job's
+    } else if (useMonth && useDay) {
+      orders = q().listBucketMeta.all(jobId, useMonth, useDay).filter(isShippable);
+    } else if (useDay) {
+      orders = q().listDayMeta.all(jobId, useDay).filter(isShippable);
+    }
+
     const distribution = redistributeUnshippedOrders(jobId, quotaSnapshot);
     const shifted = previousMonths != null && distribution.months > previousMonths;
 
-    // Include 'deferred' rows alongside 'planned' — deferred orders were
-    // denied quota on a previous run and never went to Adobe. After UTC
-    // rollover (daily) or month rollover (monthly), they're safe to retry.
-    //
-    // Bucket selection: a (month, day) pair, or just day for backward
-    // compat with callers that don't know about monthIndex yet (legacy
-    // jobs default to month_index 1).
-    const useMonth = Number(monthIndex) || null;
-    const useDay   = Number(dayIndex)   || null;
-    let orders;
-    if (useMonth && useDay) {
-      orders = q().getOrdersByMonthAndDay.all(jobId, useMonth, useDay)
-        .filter(o => ['planned', 'deferred'].includes(o.status));
-    } else if (useDay) {
-      orders = q().getOrdersByDay.all(jobId, useDay).filter(o => ['planned', 'deferred'].includes(o.status));
-    } else {
-      // No explicit bucket (the auto-resume scheduler, and the default UI
-      // "Submit" click). Ship ONLY the current window — the lowest
-      // (month_index, day_index) bucket among un-shipped orders. After the
-      // redistribute() above, that bucket is sized to Adobe's live daily
-      // `remaining`. Shipping every planned order here (the old behavior)
-      // ignored the bucketing and over-submitted beyond Adobe's remaining
-      // for today — review blocker #3. The next run (next scheduler tick /
-      // next UTC day) re-buckets and ships the following window.
-      const unshipped = q().getPlannedOrders.all(jobId); // sorted month,day,rowid
+    if (orders === null) {
+      // No explicit bucket (the auto-resume scheduler). Ship ONLY the current
+      // window — the lowest (month_index, day_index) bucket among un-shipped
+      // orders, which the redistribute() above just sized to what reserve()
+      // will grant. Shipping every planned order (the old behavior) ignored the
+      // bucketing and over-submitted beyond Adobe's remaining for today —
+      // review blocker #3. The next run re-buckets and ships the next window.
+      const unshipped = q().listApprovedUnshippedMeta.all(jobId); // sorted month,day,rowid
       if (unshipped.length === 0) {
         orders = [];
       } else {
@@ -368,6 +455,24 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
         const d = first.day_index ?? 1;
         orders = unshipped.filter(o => (o.month_index ?? 1) === m && (o.day_index ?? 1) === d);
       }
+    } else if (orders.length === 0) {
+      // Explicit request with nothing left to ship. Say so where the operator
+      // looks (job.last_error → Submit-tab banner) instead of returning a
+      // silent 0/0/0, and leave the job status alone — nothing ran.
+      const msg = explicitIds
+        ? `Submit did not run: none of the ${explicitIds.length} confirmed work orders is still waiting to ship ` +
+          `(already shipped, awaiting month approval, or not part of this job). Refresh the page and try again.`
+        : `Submit did not run: Month ${useMonth ?? 1} · Day ${useDay} has no work orders waiting to ship. ` +
+          `Refresh the page and try again.`;
+      q().setJobError.run(msg, jobId);
+      logger.warn({ jobId, requested: explicitIds?.length ?? 0, monthIndex: useMonth, dayIndex: useDay },
+        'submit request matched no shippable work orders — nothing sent');
+      return {
+        submitted: 0, deferred: 0, failed: 0, skipped,
+        months: distribution.months, previousMonths, shiftedFromPrevious: shifted,
+        quotaSnapshot: { daily: quotaSnapshot.daily, monthly: quotaSnapshot.monthly,
+          stale: quotaSnapshot.stale, fetchedAt: quotaSnapshot.fetchedAt },
+      };
     }
 
     // Live caps from the (fresh, validated-above) /quota snapshot. Both
@@ -394,6 +499,18 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
     let submitted = 0, deferred = 0, failed = 0;
 
     const tasks = orders.map(wo => limit(async () => {
+      // Re-check right before reserving (2026-10-06): an order queued behind the
+      // concurrency limit may have been settled meanwhile (approval revoked,
+      // matched by a reconcile, job force-deleted). Everything from here through
+      // the durable 'submitting' write is synchronous, so nothing can interleave.
+      const cur = q().getWorkOrderStatusById.get(wo.id);
+      if (!cur || !isShippable(cur)) {
+        skipped++;
+        logger.warn({ localId: wo.id, status: cur?.status ?? '(deleted)' },
+          'work order no longer waiting to ship — skipped');
+        return;
+      }
+
       // Per-WO reservation (review R4 #1, R5 lifecycle): keyed by wo.id so
       // reserve/markAccepted/release are exact and period-correct.
       const res = reserve({
@@ -406,6 +523,22 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
           : `daily quota: ${res.used}/${res.limit} used`;
         q().updateWorkOrderStatus.run('deferred', reason, wo.id);
         deferred++;
+        return;
+      }
+
+      // Identity list read per order, only now that it will be POSTed (selection
+      // uses metadata only — ~6 MB per 100k-identifier order). A payload that
+      // can't be read is a LOCAL problem: nothing was sent, so refund and mark it
+      // definitively failed (retryable) rather than leave it 'submitting'.
+      let namespacesIdentities, targetServices;
+      try {
+        namespacesIdentities = JSON.parse(q().getWorkOrderPayload.get(wo.id).namespaces_identities);
+        targetServices = wo.target_services_json ? JSON.parse(wo.target_services_json) : undefined;
+      } catch (err) {
+        release(wo.id);
+        q().markWorkOrderFailedDefinitive.run(`work order payload unreadable: ${err.message}`, wo.id);
+        failed++;
+        logger.error({ localId: wo.id, err: err.message }, 'work order payload unreadable — not sent');
         return;
       }
 
@@ -436,9 +569,6 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
         // the await returns, so the WO stays guarded through markAccepted / the
         // uncertain-error write with no interleaving release possible.
         markPosting(wo.id);
-
-        const namespacesIdentities = JSON.parse(wo.namespaces_identities);
-        const targetServices = wo.target_services_json ? JSON.parse(wo.target_services_json) : undefined;
 
         const result = await submitWorkOrder({
           creds,
@@ -492,17 +622,23 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
         //     the real Adobe ID or confirm absence. Do NOT release
         //     quota — Adobe may have spent it.
         const status = err.response?.status;
-        const isAdobeRejection = status != null && status >= 400 && status < 500;
+        // DEFINITIVE only when nothing can have been created (2026-10-06 fix 5):
+        // a pre-network WorkOrderValidationError (never sent), or a status that
+        // means Adobe refused the request before processing it. Any OTHER 4xx —
+        // 408 (a proxy timed out after forwarding), 409, … — is as uncertain as a
+        // 5xx/timeout: hold the reservation and let reconcile find out.
+        const isLocalValidation = err.name === 'WorkOrderValidationError';
+        const isDefinitive = isLocalValidation || isDefinitiveRejection(status);
 
-        if (isAdobeRejection) {
+        if (isDefinitive) {
           release(wo.id);
-          // Mark DEFINITIVE (review R11 #1): a 4xx means Adobe never created the
-          // WO (no quota spent), so it's unambiguously safe to delete later —
+          // Mark DEFINITIVE (review R11 #1): Adobe never created the WO (no quota
+          // spent), so it's safe to delete later or retry (retry-rejected) —
           // unlike an uncertain timeout (kept 'submitting') or a legacy 'failed'.
           q().markWorkOrderFailedDefinitive.run(err.message, wo.id);
           failed++;
-          logger.error({ localId: wo.id, status, err: err.message },
-            'submission failed (Adobe rejected — 4xx)');
+          logger.error({ localId: wo.id, status: status ?? '(not sent)', err: err.message },
+            isLocalValidation ? 'submission failed validation — not sent' : 'submission failed (Adobe rejected)');
         } else {
           // Keep status='submitting' so listSubmittingOrphanOrders picks
           // it up on next startup. Persist last_error so the operator can
@@ -524,10 +660,18 @@ export async function runSubmission({ jobId, dayIndex, monthIndex } = {}) {
 
     await Promise.all(tasks);
 
-    const status = failed > 0 ? 'partial' : (deferred > 0 ? 'submitting' : 'submitted');
-    q().updateJobStatus.run(status, null, jobId);
+    if (submitted + deferred + failed === 0) {
+      // Every selected order was settled elsewhere before its turn — nothing
+      // ran. Don't report the job as 'submitted'; restore its status and say why.
+      q().updateJobStatus.run(job.status,
+        `Submit did not run: the ${skipped} selected work order(s) were no longer waiting to ship. Refresh the page and try again.`,
+        jobId);
+    } else {
+      const status = failed > 0 ? 'partial' : (deferred > 0 ? 'submitting' : 'submitted');
+      q().updateJobStatus.run(status, null, jobId);
+    }
     return {
-      submitted, deferred, failed,
+      submitted, deferred, failed, skipped,
       // Phase 2 metadata: the UI surfaces a toast when months shifted from
       // the previously-projected value, and renders the live quota that
       // gated this submission.

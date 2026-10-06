@@ -7,6 +7,7 @@ import { getWorkOrder } from '../services/hygiene.js';
 import { decryptCreds } from '../utils/crypto.js';
 import { reactivate, markAccepted, release } from '../services/quotaManager.js';
 import { isWorkOrderPosting, markReconciling, unmarkReconciling, isWorkOrderReconciling } from './postingState.js';
+import { isDefinitiveRejection } from './submission.js';
 
 // Bounded concurrency for reconcile Adobe lookups (review R10 #3). The orphans
 // are marked reconciling UP FRONT, but their lookups run in PARALLEL so one slow
@@ -77,6 +78,32 @@ function applyIfStillUnresolved(woId, snapshotAttempt, writeFn) {
  *  reconciliation — the 60s monitor tick picks them up and polls normally.
  */
 
+/**
+ * Continue an expansion from where it stopped (crash or failure): re-stream the
+ * SAME upload + column, skipping every source that already has rows. The skip
+ * check is a per-row indexed lookup (hasProcessedSource), not a Set of every
+ * processed id — that Set is ~1 GB of heap at 6.8M sources (2026-10-06).
+ * Returns runExpansion's promise; the caller decides how to report failures.
+ */
+export function resumeExpansionForJob(job) {
+  return runExpansion({
+    jobId: job.id,
+    uploadPath: job.upload_path,
+    sourceNamespace: job.source_namespace,
+    sourceNamespaceId: job.source_namespace_id,
+    credsId: job.creds_id,
+    sandboxName: job.sandbox_name,
+    // Resume against the SAME column the operator chose at upload (review
+    // blocker #4). source_column is stored as TEXT (index or header name);
+    // re-apply the upload route's isNaN/Number coercion.
+    column: (() => {
+      const c = job.source_column ?? '0';
+      return isNaN(c) ? c : Number(c);
+    })(),
+    skipSourceIds: { has: (sourceId) => !!q().hasProcessedSource.get(job.id, sourceId) },
+  });
+}
+
 /** Resume any jobs whose status is still 'expanding'. */
 export async function resumeExpandingJobs() {
   const jobs = q().listExpandingJobs.all();
@@ -92,28 +119,9 @@ export async function resumeExpandingJobs() {
       continue;
     }
 
-    // Build fast lookup of already-processed source IDs.
-    const processedRows = q().processedSourceIdsForJob.all(job.id);
-    const skipSourceIds = new Set(processedRows.map(r => r.source_id));
-
     // Fire-and-forget; progress is tracked in the DB. Errors are logged by
     // runExpansion itself.
-    runExpansion({
-      jobId: job.id,
-      uploadPath: job.upload_path,
-      sourceNamespace: job.source_namespace,
-      sourceNamespaceId: job.source_namespace_id,
-      credsId: job.creds_id,
-      sandboxName: job.sandbox_name,
-      // Resume against the SAME column the operator chose at upload (review
-      // blocker #4). source_column is stored as TEXT (index or header name);
-      // re-apply the upload route's isNaN/Number coercion.
-      column: (() => {
-        const c = job.source_column ?? '0';
-        return isNaN(c) ? c : Number(c);
-      })(),
-      skipSourceIds,
-    }).catch(err => {
+    resumeExpansionForJob(job).catch(err => {
       logger.error({ jobId: job.id, err: err.message }, 'recovery: resume failed');
     });
   }
@@ -527,6 +535,61 @@ export function releaseAbsentOrphan(jobId, woId) {
     q().bumpWorkOrderAttempt.run(woId);
     q().updateWorkOrderStatus.run('planned', null, woId);
     logger.info({ jobId, woId }, 'operator confirmed orphan absent in Adobe → released + reset to planned for retry');
+    return { ok: true, woId, status: 'planned' };
+  })();
+}
+
+/**
+ * OPERATOR retry of a work order Adobe definitively REJECTED (2026-10-06 fix 5).
+ *
+ * A definitive rejection (failure_definitive=1) means Adobe never created the
+ * order — its quota was refunded at the time — so after the operator fixes the
+ * cause (permissions, payload, rate limit) it can safely go back to 'planned'
+ * and ship on the next Submit. Without this, re-plan being forbidden once
+ * anything ships left its identities permanently undeleted.
+ *
+ * Fail-closed, in ONE transaction:
+ *   - 404 if the order isn't this job's;
+ *   - 409 unless status 'failed' + failure_definitive=1 + no Adobe ID;
+ *   - 409 while its POST or a reconcile lookup is in flight;
+ *   - 409 if its reservation is accepted (Adobe spent quota on it);
+ *   - 409 'ambiguous_rejection' if the recorded error carries an HTTP status
+ *     that does NOT prove rejection (e.g. a 408 recorded by pre-2026-10-06 code,
+ *     which marked EVERY 4xx definitive) — retrying that could duplicate a
+ *     delete Adobe actually received. A failure with no HTTP status was local
+ *     (validation / unreadable payload): nothing was sent, so it is safe.
+ * Bumps `attempt` so any reconcile that snapshotted the old attempt discards
+ * its stale result (R9 CAS).
+ */
+export function retryRejectedWorkOrder(jobId, woId) {
+  return db.transaction(() => {
+    const refuse = (status, code, msg) => {
+      const e = new Error(msg); e.status = status; e.code = code; e.publicMessage = msg; return e;
+    };
+    const wo = q().getWorkOrderByIdAndJob.get(woId, jobId);
+    if (!wo) throw refuse(404, 'not_found', 'work order not found for this job');
+    if (wo.adobe_workorder_id || wo.status !== 'failed' || wo.failure_definitive !== 1) {
+      throw refuse(409, 'not_rejected',
+        `Only a work order Adobe definitively rejected can be retried (this one is '${wo.status}'` +
+        `${wo.status === 'failed' ? ', with an unconfirmed outcome — run Reconcile first' : ''}).`);
+    }
+    if (isWorkOrderPosting(woId) || isWorkOrderReconciling(woId)) {
+      throw refuse(409, 'busy', 'This work order is being submitted or reconciled right now — wait, then retry.');
+    }
+    const resv = q().getReservation.get(woId);
+    if (resv && resv.accepted === 1) {
+      throw refuse(409, 'accepted', 'This work order\'s quota is marked accepted by Adobe — it cannot be retried.');
+    }
+    const recorded = /^HTTP (\d{3})\b/.exec(wo.last_error || '');
+    if (recorded && !isDefinitiveRejection(Number(recorded[1]))) {
+      throw refuse(409, 'ambiguous_rejection',
+        `This work order failed with HTTP ${recorded[1]}, which does not prove Adobe rejected it. ` +
+        `Run Reconcile; if it is still not found, verify in Adobe's Data Lifecycle UI before acting on it.`);
+    }
+    release(woId);                                   // already refunded at the rejection; idempotent
+    q().bumpWorkOrderAttempt.run(woId);
+    q().resetRejectedWorkOrder.run(woId);
+    logger.info({ jobId, woId }, 'operator retry of a definitively rejected work order → planned');
     return { ok: true, woId, status: 'planned' };
   })();
 }

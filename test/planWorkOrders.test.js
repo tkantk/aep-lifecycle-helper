@@ -61,6 +61,9 @@ function insertJob(overrides = {}) {
     totalSourceIds: 0,
     ...overrides,
   });
+  // The planner only accepts a job whose expansion finished (2026-10-06 fix 4);
+  // these tests seed expanded_identities directly, i.e. a finished expansion.
+  q().updateJobStatus.run('expanded', null, jobId);
   return jobId;
 }
 

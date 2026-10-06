@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { q, prepareStreamIdentitiesBySource } from '../db.js';
-import { planWorkOrders, runSubmission } from '../runner/submission.js';
-import { reconcileJobOrphans, releaseAbsentOrphan } from '../runner/recovery.js';
+import { planWorkOrders, runSubmission, summarizeNamespaceGroups, assertPlannable, isSubmissionInFlight } from '../runner/submission.js';
+import { reconcileJobOrphans, releaseAbsentOrphan, resumeExpansionForJob, retryRejectedWorkOrder } from '../runner/recovery.js';
 import { isWorkOrderReconciling } from '../runner/postingState.js';
 import { peek as peekQuota } from '../services/quotaManager.js';
 import { getOrgQuota } from '../services/quotaApi.js';
@@ -10,7 +10,7 @@ import { liveProgress } from '../runner/expansion.js';
 import { writeCsv } from '../utils/csv.js';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
-import { registerUuidParamGuards } from '../middleware/security.js';
+import { registerUuidParamGuards, UUID_RE } from '../middleware/security.js';
 import path from 'node:path';
 import fs from 'node:fs';
 
@@ -115,6 +115,10 @@ router.post('/:id/plan', async (req, res, next) => {
       return next(err);
     }
 
+    // Refuse BEFORE contacting Adobe when expansion hasn't finished (fix 4).
+    // planWorkOrders enforces the same rule; this just fails fast.
+    assertPlannable(job);
+
     // Fetch live quota. If the credential is gone, fall back to job-row caps.
     let quota = null;
     try {
@@ -142,22 +146,106 @@ router.post('/:id/plan', async (req, res, next) => {
     if (err.name === 'ReplanForbiddenError') {
       return res.status(409).json({ error: 'replan_forbidden', message: err.message });
     }
-    next(err);
+    next(err);   // PlanNotReadyError carries status 409 + code 'not_expanded'
   }
 });
 
+/** Resume a FAILED identity expansion where it stopped (2026-10-06 fix 4).
+ *  Only for a job that failed during expansion and has no work orders (a plan
+ *  built on top would not include the identities the resume adds). Sources
+ *  that already have rows are skipped. Fire-and-forget; poll /progress. */
+router.post('/:id/resume-expansion', (req, res, next) => {
+  try {
+    const job = q().getJob.get(req.params.id);
+    const refuse = (status, code, msg) => {
+      const err = new Error(msg);
+      err.status = status; err.code = code; err.publicMessage = msg;
+      return next(err);
+    };
+    if (!job) return refuse(404, 'not_found', 'job not found');
+    if (job.status !== 'failed') {
+      return refuse(409, 'bad_state', `Only a job whose expansion failed can be resumed (this job is "${job.status}").`);
+    }
+    if (q().countWorkOrdersByStatus.all(job.id).length > 0) {
+      return refuse(409, 'has_work_orders',
+        'This job already has work orders, so its expansion cannot be resumed — the plan would not ' +
+        'include the identities a resume adds. Upload the CSV as a new job instead.');
+    }
+    if (!job.upload_path || !fs.existsSync(job.upload_path)) {
+      return refuse(409, 'upload_missing', 'The uploaded CSV for this job is no longer on disk — upload it again as a new job.');
+    }
+
+    // Leave 'failed' synchronously so a second click is refused (409 bad_state)
+    // instead of starting a second, overlapping run.
+    q().updateJobStatus.run('expanding', null, job.id);
+    resumeExpansionForJob(job).catch(err => {
+      logger.error({ jobId: job.id, err: err.message }, 'resume-expansion: run failed');
+      // runExpansion records its own failures; this covers anything that threw
+      // before it could (e.g. credentials no longer decryptable).
+      if (q().getJob.get(job.id)?.status === 'expanding') {
+        q().updateJobStatus.run('failed', `resume failed: ${err.message}`, job.id);
+      }
+    });
+    logger.info({ jobId: job.id }, 'resume-expansion: started');
+    res.json({ ok: true, resumed: true });
+  } catch (err) { next(err); }
+});
+
 /** Kick off submission (fire-and-forget). Poll /work-orders for status.
- *  Body: { dayIndex?: number, monthIndex?: number }. Omit both to ship "the
- *  next available bucket" (lowest month with un-shipped WOs, Day 1 of that
- *  month). */
+ *  Body: { workOrderIds: string[] } — the EXACT work orders the operator
+ *  confirmed (the Submit tab sends these). The server ships only those that
+ *  are still planned/deferred, gated by the quota ledger as always; it never
+ *  substitutes a different batch (2026-10-06 fix 1).
+ *  Legacy body { dayIndex, monthIndex } still works (bucket resolved before
+ *  re-labelling); omit everything to ship the next window (scheduler path). */
+const MAX_SUBMIT_IDS = 1000;
 router.post('/:id/submit', async (req, res, next) => {
   try {
-    const { dayIndex, monthIndex } = req.body || {};
+    const { dayIndex, monthIndex, workOrderIds } = req.body || {};
     const job = q().getJob.get(req.params.id);
     if (!job) {
       const err = new Error('job not found');
       err.status = 404; err.code = 'not_found'; err.publicMessage = 'job not found';
       return next(err);
+    }
+
+    // A request runSubmission would silently skip must be refused VISIBLY: the
+    // route answers {ok:true} before the run starts, so an early no-op return
+    // there would never reach the operator (2026-10-06 review).
+    const busy = (code, msg) => {
+      const err = new Error(msg);
+      err.status = 409; err.code = code; err.publicMessage = msg;
+      return next(err);
+    };
+    if (isSubmissionInFlight(job.id)) {
+      return busy('submission_in_progress',
+        'A submission for this job is still running. Wait until its work orders show submitted or deferred, then submit the next batch.');
+    }
+    if (job.status === 'expanding') {
+      return busy('expansion_running', 'This job\'s identity expansion is still running — nothing can be submitted until it finishes.');
+    }
+
+    // Validate synchronously so a malformed request never starts a run.
+    if (workOrderIds !== undefined) {
+      const invalid = (msg) => {
+        const err = new Error(msg);
+        err.status = 400; err.code = 'invalid_work_order_ids'; err.publicMessage = msg;
+        return next(err);
+      };
+      if (!Array.isArray(workOrderIds) || workOrderIds.length === 0) {
+        return invalid('workOrderIds must be a non-empty array of work-order IDs');
+      }
+      if (workOrderIds.length > MAX_SUBMIT_IDS) {
+        return invalid(`workOrderIds may list at most ${MAX_SUBMIT_IDS} work orders`);
+      }
+      if (!workOrderIds.every(id => typeof id === 'string' && UUID_RE.test(id))) {
+        return invalid('every workOrderIds entry must be a work-order UUID');
+      }
+      const ownIds = new Set(q().listWorkOrderMetaForJob.all(job.id).map(w => w.id));
+      const foreign = workOrderIds.filter(id => !ownIds.has(id));
+      if (foreign.length > 0) {
+        return invalid(`${foreign.length} of the submitted work-order IDs do not belong to this job`);
+      }
     }
 
     // The actual submission runs async — we kick it off and return 200. So a
@@ -168,7 +256,7 @@ router.post('/:id/submit', async (req, res, next) => {
     // updateJobStatus(..., null, ...) clears last_error — so we deliberately do
     // NOT clear here (a clear-at-start could be wiped by a no-op concurrent
     // submit and erase a real error).
-    runSubmission({ jobId: job.id, dayIndex, monthIndex }).catch(err => {
+    runSubmission({ jobId: job.id, dayIndex, monthIndex, workOrderIds }).catch(err => {
       logger.error({ jobId: job.id, err: err.message, code: err.code }, 'submission run crashed');
       try {
         const prefix = err.code === 'quota_unavailable' ? 'Submit blocked: ' : 'Submit failed: ';
@@ -179,20 +267,24 @@ router.post('/:id/submit', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// Polled every 2 s by the Submit tab, so it must stay cheap at any job size:
+// metadata columns only, with per-namespace counts from ns_summary_json. The
+// identity list itself (~6 MB per 100k-identifier order) is never read here —
+// except ONCE for a legacy row planned before ns_summary_json existed, whose
+// summary is computed and persisted so later polls skip the parse.
 router.get('/:id/work-orders', (req, res, next) => {
   try {
-    const rows = q().getAllOrdersForJob.all(req.params.id).map(r => {
-      const groups = JSON.parse(r.namespaces_identities || '[]');
-      return {
-        ...r,
-        namespaces: groups.map(g => ({
-          code: g.namespace.code || null,
-          id: g.namespace.id || null,
-          count: g.ids.length,
-        })),
-        // Strip the full id lists from the list view - too chatty for the UI
-        namespaces_identities: undefined,
-      };
+    const rows = q().listWorkOrderMetaForJob.all(req.params.id).map(r => {
+      let namespaces;
+      if (r.ns_summary_json) {
+        namespaces = JSON.parse(r.ns_summary_json);
+      } else {
+        const payload = q().getWorkOrderPayload.get(r.id)?.namespaces_identities || '[]';
+        namespaces = summarizeNamespaceGroups(JSON.parse(payload));
+        q().setWorkOrderNsSummary.run(JSON.stringify(namespaces), r.id);
+      }
+      const { ns_summary_json: _summary, ...rest } = r;
+      return { ...rest, namespaces };
     });
     res.json(rows);
   } catch (err) { next(err); }
@@ -286,6 +378,16 @@ router.post('/:id/work-orders/:woId/release-absent', (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+/** Re-queue a work order Adobe definitively REJECTED (HTTP 4xx before
+ *  processing, or a local validation failure) so the next Submit retries it
+ *  (2026-10-06 fix 5). Refuses anything whose outcome is not proven
+ *  rejected — see recovery.js::retryRejectedWorkOrder. */
+router.post('/:id/work-orders/:woId/retry-rejected', (req, res, next) => {
+  try {
+    res.json(retryRejectedWorkOrder(req.params.id, req.params.woId));
+  } catch (err) { next(err); }
+});
+
 /** Export all expanded identities as CSV.
  *  Uses a FRESH prepared Statement (not q().streamIdentitiesBySource) so two
  *  overlapping export requests — or one export overlapping the planner —
@@ -352,7 +454,7 @@ router.delete('/:id', async (req, res, next) => {
     const IN_FLIGHT_STATES = new Set([
       'submitting', 'submitted', 'received', 'validated', 'ingested',
     ]);
-    const wos = q().getAllOrdersForJob.all(jobId);
+    const wos = q().listWorkOrderMetaForJob.all(jobId);
     const inFlight = wos.filter(w => IN_FLIGHT_STATES.has(w.status));
     if (inFlight.length > 0 && !force) {
       const distinctStatuses = [...new Set(inFlight.map(w => w.status))].join(', ');
