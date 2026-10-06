@@ -148,13 +148,22 @@ demo — never for production. See CLAUDE.md I12.
                      found_count and writes it via setFoundCount. Live
                      progress map in memory for the UI poll path.
 
-  4. PLAN            Iterate expanded_identities ORDER BY source_id, ns_code.
-     │               Bundle identities by cluster. Pack bundles into work orders
-     ▼               (≤ 100k ids/order). Initial day_index assigned by the
-                     legacy planner. Then runner/redistributor.js runs against
-                     live /quota and assigns each un-shipped WO an authoritative
-                     (month_index, day_index) — current month uses
-                     monthly.remaining; subsequent months use the full quota.
+  4. PLAN            Only after a FINISHED expansion (2026-10-06): planWorkOrders
+     │               throws PlanNotReadyError (409 'not_expanded') unless the job
+     ▼               is expanded/ready/submitting/submitted/partial — planning a
+                     running or failed expansion plans a PARTIAL identity set.
+                     Iterate expanded_identities ORDER BY source_id, ns_code.
+                     Bundle identities by cluster. Pack bundles into work orders
+                     (≤ 100k ids/order); each WO also stores ns_summary_json
+                     (per-namespace counts for list/poll paths). Initial
+                     day_index assigned by the legacy planner. The job is stamped
+                     with plan_anchor_month (UTC 'YYYY-MM'). Then
+                     runner/redistributor.js assigns each un-shipped WO an
+                     authoritative (month_index, day_index): Month N = anchor +
+                     (N-1) calendar months; the current window is sized with the
+                     SAME numbers reserve() gates on (buffered caps; Adobe consumed
+                     + held reservations via quotaManager.projectedUsage);
+                     later days/months use the full buffered caps.
                      Plan tab groups by Month → Day; if months > 1 OR the
                      timeline shifted from a previous plan, a pre-plan modal
                      confirms before locking in. (RQ-2: 1-month shift = toast,
@@ -181,9 +190,12 @@ demo — never for production. See CLAUDE.md I12.
                      the initial Submit. Idempotent: approving an already-
                      approved month returns 404 (no rows changed).
 
-  5. SUBMIT          Pre-submit modal: shows live remaining + planned count;
-     │               operator confirms each click (always shown — destructive).
-     ▼               Backend then:
+  5. SUBMIT          The Submit tab shows ONE batch = one (month, day) bucket
+     │               (src/web/buckets.js); the pre-submit modal lists exactly
+     ▼               that batch's planned/deferred orders and the click POSTs
+                     their IDs: POST /api/jobs/:id/submit {workOrderIds}
+                     (2026-10-06 — the server ships only those IDs, never a
+                     substitute batch). Backend then:
                        a. Re-fetch /quota with refresh: true, RETRYING the live
                           fetch up to QUOTA_PREFLIGHT_ATTEMPTS (default 3, linear
                           backoff) — P1, 2026-06-01: adobeClient does NOT retry
@@ -193,10 +205,16 @@ demo — never for production. See CLAUDE.md I12.
                           FRESH snapshot. On hard failure (all attempts fail and
                           no recent cache), abort with quota_unavailable 503;
                           a stale-but-cached snapshot is still REFUSED (I15).
-                       b. Re-run redistributor against the fresh numbers
-                          (un-shipped WOs may shift to a later month).
-                       c. For each planned OR deferred order in the target
-                          (month, day) bucket:
+                       b. Resolve WHAT to ship BEFORE re-labelling: the
+                          confirmed IDs (or a legacy {monthIndex, dayIndex}
+                          bucket), filtered to planned/deferred of this job.
+                          0 eligible → job.last_error explains, status untouched.
+                          (Re-labelling first used to turn clicks into silent
+                          0/0/0 no-ops — the 2026-05-30 incident.) Then re-run
+                          the redistributor (labels only). No explicit request
+                          (scheduler) → the lowest (month, day) bucket after it.
+                       c. For each selected order (status re-checked right
+                          before reserve; identity JSON loaded only now):
                             i.   reserve({workOrderId, imsOrgId, count,
                                  dailyLimit, monthlyLimit}) — per-WO row, pending
                                  (accepted=0). dailyLimit/monthlyLimit are the
@@ -414,17 +432,28 @@ src/
 │   │                       every job with un-shipped WOs and calls
 │   │                       runSubmission(jobId), which itself re-fetches
 │   │                       /quota + re-buckets via the redistributor.
-│   ├── redistributor.js    Month-aware re-bucketer (Phase 2). Walks un-
-│   │                       shipped WOs in rowid order and assigns
-│   │                       (month_index, day_index) from live Adobe quota
-│   │                       remaining + fresh future-period caps. Atomic
-│   │                       SQLite transaction. Shipped WOs are immutable.
+│   ├── redistributor.js    Month-aware re-bucketer (Phase 2; rewritten
+│   │                       2026-10-06). Walks un-shipped WOs in rowid order —
+│   │                       approved (planned/deferred) first, then
+│   │                       awaiting_approval (never into Month 1) — and assigns
+│   │                       (month_index, day_index) LABELS: calendar months from
+│   │                       jobs.plan_anchor_month; current window sized like
+│   │                       reserve() (buffered caps, projectedUsage = MAX(floor,
+│   │                       live consumed) + held reservations); one window per
+│   │                       UTC day, bounded by the days left in each month; a
+│   │                       window's work is charged twice against its month from
+│   │                       the next day (R5 hold); never leaves an empty day
+│   │                       label. Writes only changed labels in one transaction.
+│   │                       Shipped WOs are immutable.
 │   └── recovery.js         Startup reconciliation AND per-job operator-
 │                           triggered reconciliation. Exports:
 │                             • resumeExpandingJobs() — resumes 'expanding'
-│                               jobs with skipSourceIds set from
-│                               expanded_identities (no re-doing Adobe calls
-│                               for rows already processed).
+│                               jobs via resumeExpansionForJob(job), which
+│                               skips sources that already have rows using a
+│                               per-row indexed lookup (hasProcessedSource) —
+│                               not a multi-GB Set at 6.8M sources.
+│                             • retryRejectedWorkOrder(jobId, woId) — operator
+│                               re-queue of a DEFINITIVELY rejected WO (2026-10-06).
 │                             • reconcileOrphanWorkOrders() — startup path,
 │                               scans status='submitting' AND
 │                               adobe_workorder_id IS NULL across all jobs.
@@ -455,6 +484,23 @@ src/
 │   ├── adobe.js            Sandbox/dataset/namespace discovery endpoints.
 │   ├── upload.js           multipart CSV → job + expansion kickoff.
 │   └── jobs.js             Job detail, plan, submit, progress, export.
+│                           - POST /api/jobs/:id/submit {workOrderIds} — ships
+│                             exactly those (1..1000 UUIDs of THIS job; else 400
+│                             invalid_work_order_ids). Legacy {monthIndex,
+│                             dayIndex} still accepted.
+│                           - POST /api/jobs/:id/plan — 409 not_expanded unless
+│                             the expansion finished.
+│                           - POST /api/jobs/:id/resume-expansion — 'failed' job,
+│                             no work orders, upload present → continues the
+│                             expansion (409 bad_state / has_work_orders /
+│                             upload_missing otherwise).
+│                           - POST /api/jobs/:id/work-orders/:woId/retry-rejected
+│                             — definitive 4xx/validation failure → 'planned';
+│                             409 for anything whose outcome is unproven
+│                             (incl. a legacy row recorded as HTTP 408/409).
+│                           - GET /api/jobs/:id/work-orders — metadata only
+│                             (namespace counts from ns_summary_json; the
+│                             identity list is never read on this 2 s poll).
 │                           - POST /api/jobs/:id/approve-month — flips
 │                             'awaiting_approval' → 'planned' for a given
 │                             monthIndex (≥ 2). Returns 400 for monthIndex=1
@@ -615,9 +661,9 @@ data/                       Runtime state; in .gitignore.
 |---|---|---|
 | `credentials` | AES-GCM encrypted secrets | UNIQUE(environment, ims_org_id, client_id) |
 | `sandbox_configs` | Cached sandbox metadata + datasets + namespaces | PK(creds_id, sandbox_name) |
-| `jobs` | One per upload. Status: created → expanding → expanded → ready → submitting → submitted/partial/failed. `projected_months` (Phase 2) tracks the redistributor's max month_index for shift detection. `source_column` (2026-05-31, default `'0'`) persists the upload-time CSV column so crash-recovery resumes against the same column. | FK creds_id |
+| `jobs` | One per upload. Status: created → expanding → expanded → ready → submitting → submitted/partial/failed. `projected_months` (Phase 2) tracks the redistributor's max month_index for shift detection. `plan_anchor_month` (2026-10-06, 'YYYY-MM' UTC) anchors month labels to the calendar (Month N = anchor + N-1). `source_column` (2026-05-31, default `'0'`) persists the upload-time CSV column so crash-recovery resumes against the same column. | FK creds_id |
 | `expanded_identities` | One row per (cluster member, source). No unique index — dedup deferred to planning via `GROUP BY` in `streamIdentitiesBySource`. Only `idx_ei_job_source(job_id, source_id)` remains; `idx_ei_job_ns` was dropped 2026-05-29 (proven via EXPLAIN QUERY PLAN to be redundant — every reader falls back to `idx_ei_job_source` with an identical plan). | FK job_id |
-| `work_orders` | One per Adobe work order. Statuses: planned → submitting → submitted → completed/failed/deferred. `month_index` (Phase 2) + `day_index` form the bucket label assigned by the redistributor on un-shipped WOs only. `last_polled_at` (2026-05-31) is the monitor's fairness cursor so >100 open WOs all get polled (no starvation). (R2's `reserved_monthly` column was removed in R4 — the per-WO `quota_reservations` table records each WO's own period/count, so recovery releases exactly what was reserved.) | FK job_id, ordered by rowid |
+| `work_orders` | One per Adobe work order. Statuses: planned → submitting → submitted → completed/failed/deferred. `month_index` (Phase 2) + `day_index` form the bucket label assigned by the redistributor on un-shipped WOs only. `last_polled_at` (2026-05-31) is the monitor's fairness cursor so >100 open WOs all get polled (no starvation). `ns_summary_json` (2026-10-06) holds per-namespace counts so list/poll/monitor paths never read `namespaces_identities` (~6 MB per 100k-id WO). (R2's `reserved_monthly` column was removed in R4 — the per-WO `quota_reservations` table records each WO's own period/count, so recovery releases exactly what was reserved.) | FK job_id, ordered by rowid |
 | `quota_usage` | Per-period **adobe_floor** = Adobe's observed consumed (R4: `used` is vestigial; an R5 boot backfill folds any legacy `used` into `adobe_floor`). Raised ONLY by `seedFloor` (MAX with live /quota). Nothing else touches the floor — an accepted WO is held as an active reservation, never folded in, so there is no double-count vs the MAX (R5). | PK(ims_org_id, utc_date) |
 | `quota_usage_monthly` | Monthly counterpart of `quota_usage`'s `adobe_floor`. | PK(ims_org_id, utc_year_month) |
 | `quota_reservations` | **Per-work-order quota reservation** (R4 #1; R5 lifecycle): (work_order_id) → count + utc_date + utc_year_month + active + **accepted**. `effective_used(period) = adobe_floor(period) + Σ active reservations(period)`. `reserve`→pending(accepted=0); `markAccepted`→accepted=1 (Adobe acked); `release` deactivates IFF accepted=0; `reactivate`→active+accepted. **HOLD-UNTIL-ROLLOVER (R5):** an accepted reservation is NEVER dropped mid-period (no `complete()`, no timer/floor-delta drop — all over-ship under a concurrent external consumer); it's held until the period-keyed SUM stops matching it at UTC day/month rollover. | PK(work_order_id) |

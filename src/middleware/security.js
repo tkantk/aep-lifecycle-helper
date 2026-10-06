@@ -6,7 +6,7 @@ import { logger } from '../utils/logger.js';
  *
  * The server binds to 127.0.0.1 by default, but that alone does NOT make the
  * API safe — DNS rebinding and same-site form-CSRF both let a random web
- * page drive the destructive endpoints from inside the operator's browser.
+ * page drive the destructive endpoints from insmide the operator's browser.
  * The three guards here close those holes:
  *
  *   1. hostHeaderGuard

@@ -33,6 +33,17 @@ import { db, q } from '../db.js';
  *   is irreversible. Monthly is ALWAYS tracked (review R4 #4).
  */
 
+/**
+ * Planning consequence of the R5 hold (2026-10-06): an accepted reservation
+ * stays ACTIVE until the UTC month rolls over, while seedFloor also raises the
+ * floor to Adobe's consumed — which includes that same work once Adobe has
+ * counted it. So, within a calendar month, every identifier this tool ships
+ * counts TWICE in reserve()'s view for the rest of that month. The
+ * redistributor plans with this so a labelled batch is one reserve() will grant.
+ * If the hold-until-rollover rule is ever changed, change this with it.
+ */
+export const SHIPPED_WORK_COUNTS_TWICE_UNTIL_MONTH_END = true;
+
 function utcToday() {
   const d = new Date();
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
@@ -63,6 +74,28 @@ export function peek(imsOrgId, dailyLimit, monthlyLimit) {
       ? { used: mUsed, remaining: Math.max(0, monthlyLimit - mUsed), limit: monthlyLimit }
       : null,
     used: dUsed, remaining: Math.max(0, dailyLimit - dUsed), limit: dailyLimit,
+  };
+}
+
+/**
+ * What reserve() will count as USED for the current UTC day and month, given
+ * Adobe's live consumed numbers — i.e. effective_used after the seedFloor that
+ * every submit run performs: MAX(stored floor, live consumed) + Σ active
+ * reservations. Read-only (never writes the floor). The redistributor sizes
+ * buckets with this so a planned day/month holds exactly what reserve() will
+ * grant (2026-10-06 fix 2). `dailyConsumed` / `monthlyConsumed` may be null
+ * when unknown — the stored floor is used alone then.
+ */
+export function projectedUsage({ imsOrgId, dailyConsumed = null, monthlyConsumed = null }) {
+  const live = (v) => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0);
+  if (!imsOrgId) return { daily: live(dailyConsumed), monthly: live(monthlyConsumed) };
+  const today = utcToday();
+  const month = utcYearMonth();
+  const dailyFloor   = Math.max(q().getDailyFloor.get(imsOrgId, today)?.adobe_floor || 0, live(dailyConsumed));
+  const monthlyFloor = Math.max(q().getMonthlyFloor.get(imsOrgId, month)?.adobe_floor || 0, live(monthlyConsumed));
+  return {
+    daily:   dailyFloor   + (q().sumActiveDaily.get(imsOrgId, today)?.s || 0),
+    monthly: monthlyFloor + (q().sumActiveMonthly.get(imsOrgId, month)?.s || 0),
   };
 }
 

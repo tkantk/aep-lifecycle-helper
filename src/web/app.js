@@ -36,7 +36,8 @@ const state = {
   progress: null,
   plan: null,
   workOrders: [],
-  currentDay: 1,
+  submitView: null,              // Submit tab: { month, day } batch being viewed
+  submitTrackIds: null,          // Submit tab: IDs of the batch just submitted (followed across re-labels)
   activity: [],
   pollTimer: null,
 };
@@ -916,6 +917,10 @@ async function startExpansion() {
 //       on Expand/Plan/Submit (so the operator can SEE the available
 //       jobs instead of guessing) AND triggerable from a "Switch ▾"
 //       link on the active-job header.
+// Statuses that prove the expansion FINISHED — mirrors
+// src/runner/submission.js PLANNABLE_JOB_STATUSES (the server enforces it).
+const PLANNABLE_JOB_STATUSES = new Set(['expanded', 'ready', 'submitting', 'submitted', 'partial']);
+
 const NON_TERMINAL_STATUSES = new Set([
   'created', 'expanding', 'expanded', 'ready', 'planning',
   'submitting', 'submitted', 'partial',
@@ -1000,7 +1005,8 @@ async function switchToJob(jobId) {
     state.job = detail.job;
     state.workOrders = [];
     state.progress = null;
-    state.currentDay = 1;
+    state.submitView = null;
+    state.submitTrackIds = null;
     // Explicit pick — clear the post-delete auto-load suppression so
     // subsequent tab navigations behave normally (auto-resume any
     // in-progress job from this point on).
@@ -1233,15 +1239,27 @@ async function renderExpand() {
     state.progress = p; state.job = j.job;
 
     const pct = p.total ? Math.round((p.processed / p.total) * 100) : 0;
-    const done = p.status !== 'expanding';
+    // A FAILED expansion is not "complete": its identities are partial, so it
+    // must never offer planning (2026-10-06 fix 4) — only Resume.
+    const failed = p.status === 'failed';
+    const done = p.status !== 'expanding' && !failed;
     const ratio = p.processed ? (p.found / p.processed).toFixed(2) + '×' : '—';
 
     const byNs = j.breakdown.byNamespace || [];
     const total = byNs.reduce((s, r) => s + r.count, 0);
 
     $('#expand-body').innerHTML = `
+      ${failed ? `
+      <div class="alert error" style="margin-bottom: 16px">
+        <div style="flex:1">
+          <div class="alert-title">Expansion failed — this job cannot be planned yet</div>
+          ${escape(j.job.last_error || 'The identity expansion stopped before finishing.')}
+          <div style="margin-top: 8px">Resume continues from where it stopped (already-expanded sources are skipped).</div>
+        </div>
+        <button class="btn btn-primary" id="btn-resume-expansion" style="white-space: nowrap; align-self: center">↻ Resume expansion</button>
+      </div>` : ''}
       <div class="progress-head">
-        <b>${done ? 'Expansion complete' : 'Expanding identities…'}</b>
+        <b>${failed ? 'Expansion failed' : done ? 'Expansion complete' : 'Expanding identities…'}</b>
         <span class="count">${p.processed.toLocaleString()} / ${p.total.toLocaleString()} (${pct}%)</span>
       </div>
       <div class="progress-bar">
@@ -1291,6 +1309,18 @@ async function renderExpand() {
 
     $('#btn-export-csv').hidden = !done || total === 0;
     $('#btn-goto-plan').hidden = !done;
+
+    onClickGuarded($('#btn-resume-expansion'), async () => {
+      try {
+        await http('POST', `/jobs/${state.job.id}/resume-expansion`);
+        showToast('Expansion resumed — already-expanded sources are skipped.', { kind: 'success' });
+        state.job.status = 'expanding';
+        if (!state.pollTimer) state.pollTimer = setInterval(render, 1500);
+        await render();
+      } catch (err) {
+        showToast(`Could not resume: ${err.message}`, { kind: 'error' });
+      }
+    }, { loadingText: 'Resuming…' });
   };
   await render();
   if (state.job.status === 'expanding') {
@@ -1317,9 +1347,31 @@ async function renderPlan() {
   // Don't auto-plan on tab entry: re-planning a job whose orders have already
   // been submitted would cause duplicate irreversible deletes. Render the
   // existing plan if there is one; otherwise show a "Build plan" button.
-  const wos = await http('GET', `/jobs/${state.job.id}/work-orders`);
+  const [wos, detail] = await Promise.all([
+    http('GET', `/jobs/${state.job.id}/work-orders`),
+    http('GET', `/jobs/${state.job.id}`),
+  ]);
+  if (detail?.job) state.job = detail.job;   // fresh status + plan_anchor_month
 
   if (wos.length === 0) {
+    // A plan may only be built from a FINISHED expansion (2026-10-06 fix 4) —
+    // the server refuses otherwise; explain instead of offering the button.
+    if (!PLANNABLE_JOB_STATUSES.has(state.job.status)) {
+      const failed = state.job.status === 'failed';
+      $('#plan-body').innerHTML = `
+        <div class="empty-state">
+          <div><b>${failed ? 'The identity expansion for this job failed.' : 'The identity expansion for this job has not finished.'}</b></div>
+          <div style="margin-top: 8px; max-width: 520px">
+            ${failed
+              ? `Planning now would only cover the identities found before it stopped. Resume the expansion on the Expand tab first.${state.job.last_error ? `<br><span style="color: var(--g600)">${escape(state.job.last_error)}</span>` : ''}`
+              : 'Planning now would only cover the identities found so far. The plan can be built as soon as the expansion completes.'}
+          </div>
+          <button class="btn btn-secondary" data-goto="expand" style="margin-top:16px">Go to Expand</button>
+        </div>`;
+      renderActiveJobHeader('plan-body');
+      $('#plan-body').querySelector('[data-goto]')?.addEventListener('click', () => goto('expand'));
+      return;
+    }
     $('#plan-body').innerHTML = `
       <div class="empty-state">
         <div>No plan yet for this job.</div>
@@ -1356,10 +1408,19 @@ async function buildOrRebuildPlan() {
         return;
       }
     }
-    const wos = await http('GET', `/jobs/${state.job.id}/work-orders`);
+    const [wos, detail] = await Promise.all([
+      http('GET', `/jobs/${state.job.id}/work-orders`),
+      http('GET', `/jobs/${state.job.id}`),
+    ]);
+    if (detail?.job) state.job = detail.job;   // picks up the new plan_anchor_month
     state.workOrders = wos;
     await renderPlanResults(wos);
   } catch (err) {
+    if (err.status === 409 && err.data?.error === 'not_expanded') {
+      $('#plan-body').innerHTML = `<div class="alert error">
+        <div><div class="alert-title">Cannot plan yet</div>${escape(err.data?.message || err.message)}</div></div>`;
+      return;
+    }
     if (err.status === 409) {
       $('#plan-body').innerHTML = `<div class="alert error">
         <div><div class="alert-title">Re-plan blocked</div>${escape(err.data?.message || err.message)}</div></div>`;
@@ -1464,7 +1525,10 @@ async function renderPlanResults(wos, container) {
       return `
       <details class="plan-month" ${m.month === monthsSorted[0] ? 'open' : ''}>
         <summary>
-          <span class="plan-month-label">Month ${m.month}</span>
+          <span class="plan-month-label">Month ${m.month}${(() => {
+            const cal = window.AepBuckets.calendarMonthName(state.job?.plan_anchor_month, m.month);
+            return cal ? ` <span style="font-weight: 400; color: var(--g600)">· ${escape(cal)}</span>` : '';
+          })()}</span>
           <span class="plan-month-stats">
             ${m.wos.length} work order${m.wos.length === 1 ? '' : 's'} · ${m.ids.toLocaleString()} identifiers
             ${monthlyCap > 0 ? `· ${((m.ids / monthlyCap) * 100).toFixed(0)}% of monthly cap` : ''}
@@ -1564,22 +1628,49 @@ async function renderSubmit() {
     });
     return;
   }
-  const totalDays = Math.max(...state.workOrders.map(w => w.day_index), 1);
-
-  // On tab entry, land on the first day that still has un-shipped (planned/
-  // deferred) work, so the operator sees "Submit Day N" for the actual pending
-  // window instead of a fully-shipped earlier day. (2026-06-03: pairs with the
-  // redistributor's day-label continuity so a remaining tail reads as "Day 2",
-  // not a confusing reset to "Day 1".) Runs once per tab entry — it does NOT
-  // fight the Advance/Back navigation, which re-renders via render() not here.
-  const firstPendingDay = state.workOrders
-    .filter(w => w.status === 'planned' || w.status === 'deferred')
-    .reduce((min, w) => Math.min(min, w.day_index), Infinity);
-  if (Number.isFinite(firstPendingDay)) state.currentDay = firstPendingDay;
+  // ─── Batches: one (month, day) bucket per Submit (2026-10-06 fix 3) ────
+  // The tab shows ONE batch at a time. On entry it is the next batch to ship.
+  // After a Submit it follows the work orders just sent (state.submitTrackIds)
+  // even if the server re-labels them, so the operator watches THAT batch.
+  // Previous / Next browse other batches. A Submit sends the EXACT IDs of the
+  // viewed batch's shippable orders — the server never substitutes a different
+  // set (the old day-only grouping mixed months, and the server's re-labelling
+  // turned "Submit Day N" into silent no-ops; see CHANGELOG 2026-10-06).
+  const B = window.AepBuckets;
+  state.submitTrackIds = null;
+  {
+    const first = B.firstPendingBucket(state.workOrders);
+    state.submitView = first ? { month: first.month, day: first.day } : null;
+  }
+  const anchorMonth = () => state.job?.plan_anchor_month || null;
+  const viewedBatch = () => {
+    const buckets = B.listBuckets(state.workOrders);
+    if (state.submitTrackIds?.length) {
+      const tracked = state.workOrders.find(w => state.submitTrackIds.includes(w.id));
+      if (tracked) state.submitView = { month: tracked.month_index ?? 1, day: tracked.day_index ?? 1 };
+    }
+    let index = state.submitView ? B.bucketIndex(buckets, state.submitView.month, state.submitView.day) : -1;
+    if (index === -1) {
+      const first = B.firstPendingBucket(state.workOrders);
+      index = first ? B.bucketIndex(buckets, first.month, first.day) : buckets.length - 1;
+      state.submitView = buckets[index] ? { month: buckets[index].month, day: buckets[index].day } : null;
+    }
+    return { buckets, index, bucket: buckets[index] || null };
+  };
+  const viewBatch = (b) => {
+    state.submitTrackIds = null;
+    state.submitView = b ? { month: b.month, day: b.day } : null;
+    render(state.workOrders);
+  };
 
   const render = (wos) => {
     state.workOrders = wos;
-    const today = wos.filter(w => w.day_index === state.currentDay);
+    const { buckets, index, bucket } = viewedBatch();
+    const batchWos = bucket ? bucket.wos : [];
+    const ship = B.submittable(bucket);
+    const next = B.firstPendingBucket(wos);
+    const isNext = !!(bucket && next && next.month === bucket.month && next.day === bucket.day);
+    const label = bucket ? B.bucketLabel(bucket, anchorMonth()) : 'No batches';
     const stats = {
       submitted: wos.filter(w => ['submitted','completed','received','validated','ingested'].includes(w.status)).length,
       failed:    wos.filter(w => w.status === 'failed').length,
@@ -1588,8 +1679,13 @@ async function renderSubmit() {
 
     $('#submit-body').innerHTML = `
       <div class="progress-head">
-        <b>Day ${state.currentDay} of ${totalDays}</b>
-        <span class="count">${today.length} work orders · ${today.reduce((s,w) => s+w.identifier_count, 0).toLocaleString()} identifiers</span>
+        <b>${escape(label)}</b>
+        <span class="count">batch ${index + 1} of ${buckets.length} · ${batchWos.length} work orders · ${batchWos.reduce((s, w) => s + w.identifier_count, 0).toLocaleString()} identifiers</span>
+      </div>
+      <div style="display:flex; gap:8px; flex-wrap:wrap; margin: 4px 0 14px">
+        <button class="btn btn-secondary btn-sm" id="btn-batch-prev" ${index <= 0 ? 'disabled' : ''}>◀ Previous batch</button>
+        <button class="btn btn-secondary btn-sm" id="btn-batch-next" ${index >= buckets.length - 1 ? 'disabled' : ''}>Next batch ▶</button>
+        ${next && !isNext ? `<button class="btn btn-secondary btn-sm" id="btn-batch-pending">Go to next batch to ship: ${escape(B.bucketLabel(next, anchorMonth()))}</button>` : ''}
       </div>
       <div class="stat-grid">
         <div class="stat hi">
@@ -1607,12 +1703,13 @@ async function renderSubmit() {
         </div>
       </div>
       <div class="section" style="margin-top: 24px; padding-top: 24px">
-        <div class="section-head">Day ${state.currentDay} work orders</div>
+        <div class="section-head">${escape(label)} — work orders</div>
+        ${batchWos.some(w => w.status === 'awaiting_approval') ? `<div class="section-sub">Work orders awaiting month approval are not submitted — approve the month on the Plan tab first.</div>` : ''}
       </div>
       <div class="table-wrap">
         <table>
           <thead><tr><th>Local ID</th><th>Status</th><th>Identities</th><th>Adobe Work Order ID</th></tr></thead>
-          <tbody>${today.map(w => `
+          <tbody>${batchWos.map(w => `
             <tr>
               <td class="mono">${escape(w.id.slice(0, 8))}…</td>
               <td><span class="pill ${escape(w.status)}">${escape(w.status)}</span></td>
@@ -1624,11 +1721,14 @@ async function renderSubmit() {
       </div>`;
 
     renderActiveJobHeader('submit-body');
+    $('#btn-batch-prev')?.addEventListener('click', () => viewBatch(buckets[index - 1]));
+    $('#btn-batch-next')?.addEventListener('click', () => viewBatch(buckets[index + 1]));
+    $('#btn-batch-pending')?.addEventListener('click', () => viewBatch(next));
 
     // Submit-failure banner (review #10): a fire-and-forget submit that failed
-    // its preflight (e.g. quota_unavailable) persists job.last_error. Surface
-    // it so the operator isn't left with a silent {ok:true}. Clears itself on
-    // the next successful submit (runSubmission's final updateJobStatus nulls it).
+    // its preflight (e.g. quota_unavailable) — or found nothing left to ship —
+    // persists job.last_error. Surface it so the operator isn't left with a
+    // silent {ok:true}. Cleared by the next submit that actually runs.
     if (state.job && state.job.last_error) {
       const errBanner = document.createElement('div');
       errBanner.style.cssText = 'margin: 14px 0; padding: 12px 14px; background: rgba(244,67,54,0.08); border: 1px solid rgba(244,67,54,0.45); border-radius: 6px; font-size: 13px; line-height: 1.5';
@@ -1636,23 +1736,62 @@ async function renderSubmit() {
       $('#submit-body').insertBefore(errBanner, $('#submit-body').querySelector('.progress-head'));
     }
 
-    // Reconciliation banner: when there are work orders that are 'failed' or
-    // 'submitting' WITHOUT an adobe_workorder_id, the operator might be in
-    // the "Adobe processed but our local record doesn't know" state (real
-    // 2026-05-29 incident: 10 WOs in Adobe's UI but only 7 in ours after a
-    // 60s axios timeout marked 3 as failed). One click hits the new
-    // POST /api/jobs/:id/reconcile route which looks each one up in Adobe
-    // by displayName and corrects the local record.
-    const reconcilable = wos.filter(w =>
-      !w.adobe_workorder_id && (w.status === 'failed' || w.status === 'submitting'));
+    // Rejected banner (2026-10-06 fix 5): Adobe definitively REJECTED these
+    // (HTTP 4xx before processing, or a local validation failure) — never
+    // created, quota refunded. Once the cause is fixed they can be re-queued.
+    const rejected = wos.filter(w => w.status === 'failed' && w.failure_definitive && !w.adobe_workorder_id);
+    if (rejected.length > 0) {
+      const rej = document.createElement('div');
+      rej.style.cssText = 'margin: 14px 0; padding: 12px 14px; background: rgba(244,67,54,0.06); border: 1px solid rgba(244,67,54,0.35); border-radius: 6px; font-size: 12.5px; line-height: 1.5';
+      rej.innerHTML = `
+        <b>${rejected.length} work order(s) were rejected by Adobe and never created.</b>
+        Fix the cause shown, then <b>Retry</b> to put it back in the next batch.
+        <div style="margin-top: 8px; display: flex; flex-direction: column; gap: 6px">
+          ${rejected.map(w => `
+            <div style="display: flex; gap: 8px; align-items: center; justify-content: space-between; background: rgba(0,0,0,0.03); padding: 6px 8px; border-radius: 5px">
+              <span><code style="font-size: 11.5px">${escape(w.id.slice(0, 8))}…</code> · ${w.identifier_count.toLocaleString()} ids · ${escape(w.last_error || 'rejected')}</span>
+              <button class="btn btn-secondary" data-retry-rejected="${escape(w.id)}" style="white-space: nowrap; flex: 0 0 auto">Retry</button>
+            </div>`).join('')}
+        </div>`;
+      $('#submit-body').insertBefore(rej, $('#submit-body').querySelector('.progress-head'));
+      rej.querySelectorAll('[data-retry-rejected]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const woId = btn.dataset.retryRejected;
+          if (!confirm('Put this rejected work order back into the next batch?\n\n' +
+                       'Adobe rejected it before creating it, so retrying cannot duplicate a delete. ' +
+                       'Make sure the cause shown has been fixed first.')) return;
+          btn.disabled = true;
+          try {
+            await http('POST', `/jobs/${state.job.id}/work-orders/${woId}/retry-rejected`);
+            showToast('Re-queued — it will ship with the next batch you submit.', { kind: 'success' });
+            state.workOrders = await http('GET', `/jobs/${state.job.id}/work-orders`);
+            await refresh();
+          } catch (err) {
+            btn.disabled = false;
+            showToast(`Could not retry: ${err.message}`, { kind: 'error' });
+          }
+        });
+      });
+    }
+
+    // Reconciliation banner: work orders whose Adobe outcome is UNCERTAIN —
+    // 'submitting' (POST outcome unknown) or an AMBIGUOUS 'failed' (legacy /
+    // timeout, failure_definitive=0) — with no Adobe ID. Adobe may have them
+    // (real 2026-05-29 incident: 10 WOs in Adobe's UI but only 7 in ours after
+    // a 60s axios timeout marked 3 as failed). One click hits
+    // POST /api/jobs/:id/reconcile, which looks each one up in Adobe by
+    // displayName and corrects the local record. Definitive rejections are in
+    // the banner above instead — Adobe never created those.
+    const reconcilable = wos.filter(w => !w.adobe_workorder_id &&
+      (w.status === 'submitting' || (w.status === 'failed' && !w.failure_definitive)));
     if (reconcilable.length > 0) {
       // The EXACT name Adobe stored (persisted before the POST, review R6 #2) so
       // the operator can search for it in Adobe's UI. Legacy rows (no stored
       // name) fall back to the reconstruction recovery itself uses.
       const lookupName = (w) => w.display_name || `Delete ${state.job.name} - WO ${w.id}`;
       // Only an uncertain 'submitting' orphan is eligible for the manual
-      // "confirmed absent → retry" action (a 'failed' WO was a 4xx rejection or
-      // is matched by Reconcile, not stuck).
+      // "confirmed absent → retry" action (an ambiguous 'failed' WO is matched
+      // by Reconcile, not stuck).
       const submittingOrphans = reconcilable.filter(w => w.status === 'submitting');
       const banner = document.createElement('div');
       banner.style.cssText = 'margin: 14px 0; padding: 12px 14px; background: rgba(255,193,7,0.08); border: 1px solid rgba(255,193,7,0.4); border-radius: 6px';
@@ -1733,18 +1872,30 @@ async function renderSubmit() {
       });
     }
 
-    // Day is "done" only when no work order is still planned OR deferred.
-    // Deferred orders are quota-blocked but NOT shipped — re-submitting after
-    // UTC midnight (daily) or month rollover (monthly) is the documented path,
-    // so the button must keep saying "Submit Day N" while any deferred remain.
-    const dayHasPending = today.some(w => ['planned', 'deferred'].includes(w.status));
-    $('#btn-submit-day').textContent = state.currentDay < totalDays && !dayHasPending
-      ? `Advance to Day ${state.currentDay + 1}` : `Submit Day ${state.currentDay}`;
-    if (stats.deferred > 0) {
-      $('#btn-submit-day').title =
-        `${stats.deferred} order(s) deferred (quota). Click again after UTC quota rollover to retry.`;
+    // The button acts on the VIEWED batch: submit its shippable orders, or jump
+    // to the next batch that has any. Deferred orders (quota-blocked, never
+    // sent) stay submittable — resubmit after UTC midnight (daily) or the 1st
+    // (monthly).
+    const submitBtn = $('#btn-submit-day');
+    const opens = bucket ? B.opensOn(anchorMonth(), bucket.month, new Date()) : null;
+    if (ship.length > 0 && opens) {
+      // Its calendar month hasn't started: submitting now could only defer.
+      submitBtn.textContent = `Ships from ${opens}`;
+      submitBtn.disabled = true;
+    } else if (ship.length > 0) {
+      submitBtn.textContent = `Submit ${label}`;
+      submitBtn.disabled = false;
+    } else if (next) {
+      submitBtn.textContent = 'Go to next batch to ship →';
+      submitBtn.disabled = false;
     } else {
-      $('#btn-submit-day').removeAttribute('title');
+      submitBtn.textContent = 'Nothing left to submit';
+      submitBtn.disabled = true;
+    }
+    if (stats.deferred > 0) {
+      submitBtn.title = `${stats.deferred} order(s) deferred (quota). Submit again after the UTC quota rollover to retry.`;
+    } else {
+      submitBtn.removeAttribute('title');
     }
 
     const anySubmitted = wos.some(w => w.adobe_workorder_id);
@@ -1821,39 +1972,41 @@ async function renderSubmit() {
   // debounce prevents the user from seeing two confirmation modals at all
   // and stops the server-side guard from ever needing to engage.
   onClickGuarded($('#btn-submit-day'), async () => {
-    const today = state.workOrders.filter(w => w.day_index === state.currentDay);
-    if (today.every(w => !['planned', 'deferred'].includes(w.status))) {
-      if (state.currentDay < totalDays) state.currentDay++;
-      await refresh();
+    const { bucket } = viewedBatch();
+    const ship = B.submittable(bucket);
+    if (ship.length === 0) {
+      viewBatch(B.firstPendingBucket(state.workOrders));
+      return;
+    }
+    const opens = B.opensOn(anchorMonth(), bucket.month, new Date());
+    if (opens) {
+      showToast(`This batch is in a later month — it can be submitted from ${opens}.`, { kind: 'warn' });
       return;
     }
 
-    // Phase 2: pre-submit confirmation modal with current org quota.
-    // The submit endpoint will also re-fetch quota on the server before
-    // shipping, so the modal numbers + the server's decision use the same
-    // source of truth.
-    const wosToSubmit = today.filter(w => ['planned', 'deferred'].includes(w.status));
-    const monthLabel = `Month ${wosToSubmit[0]?.month_index ?? 1}`;
-    const dayLabel   = `Day ${state.currentDay}`;
+    // Confirmation lists exactly what will be POSTed: these work-order IDs.
+    // The server ships only those still waiting (planned/deferred), each gated
+    // by the quota ledger; it never swaps in a different batch.
+    const batchLabel = B.bucketLabel(bucket, anchorMonth());
     const ok = await showSubmitModal({
-      wosToSubmit,
-      monthLabel, dayLabel,
+      wosToSubmit: ship,
+      batchLabel,
       quota: state.orgQuota,   // last known; server will refresh independently
     });
     if (!ok) {
-      logActivity('info', `Submission for ${dayLabel} cancelled`);
+      logActivity('info', `Submission for ${batchLabel} cancelled`);
       return;
     }
 
-    logActivity('info', `Starting submission for ${dayLabel} of ${monthLabel}…`);
+    logActivity('info', `Starting submission for ${batchLabel} (${ship.length} work orders)…`);
     try {
-      await http('POST', `/jobs/${state.job.id}/submit`, {
-        dayIndex:   state.currentDay,
-        monthIndex: wosToSubmit[0]?.month_index ?? null,
-      });
+      await http('POST', `/jobs/${state.job.id}/submit`, { workOrderIds: ship.map(w => w.id) });
+      state.submitTrackIds = ship.map(w => w.id);   // keep showing THIS batch while it ships
       logActivity('info', 'Submission started server-side');
     } catch (err) {
+      // e.g. 409 submission_in_progress: the previous batch is still being sent.
       logActivity('error', 'Submission request failed: ' + err.message);
+      showToast(`Not submitted: ${err.message}`, { kind: 'error', durationMs: 9000 });
     }
   });
   $('#btn-goto-monitor').addEventListener('click', () => goto('monitor'));
@@ -1862,8 +2015,17 @@ async function renderSubmit() {
   // the operator toggle/edit, and shows "next run" + last-run summary.
   void initAutoResumePanel();
 
+  // Never overlap polls: if the server is slow, skip a tick instead of stacking
+  // requests behind each other (each one also re-renders the whole tab).
+  let refreshing = false;
+  const pollRefresh = async () => {
+    if (refreshing) return;
+    refreshing = true;
+    try { await refresh(); } catch (err) { console.warn('submit tab refresh failed', err); }
+    finally { refreshing = false; }
+  };
   if (submitPollTimer) clearInterval(submitPollTimer);
-  submitPollTimer = setInterval(refresh, 2000);
+  submitPollTimer = setInterval(pollRefresh, 2000);
   state.pollTimer = submitPollTimer;
 }
 
@@ -2747,7 +2909,7 @@ async function showPlanModal(plan) {
 // Pre-submit consumption check. Always shown — the operator confirms each
 // destructive submission with the current quota numbers + planned count.
 // Returns true if the operator clicks "Submit", false otherwise.
-async function showSubmitModal({ wosToSubmit, monthLabel, dayLabel, quota }) {
+async function showSubmitModal({ wosToSubmit, batchLabel, quota }) {
   const ids = wosToSubmit.reduce((s, w) => s + w.identifier_count, 0);
   const dRem = quota?.daily?.remaining;
   const mRem = quota?.monthly?.remaining;
@@ -2762,7 +2924,8 @@ async function showSubmitModal({ wosToSubmit, monthLabel, dayLabel, quota }) {
 
   const bodyHtml = `
     <p>About to submit <b>${wosToSubmit.length} work order${wosToSubmit.length === 1 ? '' : 's'}</b>
-       (<b>${ids.toLocaleString()} identifiers</b>) for <b>${escape(monthLabel)}</b> · <b>${escape(dayLabel)}</b>.</p>
+       (<b>${ids.toLocaleString()} identifiers</b>) — batch <b>${escape(batchLabel)}</b>.
+       Exactly these work orders are sent; any that can't fit today's or this month's quota are deferred, never swapped for others.</p>
 
     <div class="modal-quota">
       <div>

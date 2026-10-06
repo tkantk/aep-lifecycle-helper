@@ -35,3 +35,4 @@ CLAUDE.md
 # (not docs/DESIGN_DOC.docx) stops a plain `npm run docs:docx` rebuild from
 # clobbering the branded deliverable.
 dist/
+/graphify-out
