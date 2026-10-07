@@ -45,6 +45,7 @@
       <div class="nav-group">
         <div class="nav-label">IDENTITIES</div>
         <button class="nav-item" data-step="expand"><span class="ico">◎</span>Expansion</button>
+        <button class="nav-item" data-step="analysis"><span class="ico">◇</span>Analysis</button>
         <button class="nav-item" data-step="plan"><span class="ico">▤</span>Batch Planning</button>
       </div>
       <div class="nav-group">
@@ -238,6 +239,19 @@
           </div>
           <span class="f-hint">What kind of identifiers are in the CSV.</span>
         </label>
+        <fieldset class="choice-cards" id="expansion-mode">
+          <legend>Identity expansion</legend>
+          <label class="choice-card selected">
+            <input type="radio" name="expansion-mode" value="cluster" checked>
+            <span class="choice-title">Expand through the Identity Graph <span class="choice-tag">Recommended</span></span>
+            <span class="choice-desc">Finds every identity linked to each uploaded ID (email, ECID, phone, …) so whole profiles can be deleted, and lets you review shared clusters on the Analysis tab.</span>
+          </label>
+          <label class="choice-card">
+            <input type="radio" name="expansion-mode" value="none">
+            <span class="choice-title">Uploaded IDs only</span>
+            <span class="choice-desc">Skips the Identity Graph — only the IDs in the file can be deleted. Profiles stay reachable through their other identities.</span>
+          </label>
+        </fieldset>
         <label class="dropzone" id="dz" style="margin-top:12px">
           <input id="file-input" type="file" accept=".csv,.txt,.tsv" hidden>
           <div class="dz-ico">↑</div>
@@ -259,6 +273,8 @@
           <p>Your source identifier is only <i>one</i> identity node. Deleting it alone leaves the
             profile intact via other linked namespaces (email, phone, ECID, CRMID, etc.).
             Full deletion requires resolving the <b>identity cluster</b>.</p>
+          <p>Choose <b>Uploaded IDs only</b> when exactly the IDs in the file must be deleted and nothing else —
+            the Identity Graph is not called and the job can only be planned that way.</p>
         </div>
       </div>
     </div>
@@ -277,6 +293,7 @@
           <button class="btn btn-danger" id="btn-delete-job" title="Permanently delete this job and all its data">🗑 Delete Job</button>
           <div class="spacer"></div>
           <button class="btn btn-secondary" id="btn-export-csv" hidden>Export CSV</button>
+          <button class="btn btn-secondary" id="btn-goto-analysis" data-goto="analysis" hidden>Review Analysis →</button>
           <button class="btn btn-primary" id="btn-goto-plan" hidden>Plan Work Orders →</button>
         </div>
       </div>
@@ -295,6 +312,38 @@
           <div class="metric"><span>Concurrency</span><b>5</b></div>
           <div class="metric"><span>Batch size</span><b>1,000</b></div>
           <div class="metric"><span>Target</span><b>~5k IDs/sec</b></div>
+        </div>
+      </div>
+    </div>
+  </template>
+
+  <template id="tpl-analysis">
+    <div class="grid-2">
+      <div class="card">
+        <div class="section">
+          <div class="section-head">Shared-cluster analysis</div>
+          <div class="section-sub">Which uploaded IDs share an Identity Graph cluster with other profiles or identities — a review report only; nothing is deleted from this tab</div>
+        </div>
+        <div id="analysis-body"></div>
+        <div class="actions">
+          <button class="btn btn-secondary" data-goto="expand">← Back</button>
+          <div class="spacer"></div>
+          <button class="btn btn-primary" id="btn-analysis-to-plan" data-goto="plan" hidden>Plan Work Orders →</button>
+        </div>
+      </div>
+      <div>
+        <div class="panel drill-panel" id="analysis-drill" hidden></div>
+        <div class="panel">
+          <div class="panel-title">Categories</div>
+          <p><span class="cat-badge source_only">Only itself</span> the cluster holds nothing but the uploaded ID.</p>
+          <p><span class="cat-badge linked">Linked identities</span> other identities (email, ECID, …) but no other profile.</p>
+          <p><span class="cat-badge merged_in_list">Merged · in your list</span> the cluster also holds other uploaded IDs of this job.</p>
+          <p><span class="cat-badge merged_outside_list">⚠ Merged · not in list</span> the cluster holds a profile that is <b>not</b> in your upload. Deleting with linked identities also deletes that profile's identities.</p>
+        </div>
+        <div class="panel">
+          <div class="panel-title">Downloads</div>
+          <p><b>Summary CSV</b> — one row per uploaded ID: category, cluster size, other profiles, and a count per namespace.</p>
+          <p><b>Detail CSV</b> — every identity of the flagged IDs (or of the category you filtered on), with its relation to the uploaded ID.</p>
         </div>
       </div>
     </div>
@@ -320,6 +369,12 @@
           <p>Work orders are grouped by namespace and day-assigned so the submission respects the
             <b>daily identifier cap</b> (default 1M/day).</p>
           <p>If the job spans multiple days, re-run submission each UTC day.</p>
+        </div>
+        <div class="panel">
+          <div class="panel-title">What gets deleted</div>
+          <p><b>Uploaded IDs + linked identities</b> — each uploaded ID's whole Identity Graph cluster, so the profile is fully removed.</p>
+          <p><b>Uploaded IDs only</b> — exactly the uploaded IDs; linked identities are kept.</p>
+          <p>The choice can change by re-planning only until the first batch is submitted.</p>
         </div>
       </div>
     </div>
@@ -464,6 +519,7 @@
   <div id="toast-container" class="toast-container"></div>
 
   <script src="/buckets.js"></script>
+  <script src="/jobview.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

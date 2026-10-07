@@ -1,13 +1,14 @@
 import { Router } from 'express';
-import { q, prepareStreamIdentitiesBySource } from '../db.js';
-import { planWorkOrders, runSubmission, summarizeNamespaceGroups, assertPlannable, isSubmissionInFlight } from '../runner/submission.js';
+import { q } from '../db.js';
+import { planWorkOrders, runSubmission, summarizeNamespaceGroups, assertPlannable, isSubmissionInFlight, resolvePlanScope } from '../runner/submission.js';
 import { reconcileJobOrphans, releaseAbsentOrphan, resumeExpansionForJob, retryRejectedWorkOrder } from '../runner/recovery.js';
 import { isWorkOrderReconciling } from '../runner/postingState.js';
 import { peek as peekQuota } from '../services/quotaManager.js';
 import { getOrgQuota } from '../services/quotaApi.js';
 import { decryptCreds } from '../utils/crypto.js';
 import { liveProgress } from '../runner/expansion.js';
-import { writeCsv } from '../utils/csv.js';
+import { registerAnalysisRoutes } from './analysisRoutes.js';
+import { exportIdentitiesCsv } from '../runner/identityExport.js';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { registerUuidParamGuards, UUID_RE } from '../middleware/security.js';
@@ -16,6 +17,7 @@ import fs from 'node:fs';
 
 const router = Router();
 registerUuidParamGuards(router);   // :id is the job UUID (used by /export, /plan, /submit, etc.)
+registerAnalysisRoutes(router);    // /:id/analysis* — identity analysis (2026-10-06)
 
 router.get('/', (req, res, next) => {
   try {
@@ -118,6 +120,10 @@ router.post('/:id/plan', async (req, res, next) => {
     // Refuse BEFORE contacting Adobe when expansion hasn't finished (fix 4).
     // planWorkOrders enforces the same rule; this just fails fast.
     assertPlannable(job);
+    // Scope (2026-10-06): validated up front too — an unknown value is a 400,
+    // and "linked identities" on an expansion-off job is a 409 scope_unavailable.
+    const scope = req.body?.scope;
+    resolvePlanScope(job, scope);
 
     // Fetch live quota. If the credential is gone, fall back to job-row caps.
     let quota = null;
@@ -140,6 +146,7 @@ router.post('/:id/plan', async (req, res, next) => {
       dailyLimit: job.daily_limit,
       targetServices: job.target_services_json ? JSON.parse(job.target_services_json) : null,
       quota,
+      scope,
     });
     res.json({ ...result, quota });
   } catch (err) {
@@ -394,21 +401,14 @@ router.post('/:id/work-orders/:woId/retry-rejected', (req, res, next) => {
  *  can't collide on the shared cached Statement's single-iterator-per-stmt
  *  rule in better-sqlite3 ("This statement is busy executing a query"). */
 router.get('/:id/export', async (req, res, next) => {
+  // Built in a worker thread on its own read-only connection (2026-10-06):
+  // SQLite groups every stored row before the first one — minutes on a large
+  // job — and on the main thread that froze the server (and, iterating the
+  // main connection, made concurrent writes throw "connection is busy").
   try {
     const jobId = req.params.id;
     const outPath = path.join(config.outputDir, `job_${jobId}_identities.csv`);
-    const rows = prepareStreamIdentitiesBySource().iterate(jobId);
-    function* iter() {
-      for (const r of rows) {
-        yield {
-          source_id: r.source_id,
-          namespace_code: r.ns_code || '',
-          namespace_id: r.ns_id || '',
-          identity: r.identity_id,
-        };
-      }
-    }
-    await writeCsv(outPath, ['source_id', 'namespace_code', 'namespace_id', 'identity'], iter());
+    await exportIdentitiesCsv({ jobId, outPath });
     res.download(outPath);
   } catch (err) { next(err); }
 });

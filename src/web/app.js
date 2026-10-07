@@ -23,6 +23,7 @@ const state = {
     monthlyLimit: 3_000_000,     // fallback only — Adobe's live monthly cap wins
     sourceNamespace: 'hashedKocid',  // code; defaults to hashedKocid for backwards compat
     sourceNamespaceId: null,         // numeric nsid — filled from the namespace registry
+    expansionMode: 'cluster',        // 'cluster' (Identity Graph) | 'none' (uploaded IDs only); reset after each upload
   },
   tokenOk: false,
   identityUnlocked: false,       // true when user clicked "✏ Edit identity fields"
@@ -38,6 +39,9 @@ const state = {
   workOrders: [],
   submitView: null,              // Submit tab: { month, day } batch being viewed
   submitTrackIds: null,          // Submit tab: IDs of the batch just submitted (followed across re-labels)
+  analysis: null,                // Analysis tab: last GET /jobs/:id/analysis response
+  analysisView: null,            // Analysis tab: { jobId, category, search, sort, offset, selected }
+  planScope: null,               // Plan tab: { jobId, value } — the scope card the operator picked
   activity: [],
   pollTimer: null,
 };
@@ -105,6 +109,7 @@ const STEPS = {
   config:  { title: 'Environment Configuration', sub: 'Configure IMS credentials and sandbox for the Data Lifecycle API.', crumbs: ['Data Management', 'Environment Configuration'], render: renderConfig },
   upload:  { title: 'Upload Source Identities',  sub: 'Upload a CSV of source identifier values to be deleted.',          crumbs: ['Data Management', 'Source CSV Upload'],     render: renderUpload },
   expand:  { title: 'Identity Graph Expansion',  sub: 'Resolve all identities linked to each source identifier.',         crumbs: ['Identities', 'Identity Expansion'],         render: renderExpand },
+  analysis: { title: 'Identity Analysis',        sub: 'See which uploaded IDs share a cluster with other profiles or identities before you delete.', crumbs: ['Identities', 'Identity Analysis'], render: renderAnalysis },
   plan:    { title: 'Work Order Batch Planning', sub: 'Group identities into optimally-sized batches respecting daily quotas.', crumbs: ['Identities', 'Batch Planning'],    render: renderPlan },
   submit:  { title: 'Submit Work Orders',        sub: 'Submit record-delete work orders to the Data Hygiene API.',          crumbs: ['Data Lifecycle', 'Work Orders'],            render: renderSubmit },
   monitor: { title: 'Work Order Monitor',        sub: 'Track status of submitted work orders across downstream services.', crumbs: ['Data Lifecycle', 'Monitor'],                render: renderMonitor },
@@ -817,6 +822,32 @@ function renderUpload() {
   $('#c-source-ns').addEventListener('change', onSourceNsChange);
   $('#btn-refresh-namespaces').addEventListener('click', () => loadNamespaces(true));
 
+  // Identity expansion choice (2026-10-06). "Uploaded IDs only" is confirmed:
+  // it decides what the whole job can ever delete and can't be changed later.
+  const modeInputs = $$('input[name="expansion-mode"]');
+  const syncMode = () => {
+    const mode = state.config.expansionMode === 'none' ? 'none' : 'cluster';
+    modeInputs.forEach(i => {
+      i.checked = i.value === mode;
+      i.closest('.choice-card')?.classList.toggle('selected', i.checked);
+    });
+    $('#btn-start-expand').textContent = mode === 'none' ? 'Load Uploaded IDs →' : 'Start Identity Expansion →';
+  };
+  modeInputs.forEach(input => input.addEventListener('change', () => {
+    if (input.value === 'none' && !confirm(
+      'Delete ONLY the uploaded IDs?\n\n' +
+      'The Identity Graph will not be called, so identities linked to them (email, phone, ECID, …) ' +
+      'will NOT be deleted — the profiles stay reachable through those identities, and the Analysis ' +
+      'tab has nothing to show for this job.\n\n' +
+      'This applies to the whole job and cannot be changed after upload.')) {
+      syncMode();
+      return;
+    }
+    state.config.expansionMode = input.value;
+    syncMode();
+  }));
+  syncMode();
+
   // Fetch namespaces lazily if they weren't loaded during sandbox pick
   // (e.g. user landed here directly after a page reload).
   if (state.namespaces.length === 0 && state.credsId && state.config.sandboxName) {
@@ -869,6 +900,8 @@ async function startExpansion() {
   }
   form.append('dailyLimit', String(state.config.dailyLimit));
   form.append('monthlyLimit', String(state.config.monthlyLimit || 0));
+  const expansionMode = state.config.expansionMode === 'none' ? 'none' : 'cluster';
+  form.append('expansionMode', expansionMode);
 
   // Map the three delete-mode choices to the Adobe payload fields:
   //   'datasets'     -> datasetIds = "id1,id2,...",    no targetServices
@@ -889,7 +922,9 @@ async function startExpansion() {
 
   try {
     const res = await http('POST', '/upload', form);
-    state.job = { id: res.jobId, total_source_ids: res.totalSourceIds, status: 'expanding' };
+    state.job = { id: res.jobId, total_source_ids: res.totalSourceIds, status: 'expanding', expansion_mode: expansionMode };
+    // Every upload makes its own explicit choice — never carry "IDs only" over.
+    state.config.expansionMode = 'cluster';
     // Uploading a new CSV is an explicit "I want this one as my active job"
     // signal — clear any earlier delete-induced auto-load suppression so
     // subsequent navigations behave normally.
@@ -1007,6 +1042,8 @@ async function switchToJob(jobId) {
     state.progress = null;
     state.submitView = null;
     state.submitTrackIds = null;
+    state.analysis = null;
+    state.analysisView = null;
     // Explicit pick — clear the post-delete auto-load suppression so
     // subsequent tab navigations behave normally (auto-resume any
     // in-progress job from this point on).
@@ -1070,6 +1107,7 @@ async function renderJobsPickerInto(containerSelector, { activeJobId = null, hea
             <span>${(j.processed_count || 0).toLocaleString()} / ${(j.total_source_ids || 0).toLocaleString()} processed (${pct}%)</span>
             <span>${(j.found_count || 0).toLocaleString()} identities</span>
             <span>${new Date(j.created_at + 'Z').toLocaleString()}</span>
+            ${badgesHtml(j)}
           </div>
         </button>`;
       }).join('')}
@@ -1080,49 +1118,110 @@ async function renderJobsPickerInto(containerSelector, { activeJobId = null, hea
   });
 }
 
+// ─── Shared UI states (2026-10-06 polish) ─────────────────────────────
+// One markup for empty / loading / not-available / error panes. `body` and
+// `actionsHtml` are trusted HTML built by the caller (escape user data there).
+function stateHtml({ kind = 'empty', icon = '', title = '', body = '', actionsHtml = '' }) {
+  if (kind === 'error') {
+    return `<div class="alert error"><div style="flex:1">${title ? `<div class="alert-title">${escape(title)}</div>` : ''}${body}</div>${actionsHtml}</div>`;
+  }
+  const ico = kind === 'loading' ? '<div class="big-icon spin">↻</div>' : icon ? `<div class="big-icon">${icon}</div>` : '';
+  return `<div class="empty-state">${ico}${title ? `<div class="empty-title">${escape(title)}</div>` : ''}` +
+    `${body ? `<div>${body}</div>` : ''}${actionsHtml ? `<div class="empty-actions">${actionsHtml}</div>` : ''}</div>`;
+}
+
+// ─── Job chrome: mode badges + progress stepper (2026-10-06) ──────────
+// The decisions live in jobview.js (window.AepJobView, tested in node); this
+// only paints them. Tabs pass what they already loaded (work orders, the
+// analysis status); anything missing is fetched at most every 5 s per job.
+const jobChrome = { jobId: null, wos: null, wosAt: 0, analysis: null, analysisAt: 0 };
+function noteJobData(jobId, { wos, analysis } = {}) {
+  if (jobChrome.jobId !== jobId) Object.assign(jobChrome, { jobId, wos: null, wosAt: 0, analysis: null, analysisAt: 0 });
+  if (wos) { jobChrome.wos = wos; jobChrome.wosAt = Date.now(); }
+  if (analysis) { jobChrome.analysis = analysis; jobChrome.analysisAt = Date.now(); }
+}
+async function refreshJobChromeData(job) {
+  noteJobData(job.id);
+  if (!PLANNABLE_JOB_STATUSES.has(job.status)) return false;     // nothing to plan or analyse yet
+  const stale = (at) => Date.now() - at > 5000;
+  const tasks = [];
+  if (stale(jobChrome.wosAt)) {
+    tasks.push(http('GET', `/jobs/${job.id}/work-orders`).then(w => noteJobData(job.id, { wos: w })).catch(() => {}));
+  }
+  if (job.expansion_mode !== 'none' && stale(jobChrome.analysisAt)) {
+    tasks.push(http('GET', `/jobs/${job.id}/analysis`).then(a => noteJobData(job.id, { analysis: a })).catch(() => {}));
+  }
+  if (!tasks.length) return false;
+  await Promise.all(tasks);
+  return true;
+}
+function badgesHtml(job) {
+  return `<span class="badge-row">${window.AepJobView.badges(job)
+    .map(b => `<span class="mode-badge ${escape(b.tone)}" data-badge="${escape(b.key)}">${escape(b.label)}</span>`).join('')}</span>`;
+}
+function stepperHtml(job) {
+  const mine = jobChrome.jobId === job.id;
+  const steps = window.AepJobView.steps(job, { wos: (mine && jobChrome.wos) || [], analysis: mine ? jobChrome.analysis : null });
+  const focus = steps.find(st => st.state === 'current') || steps.find(st => st.state === 'failed');
+  return `<ol class="stepper" aria-label="Job progress">${steps.map((st, i) => {
+      const canGo = st.key !== 'upload' && st.state !== 'locked' && st.state !== 'na';
+      const dot = st.state === 'done' ? '✓' : st.state === 'failed' ? '!' : st.state === 'na' ? '–' : String(i + 1);
+      const inner = `<span class="step-dot">${dot}</span><span class="step-label">${escape(st.label)}</span>`;
+      return `<li class="step ${st.state}${st.key === state.step ? ' here' : ''}" title="${escape(st.hint)}">` +
+        (canGo ? `<button type="button" data-goto="${st.key}">${inner}</button>` : `<span>${inner}</span>`) + '</li>';
+    }).join('')}</ol>` +
+    (focus ? `<div class="stepper-hint ${focus.state}">${focus.state === 'failed' ? '⚠' : 'Next:'} <b>${escape(focus.label)}</b> — ${escape(focus.hint)}</div>` : '');
+}
+
 /**
- * Inject an "Active job: NAME · status · Switch ▾" header at the top of
- * a tab body so the operator always knows which job they're looking at
- * AND can switch to a different one without leaving the tab.
- *
- * Renders into the element with id `<tabBodyId>-active-header` if present,
- * otherwise creates one and prepends it.
+ * Inject an "Active job: NAME · status · badges · Switch" header with the job's
+ * progress stepper at the top of a tab body, so the operator always knows which
+ * job they're looking at, what it deletes, and what comes next — and can switch
+ * to a different job without leaving the tab. `data` = { wos, analysis } the tab
+ * already loaded.
  */
-function renderActiveJobHeader(tabBodyId) {
+function renderActiveJobHeader(tabBodyId, data = {}) {
   if (!state.job) return;
   const body = $('#' + tabBodyId);
   if (!body) return;
+  const job = state.job;
+  noteJobData(job.id, data);
   let header = body.querySelector('.active-job-header');
   if (!header) {
     header = document.createElement('div');
     header.className = 'active-job-header';
-    header.style.cssText = 'margin-bottom: 16px; padding: 10px 14px; background: var(--g50); border: 1px solid var(--g200); border-radius: 6px; display: flex; justify-content: space-between; align-items: center';
     body.prepend(header);
   }
-  header.innerHTML = `
-    <div style="display:flex; align-items:center; gap:10px; font-size:13px">
-      <span style="color:var(--g600)">Active job:</span>
-      <span style="font-weight:600">${escape(state.job.name || state.job.id.slice(0, 8))}</span>
-      <span class="pill ${escape(state.job.status)}">${escape(state.job.status)}</span>
-    </div>
-    <button class="btn-link" type="button"
-            style="background:none; border:none; color:var(--blue600); cursor:pointer; font-size:13px">
-      ↻ Switch job
-    </button>
-  `;
-  header.querySelector('.btn-link').addEventListener('click', async () => {
-    // Show the picker inline below the header. Click on a row swaps the
-    // active job and re-renders the tab, which rebuilds the header.
-    let popover = body.querySelector('.active-job-popover');
-    if (popover) { popover.remove(); return; }   // toggle
-    popover = document.createElement('div');
-    popover.className = 'active-job-popover';
-    popover.style.cssText = 'margin-bottom: 16px';
-    popover.id = `${tabBodyId}-picker`;
-    header.after(popover);
-    await renderJobsPickerInto('#' + popover.id, {
-      activeJobId: state.job.id, headline: 'Switch to another job',
+  const paint = () => {
+    header.innerHTML = `
+      <div class="ajh-top">
+        <div class="ajh-title">
+          <span class="ajh-label">Active job:</span>
+          <span class="ajh-name">${escape(job.name || job.id.slice(0, 8))}</span>
+          <span class="pill ${escape(job.status)}">${escape(job.status)}</span>
+          ${badgesHtml(job)}
+        </div>
+        <button class="link-btn ajh-switch" type="button">↻ Switch job</button>
+      </div>
+      ${stepperHtml(job)}`;
+    header.querySelector('.ajh-switch').addEventListener('click', async () => {
+      // Show the picker inline below the header. Click on a row swaps the
+      // active job and re-renders the tab, which rebuilds the header.
+      let popover = body.querySelector('.active-job-popover');
+      if (popover) { popover.remove(); return; }   // toggle
+      popover = document.createElement('div');
+      popover.className = 'active-job-popover';
+      popover.style.cssText = 'margin-bottom: 16px';
+      popover.id = `${tabBodyId}-picker`;
+      header.after(popover);
+      await renderJobsPickerInto('#' + popover.id, {
+        activeJobId: state.job.id, headline: 'Switch to another job',
+      });
     });
+  };
+  paint();
+  refreshJobChromeData(job).then(changed => {
+    if (changed && header.isConnected && state.job?.id === job.id) paint();
   });
 }
 
@@ -1309,6 +1408,7 @@ async function renderExpand() {
 
     $('#btn-export-csv').hidden = !done || total === 0;
     $('#btn-goto-plan').hidden = !done;
+    $('#btn-goto-analysis').hidden = !done || state.job.expansion_mode === 'none';
 
     onClickGuarded($('#btn-resume-expansion'), async () => {
       try {
@@ -1325,6 +1425,366 @@ async function renderExpand() {
   await render();
   if (state.job.status === 'expanding') {
     state.pollTimer = setInterval(render, 1500);
+  }
+}
+
+// ─── Analysis (2026-10-06) ────────────────────────────────────────────
+// Review-only report of who else is in each uploaded ID's Identity Graph
+// cluster (server: runner/analysis.js + routes/analysisRoutes.js). Nothing on
+// this tab changes the job, its plan or its work orders. Built automatically
+// after a cluster expansion; never for an expansion-off job.
+const ANALYSIS_CATS = [
+  { key: 'source_only',         label: 'Only itself',            hint: 'Nothing else in its cluster' },
+  { key: 'linked',              label: 'Linked identities',      hint: 'Other identities, no other profile' },
+  { key: 'merged_in_list',      label: 'Merged · in your list',  hint: 'Shares a cluster with other uploaded IDs' },
+  { key: 'merged_outside_list', label: '⚠ Merged · not in list', hint: 'Shares a cluster with a profile you did not upload' },
+];
+const ANALYSIS_PAGE = 50;
+const fmtNum = (n) => Number(n || 0).toLocaleString();
+function analysisCatLabel(key) {
+  return (ANALYSIS_CATS.find(c => c.key === key) || { label: key || 'Not analysed' }).label;
+}
+// Filter / paging state for the table — kept per job while the tab is revisited.
+function analysisView() {
+  if (!state.analysisView || state.analysisView.jobId !== state.job?.id) {
+    state.analysisView = { jobId: state.job?.id, category: 'all', search: '', sort: 'size', offset: 0, seq: 0, selected: null };
+  }
+  return state.analysisView;
+}
+const onAnalysisTab = (jobId) => state.step === 'analysis' && state.job?.id === jobId;
+
+async function renderAnalysis() {
+  $('#analysis-body').innerHTML = stateHtml({ kind: 'loading', body: 'Looking for active job…' });
+  await ensureActiveJobLoaded();
+  if (state.step !== 'analysis') return;
+  if (!state.job) { await renderJobsPickerInto('#analysis-body', { activeJobId: null }); return; }
+  const jobId = state.job.id;
+  let a;
+  try {
+    a = await http('GET', `/jobs/${jobId}/analysis`);
+  } catch (err) {
+    if (!onAnalysisTab(jobId)) return;
+    $('#analysis-body').innerHTML = `<div class="alert error"><div><div class="alert-title">Could not load the analysis</div>${escape(err.message)}</div></div>`;
+    renderActiveJobHeader('analysis-body');
+    return;
+  }
+  if (!onAnalysisTab(jobId)) return;
+  state.analysis = a;
+  $('#btn-analysis-to-plan').hidden = !PLANNABLE_JOB_STATUSES.has(state.job.status);
+
+  if (a.status === 'ready' && a.summary) renderAnalysisReady(a);
+  else if (a.status === 'building') renderAnalysisBuilding(a);
+  else if (!a.available) {
+    const off = state.job.expansion_mode === 'none';
+    $('#analysis-body').innerHTML = stateHtml({
+      icon: off ? '—' : '◎',
+      title: off ? 'No clusters to analyse' : 'Not available yet',
+      body: escape(a.reason || ''),
+      actionsHtml: off ? '<button class="btn btn-primary" data-goto="plan">Plan Work Orders →</button>'
+                       : '<button class="btn btn-secondary" data-goto="expand">Go to Expansion</button>',
+    });
+  } else if (a.status === 'failed') {
+    $('#analysis-body').innerHTML = `
+      <div class="alert error">
+        <div style="flex:1"><div class="alert-title">The analysis build failed</div>${escape(a.error || 'Unknown error')}
+          <div style="margin-top:6px">It is a review report only — planning and submitting are not affected.</div></div>
+        <button class="btn btn-primary" id="btn-rebuild-analysis" style="align-self:center; white-space:nowrap">↻ Rebuild</button>
+      </div>`;
+  } else {
+    $('#analysis-body').innerHTML = stateHtml({
+      icon: '◇',
+      title: 'No analysis yet',
+      body: 'Build a report of which uploaded IDs share a cluster with other profiles or identities.<br>' +
+        'It reads the expanded identities only — nothing is sent to Adobe and nothing is deleted.',
+      actionsHtml: '<button class="btn btn-primary" id="btn-build-analysis">Build analysis</button>',
+    });
+  }
+  renderActiveJobHeader('analysis-body', { analysis: a });
+  onClickGuarded($('#btn-build-analysis'), startAnalysisBuild, { loadingText: 'Starting…' });
+  onClickGuarded($('#btn-rebuild-analysis'), startAnalysisBuild, { loadingText: 'Starting…' });
+}
+
+async function startAnalysisBuild() {
+  try {
+    await http('POST', `/jobs/${state.job.id}/analysis`);
+    showToast('Building the analysis — this page updates as it runs.', { kind: 'info' });
+  } catch (err) {
+    if (!(err.status === 409 && err.data?.error === 'analysis_running')) {
+      showToast(`Could not build the analysis: ${err.message}`, { kind: 'error' });
+      return;
+    }
+  }
+  if (state.step === 'analysis') await renderAnalysis();
+}
+
+function renderAnalysisBuilding(a) {
+  const jobId = state.job.id;
+  const paint = (x) => {
+    const total = x.sourcesTotal || 0;
+    const pct = total ? Math.min(100, Math.floor((x.sourcesDone || 0) / total * 100)) : 0;
+    $('#analysis-body').innerHTML = `
+      <div class="progress-head"><b>Building the analysis…</b>
+        <span class="count">${fmtNum(x.sourcesDone)} / ${fmtNum(total)} uploaded IDs (${pct}%)</span></div>
+      <div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>
+      <div class="f-hint" style="margin-top:10px">Runs in the background — you can leave this tab; planning and submitting are not blocked.</div>`;
+    renderActiveJobHeader('analysis-body', { analysis: x });
+  };
+  paint(a);
+  if (state.pollTimer) return;
+  let busy = false;
+  state.pollTimer = setInterval(async () => {
+    if (busy) return;                     // never overlap polls on a slow server
+    busy = true;
+    try {
+      const next = await http('GET', `/jobs/${jobId}/analysis`);
+      if (!onAnalysisTab(jobId)) return;
+      if (next.status === 'building') paint(next);
+      else {
+        clearInterval(state.pollTimer); state.pollTimer = null;
+        await renderAnalysis();
+      }
+    } catch { /* transient — keep polling */ }
+    finally { busy = false; }
+  }, 2000);
+}
+
+function nsCountsHtml(counts) {
+  const entries = Object.entries(counts || {}).sort((x, y) => y[1] - x[1]);
+  if (!entries.length) return '<span class="muted">—</span>';
+  const shown = entries.slice(0, 3).map(([ns, n]) =>
+    `<span class="ns-count"><span class="ns-badge ${nsClass(ns)}">${escape(ns)}</span> ${fmtNum(n)}</span>`).join(' ');
+  return shown + (entries.length > 3 ? ` <span class="muted">+${entries.length - 3} more</span>` : '');
+}
+
+function renderAnalysisReady(a) {
+  const s = a.summary;
+  const view = analysisView();
+  const total = s.sources || 0;
+  const share = (n) => (total ? `${(n / total * 100).toFixed(n > 0 && n / total < 0.001 ? 2 : 1)}%` : '0%');
+  const outside = s.byCategory.merged_outside_list || 0;
+  const nsRows = Object.entries(s.byNamespace || {}).sort((x, y) => y[1] - x[1]);
+  const nsTotal = nsRows.reduce((t, [, n]) => t + n, 0);
+  const srcNs = state.job.source_namespace || 'uploaded ID';
+  const chips = [{ key: 'all', label: 'All', n: total }]
+    .concat(ANALYSIS_CATS.map(c => ({ key: c.key, label: c.label, n: s.byCategory[c.key] || 0 })));
+
+  $('#analysis-body').innerHTML = `
+    <div class="analysis-meta">
+      <span>Built ${escape(formatRelativeTime(a.finishedAt))} · ${fmtNum(total)} uploaded IDs · ${fmtNum(s.identities)} distinct identities in their clusters</span>
+      <button class="link-btn" id="btn-rebuild-analysis" type="button" ${a.available ? '' : 'disabled'}>↻ Rebuild</button>
+    </div>
+    ${outside > 0 ? `
+    <div class="alert warning" id="analysis-callout">
+      <div style="flex:1"><div class="alert-title">${fmtNum(outside)} uploaded ID${outside === 1 ? '' : 's'} share a cluster with a profile that is NOT in your list</div>
+        ${fmtNum(s.otherProfiles.notInList)} such profile${s.otherProfiles.notInList === 1 ? '' : 's'} in total. Planning with
+        <b>linked identities</b> (the default) also deletes those profiles' identities. Review them, or plan
+        <b>uploaded IDs only</b> to delete just your list.</div>
+      <button class="btn btn-secondary" id="btn-show-outside" style="align-self:center; white-space:nowrap">Show these IDs</button>
+    </div>` : `
+    <div class="alert success" id="analysis-callout-ok"><div>No uploaded ID shares a cluster with a profile outside your list.</div></div>`}
+    <div class="cat-cards">
+      ${ANALYSIS_CATS.map(c => {
+        const n = s.byCategory[c.key] || 0;
+        return `<button type="button" class="cat-card ${c.key}${view.category === c.key ? ' active' : ''}${c.key === 'merged_outside_list' && n > 0 ? ' warn' : ''}" data-cat="${c.key}" title="${escape(c.hint)}">
+          <span class="cat-card-label">${escape(c.label)}</span>
+          <span class="cat-card-n">${fmtNum(n)}</span>
+          <span class="cat-card-sub">${share(n)} of uploaded IDs</span>
+        </button>`;
+      }).join('')}
+    </div>
+    <div class="stat-grid">
+      <div class="stat"><div class="stat-label">Other profiles · in your list</div><div class="stat-value">${fmtNum(s.otherProfiles.inList)}</div><div class="stat-sub">merged with another uploaded ID</div></div>
+      <div class="stat${s.otherProfiles.notInList ? ' warn' : ''}"><div class="stat-label">Other profiles · not in list</div><div class="stat-value">${fmtNum(s.otherProfiles.notInList)}</div><div class="stat-sub">also deleted with linked identities</div></div>
+      <div class="stat"><div class="stat-label">Linked identities</div><div class="stat-value">${fmtNum(nsTotal)}</div><div class="stat-sub">summed over the uploaded IDs</div></div>
+    </div>
+    ${nsRows.length ? `
+    <details class="ns-dist">
+      <summary>Linked identities by namespace (${nsRows.length})</summary>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Namespace</th><th class="num">Count</th><th class="num">Share</th><th>Distribution</th></tr></thead>
+        <tbody>${nsRows.map(([ns, n]) => `<tr>
+          <td><span class="ns-badge ${nsClass(ns)}">${escape(ns)}</span></td>
+          <td class="num">${fmtNum(n)}</td><td class="num">${(n / nsTotal * 100).toFixed(1)}%</td>
+          <td><div class="progress-bar" style="width:120px"><div class="progress-fill" style="width:${(n / nsTotal * 100).toFixed(1)}%; background:${nsColor(ns)}"></div></div></td>
+        </tr>`).join('')}</tbody>
+      </table></div>
+    </details>` : ''}
+    <div class="section analysis-list-head">
+      <div><div class="section-head">Uploaded IDs</div><div class="section-sub">Click a row to see every identity in its cluster.</div></div>
+      <div class="analysis-dl">
+        <button class="btn btn-secondary btn-sm" id="btn-dl-summary" type="button">⤓ Summary CSV</button>
+        <button class="btn btn-secondary btn-sm" id="btn-dl-detail" type="button">⤓ Detail CSV</button>
+      </div>
+    </div>
+    <div class="analysis-controls">
+      <div class="filter-chips" role="tablist">
+        ${chips.map(c => `<button type="button" class="filter-chip${view.category === c.key ? ' active' : ''}" data-cat="${c.key}">${escape(c.label)} <span class="n">${fmtNum(c.n)}</span></button>`).join('')}
+      </div>
+      <div class="analysis-search-row">
+        <input type="search" id="analysis-search" placeholder="Find a ${escape(srcNs)} (exact or prefix)" value="${escape(view.search)}" maxlength="512" autocomplete="off" spellcheck="false">
+        <select id="analysis-sort" aria-label="Sort">
+          <option value="size"${view.sort === 'size' ? ' selected' : ''}>Largest clusters first</option>
+          <option value="id"${view.sort === 'id' ? ' selected' : ''}>By ID</option>
+        </select>
+      </div>
+    </div>
+    <div class="table-wrap tall">
+      <table id="analysis-table">
+        <thead><tr><th>${escape(srcNs)}</th><th>Category</th><th class="num">Identities</th><th>Other profiles</th><th>Linked namespaces</th></tr></thead>
+        <tbody id="analysis-rows"><tr><td colspan="5" class="table-msg">Loading…</td></tr></tbody>
+      </table>
+    </div>
+    <div class="pager" id="analysis-pager"></div>`;
+  renderActiveJobHeader('analysis-body', { analysis: a });
+
+  const setCategory = (cat) => {
+    view.category = cat; view.offset = 0;
+    $$('#analysis-body .filter-chip, #analysis-body .cat-card').forEach(el => el.classList.toggle('active', el.dataset.cat === cat));
+    updateAnalysisDownloads();
+    loadAnalysisRows();
+  };
+  $$('#analysis-body .filter-chip, #analysis-body .cat-card').forEach(el =>
+    el.addEventListener('click', () => setCategory(view.category === el.dataset.cat && el.classList.contains('cat-card') ? 'all' : el.dataset.cat)));
+  $('#btn-show-outside')?.addEventListener('click', () => {
+    setCategory('merged_outside_list');
+    $('#analysis-table')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+  let searchTimer = null;
+  $('#analysis-search').addEventListener('input', (ev) => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => { view.search = ev.target.value.trim(); view.offset = 0; loadAnalysisRows(); }, 300);
+  });
+  $('#analysis-sort').addEventListener('change', (ev) => { view.sort = ev.target.value; view.offset = 0; loadAnalysisRows(); });
+  const tbody = $('#analysis-rows');
+  tbody.addEventListener('click', (ev) => {
+    const tr = ev.target.closest('tr[data-source]');
+    if (tr) openAnalysisDrill(tr.dataset.source);
+  });
+  tbody.addEventListener('keydown', (ev) => {
+    const tr = ev.target.closest('tr[data-source]');
+    if (tr && (ev.key === 'Enter' || ev.key === ' ')) { ev.preventDefault(); openAnalysisDrill(tr.dataset.source); }
+  });
+  onClickGuarded($('#btn-rebuild-analysis'), startAnalysisBuild, { loadingText: 'Starting…' });
+  bindAnalysisDownloads();
+  updateAnalysisDownloads();
+  loadAnalysisRows();
+}
+
+async function loadAnalysisRows() {
+  const view = analysisView();
+  const jobId = state.job.id;
+  const seq = ++view.seq;
+  const qs = new URLSearchParams({ sort: view.sort, limit: String(ANALYSIS_PAGE), offset: String(view.offset) });
+  if (view.category !== 'all') qs.set('category', view.category);
+  if (view.search) qs.set('search', view.search);
+  const tbody = $('#analysis-rows');
+  if (!tbody) return;
+  tbody.classList.add('loading');
+  let r;
+  try {
+    r = await http('GET', `/jobs/${jobId}/analysis/sources?${qs}`);
+  } catch (err) {
+    if (seq !== view.seq || !onAnalysisTab(jobId)) return;
+    tbody.classList.remove('loading');
+    tbody.innerHTML = `<tr><td colspan="5" class="table-msg error">Could not load the IDs: ${escape(err.message)}</td></tr>`;
+    return;
+  }
+  if (seq !== view.seq || !onAnalysisTab(jobId)) return;     // a newer request (or tab) won
+  tbody.classList.remove('loading');
+  tbody.innerHTML = r.rows.length ? r.rows.map(row => `
+    <tr data-source="${escape(row.source_id)}" tabindex="0"${row.source_id === view.selected ? ' class="selected"' : ''}>
+      <td class="mono">${escape(row.source_id)}</td>
+      <td><span class="cat-badge ${escape(row.category)}">${escape(analysisCatLabel(row.category))}</span></td>
+      <td class="num">${fmtNum(row.identities_total)}</td>
+      <td>${row.other_in_list || row.other_not_in_list
+        ? `${fmtNum(row.other_in_list)} in list${row.other_not_in_list ? ` · <b class="warn-text">${fmtNum(row.other_not_in_list)} not in list</b>` : ''}`
+        : '<span class="muted">—</span>'}</td>
+      <td>${nsCountsHtml(row.ns_counts)}</td>
+    </tr>`).join('')
+    : `<tr><td colspan="5" class="table-msg">${view.search ? 'No uploaded ID matches that search.' : 'No uploaded IDs in this category.'}</td></tr>`;
+
+  const pager = $('#analysis-pager');
+  const pages = Math.max(1, Math.ceil(r.total / ANALYSIS_PAGE));
+  const page = Math.floor(view.offset / ANALYSIS_PAGE) + 1;
+  const from = r.total ? view.offset + 1 : 0;
+  const to = Math.min(view.offset + r.rows.length, r.total);
+  pager.innerHTML = `
+    <span>Showing ${fmtNum(from)}–${fmtNum(to)} of ${fmtNum(r.total)}</span>
+    <span class="spacer"></span>
+    <button class="btn btn-secondary btn-sm" id="analysis-prev" ${page <= 1 ? 'disabled' : ''}>← Prev</button>
+    <span>Page ${fmtNum(page)} of ${fmtNum(pages)}</span>
+    <button class="btn btn-secondary btn-sm" id="analysis-next" ${page >= pages ? 'disabled' : ''}>Next →</button>`;
+  $('#analysis-prev').addEventListener('click', () => { view.offset = Math.max(0, view.offset - ANALYSIS_PAGE); loadAnalysisRows(); });
+  $('#analysis-next').addEventListener('click', () => { view.offset += ANALYSIS_PAGE; loadAnalysisRows(); });
+}
+
+async function openAnalysisDrill(sourceId) {
+  const panel = $('#analysis-drill');
+  if (!panel) return;
+  const view = analysisView();
+  const jobId = state.job.id;
+  view.selected = sourceId;
+  $$('#analysis-rows tr[data-source]').forEach(tr => tr.classList.toggle('selected', tr.dataset.source === sourceId));
+  panel.hidden = false;
+  panel.innerHTML = `<div class="panel-title">Cluster</div><div class="muted">Loading…</div>`;
+  let d;
+  try {
+    d = await http('GET', `/jobs/${jobId}/analysis/sources/${encodeURIComponent(sourceId)}`);
+  } catch (err) {
+    if (view.selected !== sourceId || !onAnalysisTab(jobId)) return;
+    panel.innerHTML = `<div class="panel-title">Cluster</div><div class="alert error"><div>${escape(err.message)}</div></div>`;
+    return;
+  }
+  if (view.selected !== sourceId || !onAnalysisTab(jobId)) return;
+  const groups = [['self', 'Uploaded ID'], ['other_profile', 'Other profiles'], ['linked', 'Linked identities']];
+  panel.innerHTML = `
+    <div class="drill-head"><div class="panel-title">Cluster of</div>
+      <button class="drill-close" type="button" aria-label="Close">×</button></div>
+    <div class="drill-id mono">${escape(d.source)}</div>
+    <div class="drill-meta"><span class="cat-badge ${escape(d.category || '')}">${escape(analysisCatLabel(d.category))}</span>
+      <span>${fmtNum(d.total)} identit${d.total === 1 ? 'y' : 'ies'}</span></div>
+    ${groups.map(([rel, title]) => {
+      const items = d.identities.filter(i => i.relation === rel);
+      if (!items.length) return '';
+      return `<div class="drill-group"><div class="drill-group-title">${title} <span class="muted">${fmtNum(items.length)}</span></div>
+        ${items.map(i => `<div class="drill-row">
+          <span class="ns-badge ${nsClass(i.namespace)}">${escape(i.namespace || `nsid ${i.nsid}`)}</span>
+          <span class="drill-val mono">${escape(i.value)}</span>
+          ${rel === 'other_profile' ? (i.inList ? '<span class="in-list yes">in your list</span>' : '<span class="in-list no">⚠ not in list</span>') : ''}
+        </div>`).join('')}</div>`;
+    }).join('')}
+    ${d.truncated ? `<div class="f-hint">Showing the first ${fmtNum(d.identities.length)} of ${fmtNum(d.total)}.</div>` : ''}`;
+  panel.querySelector('.drill-close').addEventListener('click', () => {
+    panel.hidden = true; view.selected = null;
+    $$('#analysis-rows tr.selected').forEach(tr => tr.classList.remove('selected'));
+  });
+  if (window.matchMedia && window.matchMedia('(max-width: 1100px)').matches) panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function analysisDownloadUrl(kind) {
+  const view = analysisView();
+  const qs = new URLSearchParams({ kind });
+  if (view.category !== 'all') qs.set('category', view.category);
+  return `${API}/jobs/${state.job.id}/analysis/export?${qs}`;
+}
+function updateAnalysisDownloads() {
+  const view = analysisView();
+  const label = view.category === 'all' ? null : analysisCatLabel(view.category).replace(/^⚠\s*/, '');
+  const sum = $('#btn-dl-summary'); const det = $('#btn-dl-detail');
+  if (sum) sum.textContent = `⤓ Summary CSV (${label || 'all IDs'})`;
+  if (det) det.textContent = `⤓ Detail CSV (${label || 'flagged IDs'})`;
+}
+// The download buttons are re-created with each report render; they read the
+// current filter at click time.
+function bindAnalysisDownloads() {
+  for (const [sel, kind] of [['#btn-dl-summary', 'summary'], ['#btn-dl-detail', 'detail']]) {
+    const btn = $(sel);
+    if (!btn || btn.dataset.bound) continue;
+    btn.dataset.bound = '1';
+    onClickGuarded(btn, async () => {
+      window.location.href = analysisDownloadUrl(kind);
+      await new Promise(r => setTimeout(r, 3000));     // no double-download on a rapid re-click
+    });
   }
 }
 
@@ -1372,42 +1832,138 @@ async function renderPlan() {
       $('#plan-body').querySelector('[data-goto]')?.addEventListener('click', () => goto('expand'));
       return;
     }
-    $('#plan-body').innerHTML = `
-      <div class="empty-state">
-        <div>No plan yet for this job.</div>
-        <button class="btn btn-primary" id="btn-build-plan" style="margin-top:16px">Build plan</button>
-      </div>`;
-    renderActiveJobHeader('plan-body');
-    // CRITICAL: duplicate Plan clicks could have raced before today's fixes.
-    // Server-side ReplanForbiddenError now guards correctness, but UI-level
-    // debounce keeps a single click from spawning two in-flight Plan calls.
-    onClickGuarded($('#btn-build-plan'), buildOrRebuildPlan, { loadingText: 'Planning…' });
+    // No plan yet: choose what to delete, then build (2026-10-06).
+    await renderScopeChooser($('#plan-body'));
+    renderActiveJobHeader('plan-body', { wos });
     return;
   }
 
   await renderPlanResults(wos);
 }
 
-async function buildOrRebuildPlan() {
+// What a plan deletes (2026-10-06): the uploaded IDs + every identity linked to
+// them (default), or only the uploaded IDs. An expansion-off job can only be
+// planned IDs-only. The server enforces both rules and keeps the current scope
+// on a re-plan that doesn't name one.
+async function renderScopeChooser(target, { replan = false } = {}) {
+  const job = state.job;
+  const off = job.expansion_mode === 'none';
+  let analysis = null;
+  if (!off) {
+    try { analysis = await http('GET', `/jobs/${job.id}/analysis`); noteJobData(job.id, { analysis }); }
+    catch { /* the estimates fall back to the job counters */ }
+  }
+  const summary = analysis?.status === 'ready' ? analysis.summary : null;
+  const est = window.AepJobView.scopeEstimates(job, summary, 100000);
+  const outside = summary?.byCategory?.merged_outside_list || 0;
+  let scope = off ? 'source_only'
+    : (state.planScope?.jobId === job.id ? state.planScope.value : (job.delete_scope || 'cluster'));
+  const card = (value, title, desc, e) => `
+    <label class="choice-card${scope === value ? ' selected' : ''}">
+      <input type="radio" name="plan-scope" value="${value}"${scope === value ? ' checked' : ''}>
+      <span class="choice-title">${title}</span>
+      <span class="choice-desc">${desc}</span>
+      <span class="choice-est">≈ ${fmtNum(e.identities)} identities · ≈ ${fmtNum(e.workOrders)} work order${e.workOrders === 1 ? '' : 's'}</span>
+    </label>`;
+  target.innerHTML = `
+    <div class="section">
+      <div class="section-head">${replan ? 'Change what this plan deletes' : 'What should this plan delete?'}</div>
+      <div class="section-sub">${off
+        ? 'Identity expansion was off for this job, so only the uploaded IDs can be deleted.'
+        : 'Both options delete every uploaded ID; they differ in what else is deleted.'}</div>
+    </div>
+    <fieldset class="choice-cards" id="plan-scope">
+      ${off ? '' : card('cluster', 'Uploaded IDs + linked identities <span class="choice-tag">Recommended</span>',
+        "Deletes each uploaded ID's whole Identity Graph cluster (email, ECID, phone, …), so the profile is fully removed.", est.cluster)}
+      ${card('source_only', 'Uploaded IDs only', off
+        ? 'Deletes exactly the IDs in the uploaded file.'
+        : 'Deletes exactly the uploaded IDs. Their linked identities are kept, so the profiles stay reachable through them.', est.sourceOnly)}
+    </fieldset>
+    <div id="plan-callout"></div>
+    <div class="actions">
+      ${replan ? '<button class="btn btn-secondary" id="btn-cancel-scope" type="button">Cancel</button>' : ''}
+      <button class="btn btn-primary" id="btn-build-plan" type="button">${replan ? 'Re-plan with this choice' : 'Build plan'}</button>
+    </div>`;
+  const paintCallout = () => {
+    const el = $('#plan-callout');
+    if (!el) return;
+    if (scope === 'cluster' && outside > 0) {
+      const profiles = summary.otherProfiles.notInList;
+      el.innerHTML = `<div class="alert warning"><div style="flex:1">
+          <div class="alert-title">${fmtNum(outside)} uploaded ID${outside === 1 ? '' : 's'} share a cluster with a profile NOT in your list</div>
+          Deleting linked identities also deletes those ${fmtNum(profiles)} profile${profiles === 1 ? "'s" : "s'"} identities.
+          Review them on the Analysis tab, or choose <b>Uploaded IDs only</b>.</div>
+        <button class="btn btn-secondary" data-goto="analysis" type="button" style="align-self:center; white-space:nowrap">Review →</button></div>`;
+    } else if (scope === 'cluster' && !summary) {
+      el.innerHTML = `<div class="alert info"><div>${analysis?.status === 'building'
+        ? 'The shared-cluster analysis is still building.'
+        : 'Tip: the Analysis tab shows which uploaded IDs share a cluster with other profiles before you delete.'}
+        <a href="#" data-goto="analysis">Open Analysis</a></div></div>`;
+    } else if (scope === 'source_only' && !off) {
+      el.innerHTML = `<div class="alert warning"><div>Linked identities (email, phone, ECID, …) will <b>not</b> be deleted —
+        the profiles stay reachable through them.</div></div>`;
+    } else {
+      el.innerHTML = '';
+    }
+  };
+  $$('input[name="plan-scope"]', target).forEach(input => input.addEventListener('change', () => {
+    scope = input.value;
+    state.planScope = { jobId: job.id, value: scope };
+    $$('.choice-card', target).forEach(c => c.classList.toggle('selected', c.querySelector('input').checked));
+    paintCallout();
+  }));
+  paintCallout();
+  // CRITICAL: duplicate Plan clicks could have raced before the 2026-05 fixes.
+  // Server-side ReplanForbiddenError guards correctness; the debounce keeps one
+  // click from spawning two in-flight Plan calls.
+  onClickGuarded($('#btn-build-plan'), () => buildOrRebuildPlan({ scope }), { loadingText: 'Planning…' });
+  $('#btn-cancel-scope')?.addEventListener('click', () => renderPlan());
+}
+
+const scopePhrase = (scope) => (scope === 'source_only' ? 'uploaded IDs only' : 'uploaded IDs + linked identities');
+
+async function buildOrRebuildPlan({ scope, restoring = false } = {}) {
+  // What the plan being replaced deletes (NULL on a plan made before scopes
+  // existed = cluster; null before the first plan) — what Cancel on a scope
+  // change goes back to.
+  const hadPlan = (state.workOrders?.length || 0) > 0 || (state.job?.planned_orders || 0) > 0;
+  const previousScope = state.job?.delete_scope || (hadPlan ? 'cluster' : null);
   $('#plan-body').innerHTML = `<div class="empty-state"><div class="big-icon spin">↻</div><div>Planning work orders…</div></div>`;
   try {
-    const plan = await http('POST', `/jobs/${state.job.id}/plan`);
+    // scope 'cluster' | 'source_only'; omitted → the server keeps the current
+    // plan's scope (or uses the job's default for a first plan).
+    const plan = await http('POST', `/jobs/${state.job.id}/plan`, scope ? { scope } : undefined);
     state.plan = plan;
+    // The server saved the new orders and their scope before answering; keep
+    // the page's idea of what the plan deletes in step with the database.
+    if (state.job && plan.scope) state.job.delete_scope = plan.scope;
 
     // Phase 2: pre-plan confirmation modal. Triggered when the plan spans
     // more than one month, or when re-planning extended the projected
-    // timeline. The operator confirms before we render the new plan and
-    // before any submission can start.
-    const shouldConfirm = (plan.months > 1) || plan.shiftedFromPrevious;
+    // timeline. NOTE the plan is already saved when it shows. A restore
+    // (below) re-creates a plan the operator had already accepted — no dialog.
+    const shouldConfirm = !restoring && ((plan.months > 1) || plan.shiftedFromPrevious);
     if (shouldConfirm) {
       const ok = await showPlanModal(plan);
       if (!ok) {
-        // Operator cancelled. Re-render the existing plan (still in DB).
-        const wos = await http('GET', `/jobs/${state.job.id}/work-orders`);
+        // Cancelling a CHANGE of what the plan deletes must not leave the new
+        // scope in place: re-plan with the previous one (allowed — nothing has
+        // shipped, or the server would have refused the change).
+        if (previousScope && previousScope !== plan.scope) {
+          showToast(`Cancelled — restoring the previous plan (${scopePhrase(previousScope)}).`, { kind: 'info' });
+          return buildOrRebuildPlan({ scope: previousScope, restoring: true });
+        }
+        // Otherwise show the saved plan, with the job re-read from the server.
+        const [wos, detail] = await Promise.all([
+          http('GET', `/jobs/${state.job.id}/work-orders`),
+          http('GET', `/jobs/${state.job.id}`),
+        ]);
+        if (detail?.job) state.job = detail.job;
         await renderPlanResults(wos);
         return;
       }
     }
+    if (restoring) showToast(`Restored the previous plan (${scopePhrase(plan.scope)}).`, { kind: 'success' });
     const [wos, detail] = await Promise.all([
       http('GET', `/jobs/${state.job.id}/work-orders`),
       http('GET', `/jobs/${state.job.id}`),
@@ -1419,6 +1975,12 @@ async function buildOrRebuildPlan() {
     if (err.status === 409 && err.data?.error === 'not_expanded') {
       $('#plan-body').innerHTML = `<div class="alert error">
         <div><div class="alert-title">Cannot plan yet</div>${escape(err.data?.message || err.message)}</div></div>`;
+      return;
+    }
+    if (err.status === 409 && err.data?.error === 'scope_unavailable') {
+      $('#plan-body').innerHTML = stateHtml({ kind: 'error', title: 'That choice is not available for this job',
+        body: escape(err.data?.message || err.message) });
+      renderActiveJobHeader('plan-body');
       return;
     }
     if (err.status === 409) {
@@ -1445,6 +2007,7 @@ async function buildOrRebuildPlan() {
   }
 }
 
+const PLAN_ROWS_SHOWN = 50;     // rows per month table before "Show all"
 async function renderPlanResults(wos, container) {
   state.workOrders = wos;
   const target = container || $('#plan-body');
@@ -1487,8 +2050,15 @@ async function renderPlanResults(wos, container) {
 
   const dailyCap   = state.config.dailyLimit   || 1_000_000;
   const monthlyCap = state.config.monthlyLimit || 0;
+  const sourceOnly = state.job?.delete_scope === 'source_only';
+  const canChangeScope = isMainBody && !replanDisabled && state.job?.expansion_mode !== 'none';
 
   target.innerHTML = `
+    <div class="plan-scope-line">
+      <span>This plan deletes</span>
+      <b>${sourceOnly ? 'the uploaded IDs only' : 'the uploaded IDs + all linked identities'}</b>
+      ${canChangeScope ? '<button class="link-btn" id="btn-change-scope" type="button">Change</button>' : ''}
+    </div>
     <div class="stat-grid">
       <div class="stat">
         <div class="stat-label">Total identities</div>
@@ -1539,8 +2109,8 @@ async function renderPlanResults(wos, container) {
         <div class="table-wrap" style="margin-top: 8px">
           <table>
             <thead><tr><th>Local ID</th><th>Day</th><th>Namespaces</th><th>Identities</th><th>Status</th></tr></thead>
-            <tbody>${m.wos.map(w => `
-              <tr>
+            <tbody>${m.wos.map((w, i) => `
+              <tr${i >= PLAN_ROWS_SHOWN ? ' class="extra-row" hidden' : ''}>
                 <td class="mono">${escape(w.id.slice(0, 8))}…</td>
                 <td><span class="day-chip">Day ${w.day_index ?? 1}</span></td>
                 <td>${w.namespaces.map(n => {
@@ -1553,6 +2123,7 @@ async function renderPlanResults(wos, container) {
             </tbody>
           </table>
         </div>
+        ${m.wos.length > PLAN_ROWS_SHOWN ? `<div class="show-all-row"><button class="link-btn" type="button" data-show-all>Show all ${m.wos.length.toLocaleString()} work orders</button></div>` : ''}
         ${!isMonth1 && hasAwaitingApproval ? `
         <div class="approval-action" style="margin: 0 14px 14px; padding: 12px; background: var(--blue50, #eff6ff); border-radius: 6px; display:flex; align-items:center; gap:12px">
           <span style="font-size:13px; flex:1">Month ${m.month} contains <b>${m.wos.filter(w => w.status === 'awaiting_approval').length}</b> work order(s) awaiting your approval before they can ship.</span>
@@ -1570,10 +2141,21 @@ async function renderPlanResults(wos, container) {
       </span>
     </div>`;
 
-  if (isMainBody) renderActiveJobHeader('plan-body');
+  if (isMainBody) renderActiveJobHeader('plan-body', { wos });
 
   const btn = target.querySelector('#btn-replan');
-  if (btn && !replanDisabled) onClickGuarded(btn, buildOrRebuildPlan, { loadingText: 'Re-planning…' });
+  // No scope sent: the server keeps the saved plan's scope — a stale tab can
+  // never switch what the plan deletes.
+  if (btn && !replanDisabled) onClickGuarded(btn, () => buildOrRebuildPlan(), { loadingText: 'Re-planning…' });
+  target.querySelector('#btn-change-scope')?.addEventListener('click', async () => {
+    await renderScopeChooser($('#plan-body'), { replan: true });
+    renderActiveJobHeader('plan-body', { wos });
+  });
+  // Long months show the first PLAN_ROWS_SHOWN orders until expanded.
+  target.querySelectorAll('[data-show-all]').forEach(b => b.addEventListener('click', () => {
+    b.closest('details')?.querySelectorAll('tr.extra-row').forEach(tr => { tr.hidden = false; });
+    b.parentElement.remove();
+  }));
 
   // Wire up "Approve Month N" buttons. Each button flips that month's
   // awaiting_approval WOs to planned, then re-renders the plan results.
@@ -1665,6 +2247,7 @@ async function renderSubmit() {
 
   const render = (wos) => {
     state.workOrders = wos;
+    noteJobData(state.job.id, { wos });
     const { buckets, index, bucket } = viewedBatch();
     const batchWos = bucket ? bucket.wos : [];
     const ship = B.submittable(bucket);
@@ -1720,7 +2303,7 @@ async function renderSubmit() {
         </table>
       </div>`;
 
-    renderActiveJobHeader('submit-body');
+    renderActiveJobHeader('submit-body', { wos });
     $('#btn-batch-prev')?.addEventListener('click', () => viewBatch(buckets[index - 1]));
     $('#btn-batch-next')?.addEventListener('click', () => viewBatch(buckets[index + 1]));
     $('#btn-batch-pending')?.addEventListener('click', () => viewBatch(next));
@@ -2439,6 +3022,7 @@ function renderSubmissionCard(r, isSelected) {
         ${completed ? `<span class="completed">${completed} completed</span>` : ''}
         ${failed ? `<span class="failed">${failed} failed</span>` : ''}
         <span>${ids} ids</span>
+        ${badgesHtml(r)}
       </div>
       <div class="sub-card-bar"><div class="sub-card-bar-fill" style="width:${pct}%"></div></div>
       <div class="sub-card-meta">
@@ -2922,7 +3506,13 @@ async function showSubmitModal({ wosToSubmit, batchLabel, quota }) {
 
   const fmt = (n) => n == null ? '—' : Number(n).toLocaleString();
 
+  const job = state.job || {};
+  const deletes = job.delete_scope === 'source_only'
+    ? 'the <b>uploaded IDs only</b> — their linked identities are kept'
+    : 'the <b>uploaded IDs and every identity linked to them</b>';
   const bodyHtml = `
+    ${state.job ? `<div class="modal-badges">${badgesHtml(state.job)}</div>` : ''}
+    <p>This plan deletes ${deletes}.</p>
     <p>About to submit <b>${wosToSubmit.length} work order${wosToSubmit.length === 1 ? '' : 's'}</b>
        (<b>${ids.toLocaleString()} identifiers</b>) — batch <b>${escape(batchLabel)}</b>.
        Exactly these work orders are sent; any that can't fit today's or this month's quota are deferred, never swapped for others.</p>

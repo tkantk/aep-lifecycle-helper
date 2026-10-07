@@ -4,7 +4,7 @@ import { submitWorkOrder, normalizeDisplayName } from '../services/hygiene.js';
 import { reserve, release, markAccepted, seedFloor } from '../services/quotaManager.js';
 import { getOrgQuota } from '../services/quotaApi.js';
 import { redistributeUnshippedOrders } from './redistributor.js';
-import { q, db, prepareStreamIdentitiesBySource, setWorkOrderSubmittingDurable } from '../db.js';
+import { q, db, prepareStreamIdentitiesBySource, prepareStreamDistinctSources, setWorkOrderSubmittingDurable } from '../db.js';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { decryptCreds } from '../utils/crypto.js';
@@ -99,10 +99,51 @@ export function assertPlannable(job) {
     `identities, and once any of them ship the rest could never be planned.`);
 }
 
-export function planWorkOrders({ jobId, datasetIds, dailyLimit, targetServices, quota = null }) {
+// What a plan deletes (2026-10-06): the uploaded IDs plus every identity linked
+// to them in the Identity Graph ('cluster' — the original behaviour), or ONLY
+// the uploaded IDs ('source_only').
+export const PLAN_SCOPES = new Set(['cluster', 'source_only']);
+
+export class PlanScopeError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'PlanScopeError';
+    this.status = 409;
+    this.code = 'scope_unavailable';
+    this.publicMessage = message;
+  }
+}
+
+/**
+ * The scope a plan for this job will use. No scope requested → the scope of
+ * the job's current plan (a re-plan never silently changes what gets
+ * deleted), else the job's default: 'cluster' (unchanged behaviour), or
+ * 'source_only' for an expansion-off job, which has no linked identities.
+ */
+export function resolvePlanScope(job, requested) {
+  if (requested === undefined || requested === null) {
+    if (PLAN_SCOPES.has(job?.delete_scope)) return job.delete_scope;
+    return job?.expansion_mode === 'none' ? 'source_only' : 'cluster';
+  }
+  if (!PLAN_SCOPES.has(requested)) {
+    const e = new Error(`scope must be one of: ${[...PLAN_SCOPES].join(', ')}`);
+    e.status = 400; e.code = 'invalid_scope'; e.publicMessage = e.message;
+    throw e;
+  }
+  if (requested === 'cluster' && job?.expansion_mode === 'none') {
+    throw new PlanScopeError(
+      'This job was uploaded with identity expansion OFF, so it only holds the uploaded IDs — ' +
+      'it can only be planned as "uploaded IDs only".');
+  }
+  return requested;
+}
+
+export function planWorkOrders({ jobId, datasetIds, dailyLimit, targetServices, quota = null, scope }) {
   // Expansion must have FINISHED (2026-10-06 fix 4): a plan built from a
   // still-running or failed expansion silently covers only part of the job.
-  assertPlannable(q().getJob.get(jobId));
+  const job = q().getJob.get(jobId);
+  assertPlannable(job);
+  const effectiveScope = resolvePlanScope(job, scope);
 
   // SAFETY: refuse to re-plan if any non-planned/non-deferred work orders exist
   // for this job. Otherwise re-running planning would re-emit work orders for
@@ -225,12 +266,23 @@ export function planWorkOrders({ jobId, datasetIds, dailyLimit, targetServices, 
   // Use a fresh Statement (not the cached one) so a concurrent export
   // request can't collide with us, and vice versa. See the rationale on
   // prepareStreamIdentitiesBySource in db.js.
-  for (const row of prepareStreamIdentitiesBySource().iterate(jobId)) {
-    if (row.source_id !== bundleSourceId) {
+  if (effectiveScope === 'source_only') {
+    // Uploaded IDs only: each distinct source ID is one identity in the job's
+    // source namespace (code + the registry nsid when known) — never a linked
+    // identity. One-row bundles through the same packing as the cluster path.
+    for (const { source_id } of prepareStreamDistinctSources().iterate(jobId)) {
+      bundle.push({ ns_code: job.source_namespace, ns_id: job.source_namespace_id ?? null,
+        identity_id: source_id, source_id });
       commitBundle();
-      bundleSourceId = row.source_id;
     }
-    bundle.push(row);
+  } else {
+    for (const row of prepareStreamIdentitiesBySource().iterate(jobId)) {
+      if (row.source_id !== bundleSourceId) {
+        commitBundle();
+        bundleSourceId = row.source_id;
+      }
+      bundle.push(row);
+    }
   }
   commitBundle();
   flushOrder();
@@ -240,6 +292,7 @@ export function planWorkOrders({ jobId, datasetIds, dailyLimit, targetServices, 
       q().insertWorkOrder.run(row);
       q().setWorkOrderNsSummary.run(nsSummaryJson, row.id);
     }
+    q().setJobDeleteScope.run(effectiveScope, jobId);
   })();
 
   q().setPlannedOrders.run(planned, jobId);
@@ -271,6 +324,7 @@ export function planWorkOrders({ jobId, datasetIds, dailyLimit, targetServices, 
 
   return {
     planned,
+    scope: effectiveScope,
     days: distribution.days,                          // days within the last month
     months: distribution.months,                      // total months
     perMonthCounts: distribution.perMonthCounts,      // identifiers per month

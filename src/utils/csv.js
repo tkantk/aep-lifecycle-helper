@@ -166,6 +166,35 @@ function sanitiseRow(row) {
 }
 
 /**
+ * Stream CSV straight to a writable (an HTTP response). Header cells and every
+ * value go through the formula-injection sanitiser. `rows` is a sync or async
+ * iterable of ARRAYS in header order. Honours back-pressure and stops early
+ * when the writable closes (the client went away). Resolves once flushed.
+ */
+export async function streamCsv(writable, headers, rows) {
+  const csv = format({ headers: headers.map(sanitiseCsvValue), writeHeaders: true, alwaysWriteHeaders: true });
+  csv.pipe(writable);
+  const waitForRoom = () => new Promise((resolve) => {
+    const done = () => { csv.off('drain', done); writable.off('close', done); resolve(); };
+    csv.once('drain', done);
+    writable.once('close', done);
+  });
+  try {
+    for await (const row of rows) {
+      if (writable.destroyed) break;
+      if (!csv.write(sanitiseRow(row))) await waitForRoom();
+    }
+  } finally {
+    csv.end();
+  }
+  if (writable.destroyed || writable.writableFinished) return;
+  await new Promise((resolve) => {
+    writable.once('finish', resolve);
+    writable.once('close', resolve);
+  });
+}
+
+/**
  * Write rows to CSV with streaming output. Every value is run through the
  * formula-injection sanitiser above.
  */

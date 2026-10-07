@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import multer from 'multer';
 import path from 'node:path';
+import fs from 'node:fs';
 import { v4 as uuid } from 'uuid';
 import { config } from '../config.js';
 import { q } from '../db.js';
@@ -9,6 +10,10 @@ import { runExpansion } from '../runner/expansion.js';
 import { logger } from '../utils/logger.js';
 
 const router = Router();
+
+// How a job gathers the identities to delete (2026-10-06): through the
+// Identity Graph ('cluster', default) or only the uploaded IDs ('none').
+const EXPANSION_MODES = new Set(['cluster', 'none']);
 
 // Coerce a supplied source nsid to a finite non-negative integer, or null.
 // Number("abc") is NaN, which would template into the /clusters/members body
@@ -94,10 +99,19 @@ router.post('/', uploadMiddleware, async (req, res, next) => {
       dailyLimit = config.dailyIdentifierLimit,
       monthlyLimit = config.monthlyIdentifierLimit,
       targetServices, column = 0,
+      // 'cluster' (default — expand through the Identity Graph, today's
+      // behaviour) or 'none' (store and delete ONLY the uploaded IDs).
+      expansionMode = 'cluster',
     } = req.body;
 
     if (!credsId || !sandboxName) {
       return res.status(400).json({ error: 'credsId and sandboxName are required' });
+    }
+    if (!EXPANSION_MODES.has(expansionMode)) {
+      try { await fs.promises.unlink(req.file.path); } catch { /* */ }
+      const e = new Error(`expansionMode must be one of: ${[...EXPANSION_MODES].join(', ')}`);
+      e.status = 400; e.code = 'invalid_expansion_mode'; e.publicMessage = e.message;
+      return next(e);
     }
 
     // Pre-flight: reject files that obviously aren't text CSV BEFORE we
@@ -151,6 +165,7 @@ router.post('/', uploadMiddleware, async (req, res, next) => {
     // same column (review blocker #4). Stored as the raw value (index or
     // header name); recovery re-applies the same isNaN/Number coercion.
     q().setJobSourceColumn.run(String(column), jobId);
+    q().setJobExpansionMode.run(expansionMode, jobId);
 
     // Kick off expansion in-process (fire-and-forget). Progress via /progress.
     runExpansion({

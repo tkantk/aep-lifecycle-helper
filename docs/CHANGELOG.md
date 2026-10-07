@@ -9,6 +9,101 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-10-06 — Identity analysis tab, "uploaded IDs only" deletion, job progress UI
+
+Adds a review report of which uploaded IDs share an Identity Graph cluster with other
+profiles or identities, a way to delete ONLY the uploaded IDs (chosen at upload and at
+plan time), and a clearer, state-aware UI. Defaults are unchanged: existing jobs,
+scripts and a `POST /plan` without a body behave exactly as before. Suite **334 → 382**;
+Playwright smokes 42/42 + 8/8; 6.8M-ID scale check below. A fresh whole-branch review
+(no Critical) found two Important issues, both fixed test-first (Plan-tab scope after a
+cancelled confirmation; Export CSV freezing the server).
+
+- **Backend — expansion-off jobs.** `POST /api/upload` accepts `expansionMode`
+  (`cluster` default | `none`; anything else → 400 `invalid_expansion_mode`), stored on the
+  new `jobs.expansion_mode` and never changed afterwards. With `none`, `runExpansion` still
+  validates the namespace against the registry (fail closed) and shares the waves / resume /
+  failure handling, but each batch stores only the uploaded IDs `[ns, nsid, id, id]` and
+  never calls `/identity/clusters/members`; the all-empty-graph refusal now applies to
+  cluster jobs only. Expansion also persists the registry-resolved source nsid on the job
+  when none was supplied. `src/routes/upload.js`, `src/runner/expansion.js`.
+- **Backend — plan scope.** `POST /api/jobs/:id/plan {scope}`: `cluster` (uploaded IDs +
+  every linked identity — the original behaviour) or `source_only` (each distinct uploaded
+  ID once, in the job's source namespace; index-only stream). Unknown → 400 `invalid_scope`;
+  `cluster` on an expansion-off job → 409 `scope_unavailable`. **No scope keeps the current
+  plan's scope** (`jobs.delete_scope`), so "Re-plan against live quota" can never widen an
+  IDs-only plan; a first plan defaults to `cluster` (`source_only` for expansion-off jobs).
+  The re-plan guard (I10) is unchanged — the scope can change only before anything ships.
+  `src/runner/submission.js` (`resolvePlanScope`, `PlanScopeError`), `src/db.js`.
+- **Backend — identity analysis.** `src/runner/analysis.js` classifies every uploaded ID of
+  an expanded cluster job: *only itself* / *linked identities* / *merged with other uploaded
+  IDs* / *merged with a profile NOT in the upload* (an "other profile" is another identity in
+  the source namespace — matched by nsid, else case-insensitive code). Keyset pages of 2,000
+  IDs at most, one transaction per page, a macrotask yield between pages; pages start at 250
+  IDs and are re-sized after each one to ~0.1 s of work, so a slow or cold disk never makes one
+  step long (an ID's rows are scattered across the table). Runs automatically after a
+  cluster expansion and on demand (`POST /api/jobs/:id/analysis`; 409 `analysis_unavailable`
+  / `analysis_running`). Review-only: it never touches the job, its plan or work orders; a
+  failed build marks only the analysis; a build interrupted by a restart is marked failed at
+  startup; deleting the job mid-build stops it. New tables `job_analysis`, `source_analysis`
+  (cascade with the job).
+- **Backend — analysis API + downloads.** `GET /:id/analysis`, `GET /:id/analysis/sources`
+  (category / exact-or-prefix search / size|id sort / paging; 400 `invalid_query`, 409
+  `analysis_not_ready`), `GET /:id/analysis/sources/:sourceId` (one cluster with each
+  identity's relation), `GET /:id/analysis/export?kind=summary|detail&category=` (streamed in
+  keyset chunks — 5,000 IDs when rows are read in ID (= disk) order, 500 when they are
+  scattered (a detail download, or one category), and a detail download pauses between IDs
+  after 50 ms of work; a single category walks
+  `idx_sa_job_cat_size`, largest clusters first, because in ID order a sparse category scanned
+  ~500k rows per chunk; values AND headers formula-sanitised). `src/routes/analysisRoutes.js`,
+  `streamCsv` in `src/utils/csv.js`.
+- **Backend — Export CSV never freezes the server or breaks concurrent writes.**
+  `GET /:id/export` lists each distinct identity once, so SQLite groups every stored row of the
+  job before returning the first one — minutes on a 36M-row job — and that ran on the main
+  thread (freezing a running submission's Adobe responses, the monitor and the UI, long enough
+  for request timeouts). It also iterated the main connection across file-write awaits, and
+  better-sqlite3 refuses every write on a connection with an open iterator, so concurrent
+  submit checkpoints / quota reservations / monitor updates threw "This database connection is
+  busy executing a query" (reproduced: 75 failed writes during one small export). The query and
+  the file write now run in a worker thread on their own read-only connection
+  (`src/runner/identityExport.js`, `identityExportWorker.js`, shared row format in
+  `src/utils/identityExportFormat.js`); the file is unchanged (test pins order and the
+  job-wide de-duplication).
+- **Frontend.** New **Analysis** tab: category cards, a ⚠ callout with "Show these IDs",
+  filter chips, prefix search, sort, a paged table, a cluster drill-down, Summary / Detail CSV
+  downloads, rebuild and live build progress. Upload: an "Identity expansion" choice (Identity
+  Graph | Uploaded IDs only — confirmed, reset after each upload). Plan: "What should this plan
+  delete?" cards with estimates, a callout when IDs share a cluster with profiles outside the
+  list, "Change" on an un-shipped plan. The multi-month confirmation still follows the save, so
+  **Cancel after changing the scope re-plans the previous scope** (nothing has shipped), and
+  "Re-plan against live quota" sends no scope — a stale tab can never switch what the plan
+  deletes. Every job tab: mode badges (Expansion On/Off, Scope) and
+  a progress stepper naming the next step. The submit dialog states what the plan deletes;
+  monitor and job-picker rows carry the badges; long month tables show 50 rows until expanded;
+  action bars wrap whole buttons. Pure state logic lives in `src/web/jobview.js`.
+- **Tests.** `expansionOff`, `planScope`, `analysisBuilder`, `analysisRoutes`, `webJobView`,
+  `exportOffThread`, `analysisSlowDisk` (48 new). Browser smokes in the session scratchpad: 42 checks (categories,
+  callout, filter, search, drill-down, CSVs, scope cards + callouts, IDs-only payloads read back
+  from SQLite, sticky re-plan scope, submit dialog, UI upload with confirm/decline and zero
+  Identity Graph calls, badges, stepper) + 8 for the cancelled-scope-change fix.
+- **Scale (synthetic 6.8M uploaded IDs → 33M stored identities, 23.3M distinct, dev Mac, 512 MB
+  SQLite cache).** Analysis build **13.3 min** (target was 5: it is I/O-bound — each ID's rows
+  are scattered across a 10 GB table; it runs in the background and yields between pages;
+  longest single step 559 ms, on the page holding a deliberate 150k-identity cluster) ·
+  categories 605,669 only-itself / 5,299,608 linked / 830,488 merged-in-list / 64,236
+  merged-NOT-in-list · table page, filter, prefix search, drill-down ≤ 29 ms median · Summary CSV
+  6.8M lines in 29.5 s, 0 failed concurrent writes, longest step 20 ms · the run exposed 0.8–2.6 s
+  steps in detail / single-category downloads (fixed: index walk, 500-ID chunks, pacing; slow-disk
+  tests). Re-measured at 2M IDs (database larger than the cache): build 27.9 s, longest step
+  219 ms; every download's longest step 22–157 ms; 0 failed concurrent writes · IDs-only plan: 69 work
+  orders holding exactly the 6.8M uploaded IDs (hashedKocid only, ≤100k each) in 87 s ·
+  expansion-off ingest of 6.8M IDs in 8.3 min with 0 Identity Graph calls.
+- **Rollout notes.** Back up `data/state.db` and check free disk: the analysis adds ~3–4 GB per
+  6.8M-ID job on top of ~10–12 GB of expanded identities. Run `npm test` on the prod Node
+  version (20.18) and open the Analysis tab + an Export CSV on a small job on the Windows box
+  first. Planning (cluster ~15 min, IDs-only ~1.5 min at 6.8M) and deleting a large job still
+  pause the server while they run (pre-existing) — not during a submission.
+
 ## 2026-10-06 — Batching review before the ~6.8M deletion: Submit ships exactly what was confirmed
 
 A review prompted by "batches are not created properly" ahead of a ~6.8M-profile

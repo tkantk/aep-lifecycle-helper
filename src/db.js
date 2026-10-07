@@ -219,6 +219,45 @@ export function initDb() {
       key   TEXT PRIMARY KEY,
       value TEXT NOT NULL
     );
+
+    -- Identity analysis (2026-10-06): a review-only report of each uploaded
+    -- ID's Identity Graph cluster, built in chunks by runner/analysis.js after
+    -- a cluster expansion. Never read by planning or submission.
+    --   status: 'building' | 'ready' | 'failed'
+    --   summary_json: totals for the Analysis tab (written when ready)
+    CREATE TABLE IF NOT EXISTS job_analysis (
+      job_id         TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+      status         TEXT NOT NULL,
+      sources_done   INTEGER NOT NULL DEFAULT 0,
+      sources_total  INTEGER,
+      summary_json   TEXT,
+      error          TEXT,
+      started_at     TEXT,
+      finished_at    TEXT
+    );
+    -- One row per uploaded ID of an analysed job.
+    --   category: 'source_only' | 'linked' | 'merged_in_list' | 'merged_outside_list'
+    --   identities_total: distinct identities in its cluster, incl. itself
+    --   linked_total: the same, excluding itself
+    --   ns_counts_json: {"email":2,"ECID":9,...} excluding itself
+    --   other_in_list / other_not_in_list: other source-namespace identities
+    --     (other profiles) in the cluster that are / are not uploaded IDs of this job
+    CREATE TABLE IF NOT EXISTS source_analysis (
+      job_id             TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+      source_id          TEXT NOT NULL,
+      category           TEXT NOT NULL,
+      identities_total   INTEGER NOT NULL,
+      linked_total       INTEGER NOT NULL,
+      ns_counts_json     TEXT NOT NULL,
+      other_in_list      INTEGER NOT NULL,
+      other_not_in_list  INTEGER NOT NULL,
+      PRIMARY KEY (job_id, source_id)
+    );
+    -- Paging by category (largest clusters first) and over all categories.
+    CREATE INDEX IF NOT EXISTS idx_sa_job_cat_size
+      ON source_analysis(job_id, category, identities_total DESC, source_id);
+    CREATE INDEX IF NOT EXISTS idx_sa_job_size
+      ON source_analysis(job_id, identities_total DESC, source_id);
   `);
 
   // ─── Additive migrations for existing DBs ─────────────────────────────
@@ -290,6 +329,17 @@ export function initDb() {
     // means anchor + (N-1) calendar months. Stamped at plan time; NULL on jobs
     // planned earlier (the redistributor derives + persists one on first use).
     { table: 'jobs', column: 'plan_anchor_month', type: 'TEXT' },
+    // 2026-10-06 (analysis + IDs-only): how the job's identities were gathered.
+    // 'cluster' = today's Identity Graph expansion (default — existing jobs and
+    // callers are unchanged); 'none' = the Identity Graph is skipped and only the
+    // uploaded IDs are stored (operator chose "delete only the uploaded IDs").
+    // Set once at upload; never changed afterwards.
+    { table: 'jobs', column: 'expansion_mode', type: "TEXT NOT NULL DEFAULT 'cluster'" },
+    // 2026-10-06: what the current plan deletes — 'cluster' (uploaded IDs + all
+    // linked identities) or 'source_only' (uploaded IDs only). Written by
+    // planWorkOrders with the work orders; NULL on jobs planned before this
+    // column existed (they were planned as 'cluster').
+    { table: 'jobs', column: 'delete_scope', type: 'TEXT' },
   ];
   for (const { table, column, type } of additiveColumns) {
     try {
@@ -425,6 +475,14 @@ function prepared() {
     // contract (and its many call sites) stays untouched. Stored as TEXT
     // because the column may be a 0-based index OR a header name.
     setJobSourceColumn: db.prepare('UPDATE jobs SET source_column = ? WHERE id = ?'),
+    // Same pattern as setJobSourceColumn: keeps insertJob's parameters unchanged.
+    setJobExpansionMode: db.prepare('UPDATE jobs SET expansion_mode = ? WHERE id = ?'),
+    setJobDeleteScope: db.prepare('UPDATE jobs SET delete_scope = ? WHERE id = ?'),
+    // Persist the registry-resolved source nsid (expansion) so an IDs-only plan
+    // can emit {code, id} without scanning identities. Never overwrites a value
+    // the operator supplied (that one is already checked against the registry).
+    setJobSourceNamespaceIdIfNull: db.prepare(
+      'UPDATE jobs SET source_namespace_id = ? WHERE id = ? AND source_namespace_id IS NULL'),
     // Persist a submission preflight/run error on the job WITHOUT changing its
     // status, so a fire-and-forget submit failure (e.g. quota_unavailable) is
     // observable by the UI instead of only logged (review finding #10).
@@ -864,6 +922,61 @@ function prepared() {
     // idx_ei_job_source instead of materialising every processed source id in a
     // JS Set — ~1 GB of heap at 6.8M sources, on a box whose Node heap may be
     // ~2-4 GB. Every processed source has at least its own source row.
+    // ─── Identity analysis (2026-10-06; runner/analysis.js) ───────────────
+    upsertJobAnalysisStart: db.prepare(`
+      INSERT INTO job_analysis (job_id, status, sources_done, sources_total, summary_json, error, started_at, finished_at)
+      VALUES (?, 'building', 0, ?, NULL, NULL, datetime('now'), NULL)
+      ON CONFLICT(job_id) DO UPDATE SET
+        status = 'building', sources_done = 0, sources_total = excluded.sources_total,
+        summary_json = NULL, error = NULL, started_at = excluded.started_at, finished_at = NULL
+    `),
+    setJobAnalysisProgress: db.prepare('UPDATE job_analysis SET sources_done = ? WHERE job_id = ?'),
+    finishJobAnalysis: db.prepare(`
+      UPDATE job_analysis
+         SET status = 'ready', summary_json = ?, sources_done = ?, error = NULL, finished_at = datetime('now')
+       WHERE job_id = ?
+    `),
+    failJobAnalysis: db.prepare(`
+      UPDATE job_analysis SET status = 'failed', error = ?, finished_at = datetime('now') WHERE job_id = ?
+    `),
+    getJobAnalysis: db.prepare('SELECT * FROM job_analysis WHERE job_id = ?'),
+    getSourceAnalysis: db.prepare('SELECT * FROM source_analysis WHERE job_id = ? AND source_id = ?'),
+    // A build only runs inside this process; one still 'building' at startup died
+    // with the previous process.
+    markInterruptedAnalysesFailed: db.prepare(`
+      UPDATE job_analysis
+         SET status = 'failed', error = 'interrupted by restart — rebuild', finished_at = datetime('now')
+       WHERE status = 'building'
+    `),
+    // Chunked so clearing millions of rows never blocks the event loop for long.
+    deleteSourceAnalysisChunk: db.prepare(`
+      DELETE FROM source_analysis
+       WHERE rowid IN (SELECT rowid FROM source_analysis WHERE job_id = ? LIMIT ?)
+    `),
+    insertSourceAnalysis: db.prepare(`
+      INSERT OR REPLACE INTO source_analysis
+        (job_id, source_id, category, identities_total, linked_total, ns_counts_json, other_in_list, other_not_in_list)
+      VALUES (@jobId, @sourceId, @category, @identitiesTotal, @linkedTotal, @nsCountsJson, @otherInList, @otherNotInList)
+    `),
+    // Keyset page of the job's uploaded IDs — index-only on idx_ei_job_source.
+    nextSourcePage: db.prepare(`
+      SELECT DISTINCT source_id FROM expanded_identities
+       WHERE job_id = ? AND source_id > ?
+       ORDER BY source_id LIMIT ?
+    `),
+    // Every stored identity of a contiguous range of uploaded IDs.
+    identitiesForSourceRange: db.prepare(`
+      SELECT source_id, ns_code, ns_id, identity_id FROM expanded_identities
+       WHERE job_id = ? AND source_id >= ? AND source_id <= ?
+    `),
+    // The canonical {code, id} expansion stored for an uploaded ID's own row —
+    // used when the job has no stored source nsid (jobs planned before it was
+    // persisted). The first rows of a job are source rows, so this stops early.
+    sourceRowNamespace: db.prepare(`
+      SELECT ns_code, ns_id FROM expanded_identities
+       WHERE job_id = ? AND identity_id = source_id AND ns_id IS NOT NULL
+       LIMIT 1
+    `),
     hasProcessedSource: db.prepare(`
       SELECT 1 FROM expanded_identities WHERE job_id = ? AND source_id = ? LIMIT 1
     `),
@@ -937,13 +1050,44 @@ function prepared() {
  *   - source_id is the MIN over the dedup group — picks the earliest cluster
  *     as the identity's "home" for cluster-aware planner packing.
  */
-export function prepareStreamIdentitiesBySource() {
-  return db.prepare(`
+export const STREAM_IDENTITIES_BY_SOURCE_SQL = `
     SELECT ns_code, ns_id, identity_id, MIN(source_id) AS source_id
       FROM expanded_identities
      WHERE job_id = ?
      GROUP BY COALESCE(ns_code, ''), COALESCE(ns_id, 0), identity_id
      ORDER BY MIN(source_id), ns_code
+  `;
+export function prepareStreamIdentitiesBySource(conn = db) {
+  return conn.prepare(STREAM_IDENTITIES_BY_SOURCE_SQL);
+}
+
+/**
+ * A separate READ-ONLY connection for long streaming reads (CSV downloads).
+ * better-sqlite3 refuses EVERY write on a connection while one of its
+ * statements is being iterated, so a download iterating on the main connection
+ * across awaits made concurrent writes (submit checkpoints, quota reservations,
+ * monitor updates) throw "This database connection is busy executing a query".
+ * WAL lets this connection read while the main one writes. Always close() it.
+ * An in-memory database has no second connection: the main one is returned
+ * with a no-op close (2026-10-06).
+ */
+export function openReadConnection() {
+  if (config.dbPath === ':memory:') return { conn: db, close() {} };
+  const conn = new Database(config.dbPath, { readonly: true, fileMustExist: true });
+  conn.pragma('cache_size = -65536');      // 64 MB: sequential reads need little cache
+  conn.pragma('temp_store = MEMORY');      // as the main connection (GROUP BY / ORDER BY)
+  return { conn, close: () => { try { conn.close(); } catch { /* already closed */ } } };
+}
+
+/**
+ * FRESH Statement (same rationale as prepareStreamIdentitiesBySource) streaming
+ * the job's distinct uploaded IDs in order — what an "uploaded IDs only" plan
+ * deletes. Index-only on idx_ei_job_source(job_id, source_id): no sort, no
+ * temp B-tree, cheap even at millions of sources (2026-10-06).
+ */
+export function prepareStreamDistinctSources() {
+  return db.prepare(`
+    SELECT DISTINCT source_id FROM expanded_identities WHERE job_id = ? ORDER BY source_id
   `);
 }
 

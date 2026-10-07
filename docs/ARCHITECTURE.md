@@ -118,6 +118,9 @@ demo — never for production. See CLAUDE.md I12.
                      route returns a clean 400 with the message in publicMessage.
                      Accepted CSV is streamed to data/uploads/. Row count passed
                      as totalSourceIds. Job row inserted, status='expanding'.
+                     expansionMode (2026-10-06): 'cluster' (default) or 'none'
+                     (delete ONLY the uploaded IDs — no Identity Graph); stored
+                     on jobs.expansion_mode, never changed afterwards.
 
   3. EXPAND          CSV stream → 1000-ID batches → p-limit(IDENTITY_CONCURRENCY)
      │               workers POST /identity/clusters/members. Default
@@ -147,11 +150,39 @@ demo — never for production. See CLAUDE.md I12.
                      COUNT DISTINCT query computes the true deduplicated
                      found_count and writes it via setFoundCount. Live
                      progress map in memory for the UI poll path.
+                     EXPANSION OFF (jobs.expansion_mode='none', 2026-10-06):
+                     same stream, registry validation (fail closed), waves and
+                     resume, but each batch stores only [ns, nsid, id, id]
+                     source rows — no /clusters/members call — and the
+                     all-empty-graph refusal is skipped (it targets
+                     wrong-region CLUSTER jobs). The registry-resolved source
+                     nsid is persisted on the job. A successful CLUSTER
+                     expansion queues the identity analysis (3b).
+
+  3b. ANALYSE        runner/analysis.js — a REVIEW report, never read by
+     │               planning or submission. Keyset pages of 2,000 uploaded
+     ▼               IDs; each cluster classified source_only | linked |
+                     merged_in_list | merged_outside_list ("other profile" =
+                     another identity in the source namespace; "in list" =
+                     it is itself an uploaded ID of this job). One transaction
+                     per page into source_analysis, a setImmediate yield
+                     between pages, totals in job_analysis.summary_json. A
+                     failed build marks only the analysis failed; one still
+                     'building' at startup is marked failed (restart). Read by
+                     the Analysis tab via routes/analysisRoutes.js.
 
   4. PLAN            Only after a FINISHED expansion (2026-10-06): planWorkOrders
      │               throws PlanNotReadyError (409 'not_expanded') unless the job
      ▼               is expanded/ready/submitting/submitted/partial — planning a
                      running or failed expansion plans a PARTIAL identity set.
+                     SCOPE (2026-10-06, jobs.delete_scope): 'cluster' plans
+                     every stored identity (the original behaviour);
+                     'source_only' plans only the DISTINCT uploaded IDs (index-
+                     only stream) in the job's source namespace. A request
+                     without a scope keeps the current plan's scope (a plain
+                     re-plan never widens an IDs-only plan); expansion-off
+                     jobs can only be planned 'source_only' (409
+                     scope_unavailable otherwise).
                      Iterate expanded_identities ORDER BY source_id, ns_code.
                      Bundle identities by cluster. Pack bundles into work orders
                      (≤ 100k ids/order); each WO also stores ns_summary_json
@@ -445,6 +476,15 @@ src/
 │   │                       the next day (R5 hold); never leaves an empty day
 │   │                       label. Writes only changed labels in one transaction.
 │   │                       Shipped WOs are immutable.
+│   ├── analysis.js         Identity analysis (2026-10-06): classifySource (pure),
+│   │                       buildAnalysis (keyset pages + yields, pages re-sized to
+│   │                       ~100 ms of work, one build per job, errors recorded on
+│   │                       the analysis only),
+│   │                       queueAnalysisBuild (after a cluster expansion),
+│   │                       describeSourceIdentities (drill-down + detail CSV).
+│   ├── identityExport.js   Expanded-identities CSV (GET /:id/export) written by
+│   │                       identityExportWorker.js in a worker thread (2026-10-06);
+│   │                       in-process only for an in-memory DB.
 │   └── recovery.js         Startup reconciliation AND per-job operator-
 │                           triggered reconciliation. Exports:
 │                             • resumeExpandingJobs() — resumes 'expanding'
@@ -483,13 +523,35 @@ src/
 │   │                       - POST   /api/config/credentials/test  (IMS auth check)
 │   ├── adobe.js            Sandbox/dataset/namespace discovery endpoints.
 │   ├── upload.js           multipart CSV → job + expansion kickoff.
+│   ├── analysisRoutes.js   Identity analysis endpoints (2026-10-06), registered
+│   │                       on the jobs router (same /api/jobs mount + :id guard):
+│   │                       POST /:id/analysis (409 analysis_unavailable /
+│   │                       analysis_running), GET /:id/analysis,
+│   │                       GET /:id/analysis/sources (category / prefix search /
+│   │                       size|id sort / paging; 409 analysis_not_ready),
+│   │                       GET /:id/analysis/sources/:sourceId,
+│   │                       GET /:id/analysis/export?kind=summary|detail.
+│   │                       Downloads read in .all() keyset chunks (5,000 IDs in
+│   │                       ID order; 500 when rows are scattered — detail, or
+│   │                       ONE category, which walks idx_sa_job_cat_size,
+│   │                       largest clusters first); a detail download pauses
+│   │                       between IDs after 50 ms of work — no statement is
+│   │                       held across an await.
 │   └── jobs.js             Job detail, plan, submit, progress, export.
+│                           - GET /api/jobs/:id/export — built by
+│                             runner/identityExport.js in a WORKER THREAD on its
+│                             own read-only connection: SQLite groups every row of
+│                             the job before the first one (minutes at 36M rows),
+│                             which on the main thread froze the server and made
+│                             concurrent writes throw "busy". Same file as before.
 │                           - POST /api/jobs/:id/submit {workOrderIds} — ships
 │                             exactly those (1..1000 UUIDs of THIS job; else 400
 │                             invalid_work_order_ids). Legacy {monthIndex,
 │                             dayIndex} still accepted.
-│                           - POST /api/jobs/:id/plan — 409 not_expanded unless
-│                             the expansion finished.
+│                           - POST /api/jobs/:id/plan {scope?} — 409 not_expanded
+│                             unless the expansion finished; scope cluster |
+│                             source_only (400 invalid_scope, 409
+│                             scope_unavailable for cluster on an IDs-only job).
 │                           - POST /api/jobs/:id/resume-expansion — 'failed' job,
 │                             no work orders, upload present → continues the
 │                             expansion (409 bad_state / has_work_orders /
@@ -573,6 +635,10 @@ src/
     │                       applyIdentityLockState. Save & Continue PATCHes when
     │                       the active cred has unsaved label/client-name/region
     │                       edits; POSTs (creates) when in Add-new mode.
+    ├── buckets.js          Submit/Plan batch helpers (window.AepBuckets).
+    ├── jobview.js          Job progress stepper, mode badges and plan-scope
+    │                       estimates (window.AepJobView) — pure functions,
+    │                       tested in node (test/webJobView.test.js).
     ├── aep-icon.svg        Local copy of the AdobeExperiencePlatform mark
     │                       (top bar + favicon).
     ├── data-cleansing-icon.svg  Adobe's official Data Cleansing icon, used
@@ -582,7 +648,7 @@ src/
 
 test/                       node --test (via `npm test` → scripts/run-tests.mjs,
                             which enumerates test/*.test.js and sets a stable
-                            test ENCRYPTION_KEY). 267 tests covering hygiene
+                            test ENCRYPTION_KEY). 376 tests (2026-10-06) covering hygiene
                             validators,
                             namespace canonicalization, IMS token cache, quota
                             atomicity (incl. monthly-disabled release gating),
@@ -661,9 +727,11 @@ data/                       Runtime state; in .gitignore.
 |---|---|---|
 | `credentials` | AES-GCM encrypted secrets | UNIQUE(environment, ims_org_id, client_id) |
 | `sandbox_configs` | Cached sandbox metadata + datasets + namespaces | PK(creds_id, sandbox_name) |
-| `jobs` | One per upload. Status: created → expanding → expanded → ready → submitting → submitted/partial/failed. `projected_months` (Phase 2) tracks the redistributor's max month_index for shift detection. `plan_anchor_month` (2026-10-06, 'YYYY-MM' UTC) anchors month labels to the calendar (Month N = anchor + N-1). `source_column` (2026-05-31, default `'0'`) persists the upload-time CSV column so crash-recovery resumes against the same column. | FK creds_id |
+| `jobs` | One per upload. Status: created → expanding → expanded → ready → submitting → submitted/partial/failed. `projected_months` (Phase 2) tracks the redistributor's max month_index for shift detection. `plan_anchor_month` (2026-10-06, 'YYYY-MM' UTC) anchors month labels to the calendar (Month N = anchor + N-1). `source_column` (2026-05-31, default `'0'`) persists the upload-time CSV column so crash-recovery resumes against the same column. `expansion_mode` (2026-10-06, `'cluster'` default \| `'none'` = uploaded IDs only, set once at upload). `delete_scope` (2026-10-06, written by planning: `'cluster'` \| `'source_only'`; NULL on plans made before it existed = cluster). | FK creds_id |
 | `expanded_identities` | One row per (cluster member, source). No unique index — dedup deferred to planning via `GROUP BY` in `streamIdentitiesBySource`. Only `idx_ei_job_source(job_id, source_id)` remains; `idx_ei_job_ns` was dropped 2026-05-29 (proven via EXPLAIN QUERY PLAN to be redundant — every reader falls back to `idx_ei_job_source` with an identical plan). | FK job_id |
 | `work_orders` | One per Adobe work order. Statuses: planned → submitting → submitted → completed/failed/deferred. `month_index` (Phase 2) + `day_index` form the bucket label assigned by the redistributor on un-shipped WOs only. `last_polled_at` (2026-05-31) is the monitor's fairness cursor so >100 open WOs all get polled (no starvation). `ns_summary_json` (2026-10-06) holds per-namespace counts so list/poll/monitor paths never read `namespaces_identities` (~6 MB per 100k-id WO). (R2's `reserved_monthly` column was removed in R4 — the per-WO `quota_reservations` table records each WO's own period/count, so recovery releases exactly what was reserved.) | FK job_id, ordered by rowid |
+| `job_analysis` | (2026-10-06) One row per analysed job: status building/ready/failed, progress, `summary_json` totals. Review-only. | PK job_id, FK jobs ON DELETE CASCADE |
+| `source_analysis` | (2026-10-06) One row per uploaded ID of an analysed job: category, cluster size, per-namespace counts, other profiles in / not in the upload. Indexed for paging by category and size. | PK(job_id, source_id), FK jobs ON DELETE CASCADE |
 | `quota_usage` | Per-period **adobe_floor** = Adobe's observed consumed (R4: `used` is vestigial; an R5 boot backfill folds any legacy `used` into `adobe_floor`). Raised ONLY by `seedFloor` (MAX with live /quota). Nothing else touches the floor — an accepted WO is held as an active reservation, never folded in, so there is no double-count vs the MAX (R5). | PK(ims_org_id, utc_date) |
 | `quota_usage_monthly` | Monthly counterpart of `quota_usage`'s `adobe_floor`. | PK(ims_org_id, utc_year_month) |
 | `quota_reservations` | **Per-work-order quota reservation** (R4 #1; R5 lifecycle): (work_order_id) → count + utc_date + utc_year_month + active + **accepted**. `effective_used(period) = adobe_floor(period) + Σ active reservations(period)`. `reserve`→pending(accepted=0); `markAccepted`→accepted=1 (Adobe acked); `release` deactivates IFF accepted=0; `reactivate`→active+accepted. **HOLD-UNTIL-ROLLOVER (R5):** an accepted reservation is NEVER dropped mid-period (no `complete()`, no timer/floor-delta drop — all over-ship under a concurrent external consumer); it's held until the period-keyed SUM stops matching it at UTC day/month rollover. | PK(work_order_id) |
