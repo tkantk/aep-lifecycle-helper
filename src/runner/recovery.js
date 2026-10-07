@@ -597,6 +597,11 @@ export function retryRejectedWorkOrder(jobId, woId) {
 /** Top-level entrypoint called by src/index.js after the DB is ready. */
 export async function runStartupRecovery() {
   try {
+    // An analysis build only runs inside the process that started it; one
+    // still 'building' now died with the previous process (2026-10-06).
+    const interrupted = q().markInterruptedAnalysesFailed.run().changes;
+    if (interrupted > 0) logger.info({ interrupted }, 'startup: marked interrupted analysis builds failed');
+
     // GC orphan quota reservations (no surviving work order) that no longer
     // count: inactive ones, OR prior-month tombstones (already excluded from the
     // current-month SUM). A CURRENT-month active tombstone from a force-deleted

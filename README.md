@@ -163,11 +163,24 @@ Turn the concurrency dial up from the conservative default of 5 (e.g.
                    Cap inputs auto-populated from Adobe's reported entitlement.
       ↓
 2. Upload CSV      Source identifiers (any namespace). Streamed to disk.
-      ↓
+      ↓            Choose "Identity expansion": through the Identity Graph
+                   (default — delete whole profiles) or "Uploaded IDs only"
+                   (no Identity Graph; only the IDs in the file can be
+                   deleted). Fixed for the job once uploaded.
 3. Expansion       Batches of 1000 IDs to /identity/clusters/members,
-                   10 concurrent. Results dedup'd and inserted to SQLite.
+                   5 concurrent. Results inserted to SQLite (dedup at plan).
       ↓
-4. Batch Planning  Identities packed into ≤100k-ID work orders, then
+3a. Analysis       Built automatically after expansion (Identity Graph jobs).
+                   Shows which uploaded IDs share a cluster with other
+                   identities or other profiles — ⚠ "Merged · not in list"
+                   means deleting with linked identities also deletes a
+                   profile you did not upload. Filter, search, drill into a
+                   cluster, download Summary / Detail CSVs. Review only.
+      ↓
+4. Batch Planning  Choose what the plan deletes: uploaded IDs + linked
+                   identities (default) or uploaded IDs only. Re-planning
+                   keeps that choice; it can change until the first batch
+                   ships. Identities packed into ≤100k-ID work orders, then
                    re-bucketed by the LIVE Adobe quota into Month × Day
                    buckets. Multi-month plans surface a confirmation
                    modal with a per-month breakdown.
@@ -318,18 +331,23 @@ All under `/api/` on `http://127.0.0.1:3000`.
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| POST | `/api/upload` | Upload CSV + start expansion |
+| POST | `/api/upload` | Upload CSV + start expansion. Field `expansionMode`: `cluster` (default) or `none` (uploaded IDs only) |
 | GET | `/api/jobs` | All jobs (every status, every sandbox) |
 | GET | `/api/jobs/monitor?search=&sandbox=` | Active-submissions dashboard feed (jobs with ≥1 Adobe-acked WO) |
 | GET | `/api/jobs/:id` | Job detail + namespace breakdown + quota peek |
 | GET | `/api/jobs/:id/progress` | Live expansion progress (fast path) |
-| POST | `/api/jobs/:id/plan` | Build work-order plan (auto re-buckets against live quota) |
+| POST | `/api/jobs/:id/plan` | Build work-order plan (auto re-buckets against live quota). Body `{scope?}`: `cluster` (uploaded IDs + linked identities) or `source_only` (uploaded IDs only); omitted = keep the current plan's scope |
 | POST | `/api/jobs/:id/approve-month` | Approve Month N for submission. Body: `{monthIndex}` (≥ 2) |
-| POST | `/api/jobs/:id/submit` | Submit work orders. Body: `{dayIndex?, monthIndex?}` |
+| POST | `/api/jobs/:id/submit` | Submit exactly these work orders. Body: `{workOrderIds: [...]}` (1..1000 IDs of this job) |
 | GET | `/api/jobs/:id/work-orders` | All work orders + per-service status |
 | POST | `/api/jobs/:id/reconcile` | Look up uncertain orphans in Adobe by name; record any that exist |
 | POST | `/api/jobs/:id/work-orders/:woId/release-absent` | Operator-confirmed: release a verified-absent orphan for retry. Body `{confirmedAbsent: true}` required |
 | GET | `/api/jobs/:id/export` | Download expanded identities CSV (formula-injection sanitized) |
+| POST | `/api/jobs/:id/analysis` | Build / rebuild the identity analysis (Identity Graph jobs) |
+| GET | `/api/jobs/:id/analysis` | Analysis status, progress and totals |
+| GET | `/api/jobs/:id/analysis/sources?category=&search=&sort=size\|id&limit=&offset=` | Page through the per-ID report |
+| GET | `/api/jobs/:id/analysis/sources/:sourceId` | One uploaded ID's cluster, each identity's relation |
+| GET | `/api/jobs/:id/analysis/export?kind=summary\|detail&category=` | Streamed Summary / Detail CSV |
 
 ### Settings
 
@@ -420,6 +438,18 @@ window and the client slept (up to 60 s per retry, up to 5 retries =
 **5 minutes of wait per affected request**). If you see this, lower
 `IDENTITY_CONCURRENCY` by 5 and restart — startup recovery will resume
 the in-progress job from where it left off.
+
+**Before a multi-million-ID run:**
+
+- **Disk.** A 6.8M-ID job with identity expansion stores ~36M identity rows
+  (~12 GB in `data/state.db`); the Analysis report built after expansion adds
+  ~3–4 GB more. Back up `data/state.db` and check free space first.
+- **Don't plan or delete a large job while a submission is running.** Planning
+  a 6.8M-ID job with linked identities runs ~15 minutes and deleting a job
+  removes every row in one statement — both pause the whole server meanwhile.
+  (Export CSV and the Analysis downloads are safe: they never pause it.)
+- **Check the prod machine first:** run `npm test` with the Node version it
+  uses, open the Analysis tab and download an Export CSV on a small job.
 
 ---
 

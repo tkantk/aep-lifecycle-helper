@@ -1,12 +1,13 @@
 import pLimit from 'p-limit';
 import { expandBatch } from '../services/identityGraph.js';
-import { listNamespaces, buildNamespaceIndex } from '../services/namespaces.js';
+import { listNamespaces, buildNamespaceIndex, canonicalizeNamespace } from '../services/namespaces.js';
 import { snapshotAndResetRateLimitHits } from '../services/adobeClient.js';
 import { insertIdentitiesAndCount, q } from '../db.js';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { streamIds } from '../utils/csv.js';
 import { decryptCreds } from '../utils/crypto.js';
+import { queueAnalysisBuild } from './analysis.js';
 
 /**
  * In-process identity expansion runner.
@@ -40,6 +41,10 @@ export async function runExpansion({
   const creds = await decryptCreds(credsId);
   const job = q().getJob.get(jobId);
   const total = job.total_source_ids;
+  // IDs-only job (2026-10-06): the operator chose to delete ONLY the uploaded
+  // IDs, so the Identity Graph is never called. Everything else — registry
+  // validation, waves, progress, resume, failure handling — is shared.
+  const expansionOff = job.expansion_mode === 'none';
   // A resume continues the job's persisted (cumulative) counters, so the live
   // progress the UI polls reads e.g. "4.9M / 6.8M" — not "0 / 6.8M".
   const progress = skipSourceIds
@@ -123,6 +128,11 @@ export async function runExpansion({
         `${resolvedNsid} was supplied — refusing to expand against a mismatched code/nsid pair`);
     }
   }
+  // Persist the registry-resolved nsid so an IDs-only plan can emit {code, id}
+  // without scanning identities (never overwrites an operator-supplied value).
+  if (resolvedNsid != null) q().setJobSourceNamespaceIdIfNull.run(resolvedNsid, jobId);
+  // The validated source namespace as {code, id} — what an IDs-only job stores.
+  const sourceNs = canonicalizeNamespace({ ns: sourceNamespace, nsid: resolvedNsid }, namespaceIndex);
 
   // ─── Pipeline: CSV stream → batch buffer → p-limit workers → SQLite ───
   //
@@ -165,34 +175,44 @@ export async function runExpansion({
     if (aborted) return;
     try {
       const t0 = Date.now();
-      const results = await expandBatch({
-        creds, sandboxName,
-        namespace: sourceNamespace,
-        namespaceId: resolvedNsid,
-        ids: batch,
-        namespaceIndex,
-      });
-      const adobeMs = Date.now() - t0;
-
-      // Diagnostic: count total linked identities returned by Adobe for this batch.
-      // If this is zero across every batch, either the namespace is wrong for this
-      // sandbox or the IDs don't exist in any cluster.
-      const linkedTotal = results.reduce((n, r) => n + r.linkedIdentities.length, 0);
-
-      // Flatten to row tuples for bulk insert.
       // Row shape: [job_id, ns_code, ns_id, identity_id, source_id]
-      // A tuple with both ns_code=null AND ns_id=null is skipped (can't dedup).
-      const rows = [];
-      for (const r of results) {
-        // Emit the source identity itself as a deletion target
-        if (r.sourceNamespace.code || r.sourceNamespace.id != null) {
-          rows.push([jobId, r.sourceNamespace.code, r.sourceNamespace.id ?? null, r.sourceId, r.sourceId]);
-        }
-        for (const li of r.linkedIdentities) {
-          if (!li.namespace.code && li.namespace.id == null) continue;
-          rows.push([jobId, li.namespace.code, li.namespace.id ?? null, li.id, r.sourceId]);
+      let rows, linkedTotal, clustersReturned;
+      if (expansionOff) {
+        // IDs-only: the uploaded IDs themselves are the deletion targets, in the
+        // validated source namespace. No Identity Graph call.
+        rows = batch.map(id => [jobId, sourceNs.code, sourceNs.id ?? null, id, id]);
+        linkedTotal = 0;
+        clustersReturned = 0;
+      } else {
+        const results = await expandBatch({
+          creds, sandboxName,
+          namespace: sourceNamespace,
+          namespaceId: resolvedNsid,
+          ids: batch,
+          namespaceIndex,
+        });
+
+        // Diagnostic: count total linked identities returned by Adobe for this batch.
+        // If this is zero across every batch, either the namespace is wrong for this
+        // sandbox or the IDs don't exist in any cluster.
+        linkedTotal = results.reduce((n, r) => n + r.linkedIdentities.length, 0);
+        clustersReturned = results.length;
+
+        // Flatten to row tuples for bulk insert.
+        // A tuple with both ns_code=null AND ns_id=null is skipped (can't dedup).
+        rows = [];
+        for (const r of results) {
+          // Emit the source identity itself as a deletion target
+          if (r.sourceNamespace.code || r.sourceNamespace.id != null) {
+            rows.push([jobId, r.sourceNamespace.code, r.sourceNamespace.id ?? null, r.sourceId, r.sourceId]);
+          }
+          for (const li of r.linkedIdentities) {
+            if (!li.namespace.code && li.namespace.id == null) continue;
+            rows.push([jobId, li.namespace.code, li.namespace.id ?? null, li.id, r.sourceId]);
+          }
         }
       }
+      const adobeMs = Date.now() - t0;
 
       const t1 = Date.now();
       // Rows + counters in ONE transaction so a crash can't leave committed
@@ -206,7 +226,7 @@ export async function runExpansion({
 
       // Per-batch line: keep it terse so the log doesn't drown the run.
       logger.info({
-        jobId, batchSize: batch.length, clustersReturned: results.length, linkedTotal,
+        jobId, batchSize: batch.length, clustersReturned, linkedTotal, expansionOff,
         adobeMs, sqliteMs,
       }, 'identity graph batch returned');
 
@@ -333,7 +353,9 @@ export async function runExpansion({
     // per batch, so a genuinely-empty graph stays 0 across the resume too.
     // Honor an explicit operator override.
     const finalJob = q().getJob.get(jobId);
-    if (!config.allowEmptyGraph &&
+    // Not for an IDs-only job: there the absence of linked identities is the
+    // operator's explicit choice, not a wrong-region / wrong-nsid fingerprint.
+    if (!expansionOff && !config.allowEmptyGraph &&
         finalJob.processed_count > 0 && (finalJob.graph_members_seen || 0) === 0) {
       throw new Error(
         `Identity Graph returned 0 linked identities across all ${finalJob.processed_count} source(s) — ` +
@@ -353,6 +375,9 @@ export async function runExpansion({
 
     q().updateJobStatus.run('expanded', null, jobId);
     logger.info({ jobId, processed: progress.processed, found: distinct }, 'expansion complete');
+    // Build the identity analysis in the background (cluster jobs only — an
+    // IDs-only job has no clusters). Its errors never reach the expansion.
+    if (!expansionOff) queueAnalysisBuild(jobId);
   } catch (err) {
     // Let any batch still in flight settle first, so nothing writes rows or
     // counters after the job is recorded 'failed' (a resume could start then).
