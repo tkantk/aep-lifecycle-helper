@@ -94,7 +94,7 @@ function pageStatement({ category, sort, search }) {
 }
 
 // Keyset chunks for the downloads. `filter` 'all' | 'flagged' (not
-// source_only) walks the primary key in uploaded-ID order. ONE category walks
+// not_found / source_only) walks the primary key in uploaded-ID order. ONE category walks
 // idx_sa_job_cat_size, largest clusters first: in ID order a sparse category
 // (1% of 6.8M IDs) scanned ~500k rows for every chunk — 2.6 s event-loop blocks.
 const chunkStatements = new Map();
@@ -105,7 +105,7 @@ function chunkStatement(filter) {
       // first chunk · rest of the current cluster size · then smaller sizes
       st = [db.prepare(SA_CATEGORY_FIRST_SQL), db.prepare(SA_CATEGORY_SAME_SIZE_SQL), db.prepare(SA_CATEGORY_SMALLER_SQL)];
     } else {
-      const cond = filter === 'flagged' ? "AND category <> 'source_only'" : '';
+      const cond = filter === 'flagged' ? "AND category NOT IN ('not_found', 'source_only')" : '';
       st = db.prepare(`SELECT ${SA_COLS} FROM source_analysis
                         WHERE job_id = @jobId AND source_id > @after ${cond}
                         ORDER BY source_id LIMIT @limit`);
@@ -265,7 +265,7 @@ export function registerAnalysisRoutes(router) {
 
   /** GET /api/jobs/:id/analysis/export?kind=summary|detail&category= — streamed CSV.
    *  summary: one row per uploaded ID (default: all categories).
-   *  detail:  every identity of the selected IDs (default: all but source_only). */
+   *  detail:  every identity of the selected IDs (default: all but not_found / source_only). */
   router.get('/:id/analysis/export', async (req, res, next) => {
     try {
       const job = loadJob(req, res);
@@ -333,6 +333,29 @@ export function registerAnalysisRoutes(router) {
       logger.warn({ jobId: req.params.id, err: err.message }, 'analysis export aborted mid-stream');
       res.destroy(err);
     }
+  });
+
+  /** GET /api/jobs/:id/no-reply — CSV of the uploaded IDs AEP never answered for,
+   *  even when asked again (2026-10-08). They are not in any plan. Header = the
+   *  job's source namespace; header only when there are none. */
+  router.get('/:id/no-reply', async (req, res, next) => {
+    try {
+      const job = loadJob(req, res);
+      if (!job) return;
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="job_${job.id}_no_reply_from_aep.csv"`);
+      res.setHeader('Cache-Control', 'no-store');
+      async function* rows() {
+        for (let after = ''; ;) {
+          const chunk = q().noReplyChunk.all(job.id, after, EXPORT_CHUNK);
+          if (chunk.length === 0) return;
+          for (const r of chunk) yield [r.source_id];
+          after = chunk[chunk.length - 1].source_id;
+          await new Promise(resolve => setImmediate(resolve));
+        }
+      }
+      await streamCsv(res, [job.source_namespace || 'source_id'], rows());
+    } catch (err) { next(err); }
   });
 }
 

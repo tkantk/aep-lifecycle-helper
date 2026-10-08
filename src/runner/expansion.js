@@ -1,8 +1,8 @@
 import pLimit from 'p-limit';
-import { expandBatch } from '../services/identityGraph.js';
+import { expandBatchDetailed } from '../services/identityGraph.js';
 import { listNamespaces, buildNamespaceIndex, canonicalizeNamespace } from '../services/namespaces.js';
 import { snapshotAndResetRateLimitHits } from '../services/adobeClient.js';
-import { insertIdentitiesAndCount, q } from '../db.js';
+import { insertIdentitiesAndCount, clearNoReply, q } from '../db.js';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { streamIds } from '../utils/csv.js';
@@ -176,7 +176,7 @@ export async function runExpansion({
     try {
       const t0 = Date.now();
       // Row shape: [job_id, ns_code, ns_id, identity_id, source_id]
-      let rows, linkedTotal, clustersReturned;
+      let rows, linkedTotal, clustersReturned, noReply = [];
       if (expansionOff) {
         // IDs-only: the uploaded IDs themselves are the deletion targets, in the
         // validated source namespace. No Identity Graph call.
@@ -184,13 +184,28 @@ export async function runExpansion({
         linkedTotal = 0;
         clustersReturned = 0;
       } else {
-        const results = await expandBatch({
+        const ask = (ids) => expandBatchDetailed({
           creds, sandboxName,
           namespace: sourceNamespace,
           namespaceId: resolvedNsid,
-          ids: batch,
+          ids,
           namespaceIndex,
         });
+        const first = await ask(batch);
+        let results = first.results;
+        // Adobe documents one reply entry per ID sent. IDs its reply left out —
+        // cleanly: every entry it did return matched an ID sent — are asked about
+        // ONCE more on their own; any still missing are recorded as "no reply from
+        // AEP": never planned or deleted, listed for download. Failing the batch
+        // instead stalled the job for good — Resume re-sends the same IDs first
+        // (2026-10-08).
+        if (first.missing.length) {
+          const again = await ask(first.missing);
+          results = results.concat(again.results);
+          noReply = again.missing;
+          logger.warn({ jobId, sent: batch.length, leftOut: first.missing.length, stillMissing: noReply.length },
+            'Identity Graph reply left out uploaded IDs — asked again');
+        }
 
         // Diagnostic: count total linked identities returned by Adobe for this batch.
         // If this is zero across every batch, either the namespace is wrong for this
@@ -218,7 +233,7 @@ export async function runExpansion({
       // Rows + counters in ONE transaction so a crash can't leave committed
       // rows with a stale graph_members_seen (which a resume would then skip,
       // bypassing the empty-graph guard) — review #1.
-      const inserted = insertIdentitiesAndCount(rows, batch.length, linkedTotal, jobId);
+      const inserted = insertIdentitiesAndCount(rows, batch.length, linkedTotal, jobId, noReply);
       const sqliteMs = Date.now() - t1;
 
       progress.processed += batch.length;
@@ -357,10 +372,17 @@ export async function runExpansion({
     // operator's explicit choice, not a wrong-region / wrong-nsid fingerprint.
     if (!expansionOff && !config.allowEmptyGraph &&
         finalJob.processed_count > 0 && (finalJob.graph_members_seen || 0) === 0) {
+      const noReplyNote = finalJob.no_reply_count
+        ? ` (${finalJob.no_reply_count} of them got no reply at all; Resume will ask Adobe about them again)` : '';
+      // Nothing came back for the whole job, so the "no reply" records describe
+      // the setup, not the IDs. Clear them: once the region/namespace is fixed,
+      // Resume asks about those IDs again instead of skipping them for good (final
+      // review #1). Never a bypass — a still-wrong setup fails here again.
+      progress.processed -= clearNoReply(jobId);
       throw new Error(
-        `Identity Graph returned 0 linked identities across all ${finalJob.processed_count} source(s) — ` +
-        `this usually means a wrong region/namespace for this sandbox. Refusing to ship a ` +
-        `source-only deletion that would leave linked identities alive. ` +
+        `Identity Graph returned 0 linked identities across all ${finalJob.processed_count} source(s)${noReplyNote} — ` +
+        `this usually means a wrong region/namespace for this sandbox, or that none of these IDs exist in AEP any more. ` +
+        `Refusing to ship a source-only deletion that would leave linked identities alive. ` +
         `Verify the credential region and source namespace; set ALLOW_EMPTY_GRAPH=1 to override ` +
         `if the sources genuinely have no linked identities.`);
     }

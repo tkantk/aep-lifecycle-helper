@@ -28,7 +28,7 @@ const analysisRows = {
   merged_outside_list: [sa('G', 'merged_outside_list', 1502, 1), sa('E', 'merged_outside_list', 6, 1), sa('F', 'merged_outside_list', 4, 1)],
   merged_in_list: [sa('C', 'merged_in_list', 3, 0), sa('D', 'merged_in_list', 3, 0)],
 };
-const summary = { sources: 7, identities: 1521, byCategory: { source_only: 1, linked: 1, merged_in_list: 2, merged_outside_list: 3 },
+const summary = { sources: 7, identities: 1521, byCategory: { not_found: 0, source_only: 1, linked: 1, merged_in_list: 2, merged_outside_list: 3 },
   byNamespace: { email: 1504, hashedKocid: 5, phone: 1, Email: 1, 'nsid:777': 1 }, otherProfiles: { inList: 2, notInList: 3 } };
 const meta = { jobId: 'job-1', jobName: 'kocid-oct', createdAt: '2026-10-07 09:00:00', sandbox: 'prod', sourceNamespace: 'hashedKocid',
   expansionMode: 'cluster', deleteScope: 'cluster', totalSourceIds: 7, foundCount: 1521,
@@ -68,14 +68,14 @@ test('dataNamespaces: every namespace but the source one, most common first', ()
 
 test('sheets, Summary dashboard values and the distinct outside-profile tile', async () => {
   const { wb, res, progress } = await build();
-  assert.deepEqual(wb.worksheets.map(w => w.name), ['Summary', REPORT_SHEETS.merged_outside_list, REPORT_SHEETS.merged_in_list]);
+  assert.deepEqual(wb.worksheets.map(w => w.name), ['Summary', REPORT_SHEETS.merged_outside_list, REPORT_SHEETS.merged_in_list, REPORT_SHEETS.not_found]);
   const s = wb.getWorksheet('Summary');
   assert.match(String(s.getCell('A1').value), /Identity Analysis — kocid-oct/);
   assert.equal(s.views[0].showGridLines, false);
   assert.equal(s.pageSetup.orientation, 'landscape');
   const tile = (label) => { const c = findCell(s, label); return s.getCell(c.row + 1, c.col).value; };
   assert.equal(tile('UPLOADED IDS'), 7);
-  assert.equal(tile('PROFILES NOT IN YOUR LIST'), 2, 'X is shared by E and F: counted once (the analysis sum says 3)');
+  assert.equal(tile('PROFILES NOT IN YOUR FILE'), 2, 'X is shared by E and F: counted once (the analysis sum says 3)');
   const linked = findCell(s, 'Linked identities');
   assert.equal(s.getCell(linked.row, 3).value, 1);
   assert.ok(Math.abs(s.getCell(linked.row, 4).value - 1 / 7) < 1e-9);
@@ -89,7 +89,7 @@ test('sheets, Summary dashboard values and the distinct outside-profile tile', a
 test('merged sheets: one row per ID, largest first, identities per namespace, text cells, cut long cells', async () => {
   const { wb } = await build();
   const out = wb.getWorksheet(REPORT_SHEETS.merged_outside_list);
-  assert.deepEqual(values(out.getRow(1)), ['hashedKocid', 'Category', 'Identities', 'Profiles NOT in list', 'Profiles in list',
+  assert.deepEqual(values(out.getRow(1)), ['hashedKocid', 'Category', 'Identities', 'Profiles NOT in your file', 'Profiles in your file',
     'email', 'Email', 'nsid:777', 'phone', 'Other namespaces']);
   assert.deepEqual([2, 3, 4].map(n => out.getRow(n).getCell(1).value), ['G', 'E', 'F']);
   const e = out.getRow(3);
@@ -116,9 +116,9 @@ test('merged sheets: one row per ID, largest first, identities per namespace, te
 test('a category longer than a sheet continues on "(2)"; an empty category gets a note row', async () => {
   const split = await build({ maxRowsPerSheet: 2 });
   assert.deepEqual(split.wb.worksheets.map(w => w.name),
-    ['Summary', REPORT_SHEETS.merged_outside_list, `${REPORT_SHEETS.merged_outside_list} (2)`, REPORT_SHEETS.merged_in_list]);
+    ['Summary', REPORT_SHEETS.merged_outside_list, `${REPORT_SHEETS.merged_outside_list} (2)`, REPORT_SHEETS.merged_in_list, REPORT_SHEETS.not_found]);
   assert.equal(split.wb.getWorksheet(`${REPORT_SHEETS.merged_outside_list} (2)`).getRow(2).getCell(1).value, 'F');
-  assert.ok(`${REPORT_SHEETS.merged_outside_list} (10)`.length <= 31);
+  for (const name of Object.values(REPORT_SHEETS)) assert.ok(`${name} (10)`.length <= 31, name);
   const filename = path.join(dir, 'empty.xlsx');
   await writeAnalysisWorkbook({ filename, meta, summary, sourceNs: KOC,
     readers: readersFor({ merged_outside_list: analysisRows.merged_outside_list, merged_in_list: [] }) });
@@ -144,7 +144,7 @@ test('rows stream to the file as they are written — memory never holds the who
   const filename = path.join(dir, 'stream.xlsx');
   let sizeAtLastProgress = 0;
   const readers = {
-    async *categoryChunks(cat) { const list = big[cat]; for (let i = 0; i < list.length; i += 500) yield list.slice(i, i + 500); },
+    async *categoryChunks(cat) { const list = big[cat] || []; for (let i = 0; i < list.length; i += 500) yield list.slice(i, i + 500); },
     identitiesOf: (s) => ids[s] || [],
     isInList: () => true,
     topClusters: () => [],
@@ -154,4 +154,53 @@ test('rows stream to the file as they are written — memory never holds the who
   const finalSize = fs.statSync(filename).size;
   assert.ok(sizeAtLastProgress >= finalSize * 0.6,
     `only ${sizeAtLastProgress} of ${finalSize} bytes reached the file before the final commit`);
+});
+
+test('names say whose profile; "Not found" and "No reply" get a row, a legend line and a list sheet', async () => {
+  const rows = { ...analysisRows, not_found: [sa('N1', 'not_found', 1, 0), sa('N2', 'not_found', 1, 0)] };
+  const sum = { ...summary, sources: 9, byCategory: { ...summary.byCategory, not_found: 2 }, noReply: 3 };
+  const filename = path.join(dir, 'names.xlsx');
+  const res = await writeAnalysisWorkbook({ filename, meta, summary: sum, sourceNs: KOC,
+    readers: { ...readersFor(rows), async *noReplyChunks() { yield [{ source_id: 'Q1' }, { source_id: 'Q2' }]; yield [{ source_id: 'Q3' }]; } } });
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.readFile(filename);
+  assert.deepEqual(wb.worksheets.map(w => w.name),
+    ['Summary', '⚠ Merged · NOT in file', 'Merged · in file', 'Not found in AEP', 'No reply from AEP']);
+  const s = wb.getWorksheet('Summary');
+  for (const label of ['Not found in AEP', 'Only itself', 'Linked identities', 'Merged with a profile in your file',
+    '⚠ Merged with a profile NOT in your file', 'No reply from AEP']) assert.ok(findCell(s, label), label);
+  const nr = findCell(s, 'No reply from AEP');
+  assert.equal(s.getCell(nr.row, 3).value, 3);
+  assert.ok(Math.abs(s.getCell(nr.row, 4).value - 3 / 12) < 1e-9, '% of every uploaded ID asked (9 analysed + 3 no reply)');
+  const up = findCell(s, 'UPLOADED IDS');
+  assert.deepEqual([s.getCell(up.row + 1, up.col).value, s.getCell(up.row + 2, up.col).value], [12, '2 not found · 3 no reply']);
+  let text = '';
+  s.eachRow(row => row.eachCell(c => { text += ` ${c.value}`; }));
+  assert.doesNotMatch(text, /in your list|NOT in list/, 'no "list" wording left');
+  assert.deepEqual(wb.getWorksheet('Not found in AEP').getSheetValues().slice(1).map(v => v[1]), ['hashedKocid', 'N1', 'N2']);
+  assert.deepEqual(wb.getWorksheet('No reply from AEP').getSheetValues().slice(1).map(v => v[1]), ['hashedKocid', 'Q1', 'Q2', 'Q3']);
+  assert.equal(res.rows, 5 + 2 + 3, 'progress counts the list rows');
+});
+
+test('with none not found, the list sheet carries a note and no "No reply" row or sheet appears', async () => {
+  const { wb } = await build();
+  assert.equal(wb.getWorksheet('Not found in AEP').getRow(2).getCell(1).value, 'No uploaded ID came back from AEP with no identities.',
+    'never claims every ID was found — IDs with no reply were not confirmed (final review #4)');
+  assert.equal(wb.getWorksheet('No reply from AEP'), undefined);
+  assert.equal(findCell(wb.getWorksheet('Summary'), 'No reply from AEP'), null);
+});
+
+test('an analysis built before "Not found in AEP" existed says to rebuild instead of showing 0', async () => {
+  // Final review #4: its summary has no not_found key — those IDs are still counted
+  // under "Only itself", so a 0 here would look like an answer.
+  const legacy = { ...summary, byCategory: { source_only: 1, linked: 1, merged_in_list: 2, merged_outside_list: 3 } };
+  const filename = path.join(dir, 'legacy.xlsx');
+  await writeAnalysisWorkbook({ filename, meta, summary: legacy, sourceNs: KOC, readers: readersFor(analysisRows) });
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.readFile(filename);
+  assert.match(String(wb.getWorksheet('Not found in AEP').getRow(2).getCell(1).value), /built before .*rebuild/i);
+  const s = wb.getWorksheet('Summary');
+  const nf = findCell(s, 'Not found in AEP');
+  assert.equal(s.getCell(nf.row, 3).value, '—');
+  assert.match(String(s.getCell(nf.row, 26).value), /rebuild/i);
 });

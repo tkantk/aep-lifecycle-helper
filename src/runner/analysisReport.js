@@ -73,7 +73,8 @@ export function startAnalysisReport(jobId, { rebuild = false, maxRowsPerSheet } 
   if (current.status === 'ready' && !rebuild) return current;
 
   const summary = JSON.parse(a.summary_json);
-  const rowsTotal = (summary.byCategory.merged_outside_list || 0) + (summary.byCategory.merged_in_list || 0);
+  const rowsTotal = (summary.byCategory.merged_outside_list || 0) + (summary.byCategory.merged_in_list || 0)
+    + (summary.byCategory.not_found || 0) + (summary.noReply || 0);
   removeFiles(jobId);
   q().startReport.run({ jobId, rowsTotal, builtFor: a.finished_at });
   const sourceNs = resolveSourceNamespace(job, job.source_namespace_id == null ? q().sourceRowNamespace.get(job.id) : undefined);

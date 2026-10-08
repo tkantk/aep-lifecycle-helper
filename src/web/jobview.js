@@ -50,7 +50,8 @@
 
     if (job.status === 'expanding') add('expand', 'Expand', 'todo', off ? 'Storing the uploaded IDs…' : 'Expanding through the Identity Graph…', true);
     else if (expFailed) add('expand', 'Expand', 'failed', 'Expansion failed — resume it on the Expansion tab');
-    else add('expand', 'Expand', 'done', off ? 'Identity Graph off — uploaded IDs only' : fmt(job.found_count) + ' identities found');
+    else add('expand', 'Expand', 'done', off ? 'Identity Graph off — uploaded IDs only'
+      : fmt(job.found_count) + ' identities found' + (job.no_reply_count > 0 ? ' · ' + fmt(job.no_reply_count) + ' no reply from AEP' : ''));
 
     var aStatus = analysis && analysis.status;
     if (off) add('analysis', 'Analyse', 'na', 'Not available — expansion was off');

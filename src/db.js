@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { config } from './config.js';
 import { logger } from './utils/logger.js';
-import { IDENTITIES_FOR_SOURCE_RANGE_SQL, HAS_PROCESSED_SOURCE_SQL } from './runner/analysisSql.js';
+import { IDENTITIES_FOR_SOURCE_RANGE_SQL, HAS_PROCESSED_SOURCE_SQL, NO_REPLY_CHUNK_SQL } from './runner/analysisSql.js';
 
 /**
  * SQLite state store.
@@ -237,7 +237,7 @@ export function initDb() {
       finished_at    TEXT
     );
     -- One row per uploaded ID of an analysed job.
-    --   category: 'source_only' | 'linked' | 'merged_in_list' | 'merged_outside_list'
+    --   category: 'not_found' | 'source_only' | 'linked' | 'merged_in_list' | 'merged_outside_list'
     --   identities_total: distinct identities in its cluster, incl. itself
     --   linked_total: the same, excluding itself
     --   ns_counts_json: {"email":2,"ECID":9,...} excluding itself
@@ -259,6 +259,14 @@ export function initDb() {
       ON source_analysis(job_id, category, identities_total DESC, source_id);
     CREATE INDEX IF NOT EXISTS idx_sa_job_size
       ON source_analysis(job_id, identities_total DESC, source_id);
+    -- 2026-10-08: uploaded IDs the Identity Graph left out of its reply even
+    -- when asked again ("no reply from AEP"). Never planned or deleted — they
+    -- have no expanded_identities rows; listed for download.
+    CREATE TABLE IF NOT EXISTS no_reply_sources (
+      job_id     TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+      source_id  TEXT NOT NULL,
+      PRIMARY KEY (job_id, source_id)
+    ) WITHOUT ROWID;
   `);
 
   // ─── Additive migrations for existing DBs ─────────────────────────────
@@ -351,6 +359,8 @@ export function initDb() {
     { table: 'job_analysis', column: 'report_built_for', type: 'TEXT' },
     { table: 'job_analysis', column: 'report_started_at', type: 'TEXT' },
     { table: 'job_analysis', column: 'report_finished_at', type: 'TEXT' },
+    // 2026-10-08: how many uploaded IDs got no reply from AEP (no_reply_sources rows).
+    { table: 'jobs', column: 'no_reply_count', type: 'INTEGER NOT NULL DEFAULT 0' },
   ];
   for (const { table, column, type } of additiveColumns) {
     try {
@@ -591,6 +601,14 @@ function prepared() {
       INSERT INTO expanded_identities (job_id, ns_code, ns_id, identity_id, source_id)
       VALUES (?, ?, ?, ?, ?)
     `),
+    // "No reply from AEP" (2026-10-08): uploaded IDs the Identity Graph left out
+    // of its reply even when asked again. Written with the batch (insertIdentitiesAndCount).
+    insertNoReply: db.prepare('INSERT OR IGNORE INTO no_reply_sources (job_id, source_id) VALUES (?, ?)'),
+    addNoReplyCount: db.prepare(`UPDATE jobs SET no_reply_count = no_reply_count + ? WHERE id = ?`),
+    noReplyChunk: db.prepare(NO_REPLY_CHUNK_SQL),
+    deleteNoReply: db.prepare('DELETE FROM no_reply_sources WHERE job_id = ?'),
+    forgetNoReply: db.prepare(`UPDATE jobs SET no_reply_count = MAX(0, no_reply_count - ?),
+      processed_count = MAX(0, processed_count - ?) WHERE id = ?`),
     // Dedup matches the old unique-index semantics: (ns_code, ns_id, identity_id)
     // without source_id. The outer GROUP BY namespace collapses the deduplicated
     // rows into per-namespace counts.
@@ -932,7 +950,8 @@ function prepared() {
     // Per-row resume check (2026-10-06): an indexed point lookup on
     // idx_ei_job_source instead of materialising every processed source id in a
     // JS Set — ~1 GB of heap at 6.8M sources, on a box whose Node heap may be
-    // ~2-4 GB. Every processed source has at least its own source row.
+    // ~2-4 GB. Every processed source has at least its own source row, or a
+    // no_reply_sources row (2026-10-08 — see HAS_PROCESSED_SOURCE_SQL).
     // ─── Identity analysis (2026-10-06; runner/analysis.js) ───────────────
     upsertJobAnalysisStart: db.prepare(`
       INSERT INTO job_analysis (job_id, status, sources_done, sources_total, summary_json, error, started_at, finished_at)
@@ -1142,14 +1161,35 @@ export function bulkInsertIdentities(rows) {
  * @param {string} jobId
  * @returns {number} rows inserted (= rows.length)
  */
-export function insertIdentitiesAndCount(rows, sourcesProcessed, membersSeen, jobId) {
+export function insertIdentitiesAndCount(rows, sourcesProcessed, membersSeen, jobId, noReply = []) {
   const p = prepared();
   const tx = db.transaction(() => {
     for (const r of rows) p.insertIdentity.run(r[0], r[1], r[2], r[3], r[4]);
     p.incrementJobCounters.run(sourcesProcessed, rows.length, membersSeen, jobId);
+    // "No reply from AEP" IDs go in with the batch (2026-10-08), so a crash can't
+    // leave them recorded without the batch's counters, or the other way round.
+    let added = 0;
+    for (const id of noReply) added += p.insertNoReply.run(jobId, id).changes;
+    if (added) p.addNoReplyCount.run(added, jobId);
     return rows.length;
   });
   return tx();
+}
+
+/**
+ * Forget a job's "no reply from AEP" IDs (2026-10-08, final review #1). Used when
+ * AEP answered NOTHING for the whole job — a wrong region/namespace, not unknown
+ * IDs — so that Resume asks about them again instead of skipping them for good.
+ * They leave processed_count too, so progress and the resumed run add up.
+ * Returns how many were forgotten.
+ */
+export function clearNoReply(jobId) {
+  const p = prepared();
+  return db.transaction(() => {
+    const n = p.deleteNoReply.run(jobId).changes;
+    if (n) p.forgetNoReply.run(n, n, jobId);
+    return n;
+  })();
 }
 
 export const q = () => prepared();

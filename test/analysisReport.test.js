@@ -15,7 +15,7 @@ const dbPath = path.join(os.tmpdir(), `aep-test-report-${Date.now()}.db`);
 const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'aep-test-report-out-'));
 process.env.DB_PATH = dbPath; process.env.UPLOAD_DIR = os.tmpdir(); process.env.OUTPUT_DIR = outDir;
 
-const { initDb, q, db, bulkInsertIdentities } = await import('../src/db.js');
+const { initDb, q, db, bulkInsertIdentities, insertIdentitiesAndCount } = await import('../src/db.js');
 const { buildAnalysis } = await import('../src/runner/analysis.js');
 const report = await import('../src/runner/analysisReport.js');
 const { runStartupRecovery } = await import('../src/runner/recovery.js');
@@ -81,7 +81,8 @@ test('a report builds in a worker: file ready, merged IDs only, the event loop s
   assert.ok(s.bytes > 0 && fs.existsSync(report.reportPath(jobId)));
   const wb = new ExcelJS.Workbook(); await wb.xlsx.readFile(report.reportPath(jobId));
   assert.deepEqual(wb.worksheets.map(w => [w.name, w.rowCount]),
-    [['Summary', wb.getWorksheet('Summary').rowCount], ['⚠ Merged · NOT in list', 3001], ['Merged · in list', 3001]]);
+    [['Summary', wb.getWorksheet('Summary').rowCount], ['⚠ Merged · NOT in file', 3001], ['Merged · in file', 3001],
+     ['Not found in AEP', 2]]);   // header + "Every uploaded ID was found in AEP."
   assert.ok(maxLag < 150, `event loop blocked ${Math.round(maxLag)} ms`);
 });
 
@@ -159,4 +160,18 @@ test('a job planned before scopes existed reads "linked identities" in the repor
   const sub = String(wb.getWorksheet('Summary').getCell('B4').value);
   assert.match(sub, /Plan: uploaded IDs \+ linked identities/, sub);
   assert.doesNotMatch(sub, /not planned/);
+});
+
+test('the report lists "Not found in AEP" and "No reply from AEP" IDs (end to end, worker thread)', async () => {
+  const jobId = await seed(2, { build: false });
+  bulkInsertIdentities([[jobId, 'hashedKocid', 5000, 'NF1', 'NF1']]);   // Adobe: no identities
+  insertIdentitiesAndCount([], 0, 0, jobId, ['NR1']);                  // Adobe: no reply
+  await buildAnalysis(jobId);
+  report.startAnalysisReport(jobId);
+  const st = await settle(jobId);
+  assert.equal(st.status, 'ready', st.error);
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.readFile(report.reportPath(jobId));
+  assert.equal(wb.getWorksheet('Not found in AEP').getRow(2).getCell(1).value, 'NF1');
+  assert.equal(wb.getWorksheet('No reply from AEP').getRow(2).getCell(1).value, 'NR1');
 });

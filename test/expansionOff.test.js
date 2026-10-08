@@ -161,7 +161,7 @@ test('a successful cluster expansion builds the analysis in the background; an I
   const ja = q().getJobAnalysis.get(jobId);
   assert.equal(ja?.status, 'ready');
   assert.deepEqual(JSON.parse(ja.summary_json).byCategory,
-    { source_only: 0, linked: 1, merged_in_list: 0, merged_outside_list: 1 });
+    { not_found: 0, source_only: 0, linked: 1, merged_in_list: 0, merged_outside_list: 1 });
 
   const off = makeJob('none', ['k1']);
   mockRegistry();

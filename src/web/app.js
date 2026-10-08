@@ -1359,6 +1359,15 @@ async function renderExpand() {
         </div>
         <button class="btn btn-primary" id="btn-resume-expansion" style="white-space: nowrap; align-self: center">↻ Resume expansion</button>
       </div>` : ''}
+      ${(j.job.no_reply_count || 0) > 0 ? `
+      <div class="alert info" id="expand-no-reply" style="margin-bottom: 16px">
+        <div style="flex:1">
+          <div class="alert-title">No reply from AEP for ${j.job.no_reply_count.toLocaleString()} uploaded ID${j.job.no_reply_count === 1 ? '' : 's'}</div>
+          AEP left ${j.job.no_reply_count === 1 ? 'it' : 'them'} out of its answer, even when asked again.
+          ${j.job.no_reply_count === 1 ? 'It is' : 'They are'} not in the plan — nothing will be deleted for ${j.job.no_reply_count === 1 ? 'it' : 'them'}.
+        </div>
+        <button class="btn btn-secondary" id="btn-dl-no-reply-expand" type="button" style="white-space: nowrap; align-self: center">⤓ Download the list</button>
+      </div>` : ''}
       <div class="progress-head">
         <b>${failed ? 'Expansion failed' : done ? 'Expansion complete' : 'Expanding identities…'}</b>
         <span class="count">${p.processed.toLocaleString()} / ${p.total.toLocaleString()} (${pct}%)</span>
@@ -1412,6 +1421,10 @@ async function renderExpand() {
     $('#btn-goto-plan').hidden = !done;
     $('#btn-goto-analysis').hidden = !done || state.job.expansion_mode === 'none';
 
+    onClickGuarded($('#btn-dl-no-reply-expand'), async () => {
+      window.location.href = `${API}/jobs/${state.job.id}/no-reply`;
+      await new Promise(r => setTimeout(r, 3000));
+    });
     onClickGuarded($('#btn-resume-expansion'), async () => {
       try {
         await http('POST', `/jobs/${state.job.id}/resume-expansion`);
@@ -1436,10 +1449,11 @@ async function renderExpand() {
 // this tab changes the job, its plan or its work orders. Built automatically
 // after a cluster expansion; never for an expansion-off job.
 const ANALYSIS_CATS = [
-  { key: 'source_only',         label: 'Only itself',            hint: 'Nothing else in its cluster' },
-  { key: 'linked',              label: 'Linked identities',      hint: 'Other identities, no other profile' },
-  { key: 'merged_in_list',      label: 'Merged · in your list',  hint: 'Shares a cluster with other uploaded IDs' },
-  { key: 'merged_outside_list', label: '⚠ Merged · not in list', hint: 'Shares a cluster with a profile you did not upload' },
+  { key: 'not_found',           label: 'Not found in AEP',                         hint: 'AEP has no identities for it — deleted on its own' },
+  { key: 'source_only',         label: 'Only itself',                              hint: 'In AEP, nothing else linked' },
+  { key: 'linked',              label: 'Linked identities',                        hint: 'Its own email, ECID, phone… no other profile' },
+  { key: 'merged_in_list',      label: 'Merged with a profile in your file',       hint: 'That profile is being deleted too' },
+  { key: 'merged_outside_list', label: '⚠ Merged with a profile NOT in your file', hint: "Deleting also removes that profile's identities" },
 ];
 const ANALYSIS_PAGE = 50;
 const fmtNum = (n) => Number(n || 0).toLocaleString();
@@ -1563,17 +1577,25 @@ function renderAnalysisReady(a) {
   const s = a.summary;
   const view = analysisView();
   const total = s.sources || 0;
-  const share = (n) => (total ? `${(n / total * 100).toFixed(n > 0 && n / total < 0.001 ? 2 : 1)}%` : '0%');
+  // Shares are of every uploaded ID AEP was asked about — the analysed ones plus
+  // those it never answered for (no reply, 2026-10-08) — the Excel report's base too.
+  const noReply = s.noReply || 0;
+  const uploaded = total + noReply;
+  const share = (n) => (uploaded ? `${(n / uploaded * 100).toFixed(n > 0 && n / uploaded < 0.001 ? 2 : 1)}%` : '0%');
   const outside = s.byCategory.merged_outside_list || 0;
   const nsRows = Object.entries(s.byNamespace || {}).sort((x, y) => y[1] - x[1]);
   const nsTotal = nsRows.reduce((t, [, n]) => t + n, 0);
   const srcNs = state.job.source_namespace || 'uploaded ID';
+  // Built before "Not found in AEP" existed (no not_found key): those IDs are still
+  // counted under "Only itself" — show "—" and ask for a rebuild, never 0 (final review #4).
+  const legacyNotFound = !Object.prototype.hasOwnProperty.call(s.byCategory || {}, 'not_found');
+  const unknownCat = (key) => legacyNotFound && key === 'not_found';
   const chips = [{ key: 'all', label: 'All', n: total }]
-    .concat(ANALYSIS_CATS.map(c => ({ key: c.key, label: c.label, n: s.byCategory[c.key] || 0 })));
+    .concat(ANALYSIS_CATS.map(c => ({ key: c.key, label: c.label, n: unknownCat(c.key) ? null : (s.byCategory[c.key] || 0) })));
 
   $('#analysis-body').innerHTML = `
     <div class="analysis-meta">
-      <span>Built ${escape(formatRelativeTime(a.finishedAt))} · ${fmtNum(total)} uploaded IDs · ${fmtNum(s.identities)} distinct identities in their clusters</span>
+      <span>Built ${escape(formatRelativeTime(a.finishedAt))} · ${fmtNum(uploaded)} uploaded IDs${noReply ? ` (${fmtNum(noReply)} no reply from AEP)` : ''} · ${fmtNum(s.identities)} distinct identities in their clusters</span>
       <button class="link-btn" id="btn-rebuild-analysis" type="button" ${a.available ? '' : 'disabled'}>↻ Rebuild</button>
     </div>
     <div class="dl-card" id="analysis-downloads">
@@ -1597,29 +1619,41 @@ function renderAnalysisReady(a) {
         </div>
         <div class="dl-action"><button class="btn btn-secondary btn-sm" id="btn-dl-detail" type="button">⤓ Detail CSV</button></div>
       </div>
+      ${(s.noReply || 0) > 0 ? `
+      <div class="dl-row">
+        <div class="dl-what"><b>No reply from AEP</b><span>${fmtNum(s.noReply)} uploaded ID${s.noReply === 1 ? '' : 's'} AEP never answered for — not in the plan</span></div>
+        <div class="dl-action"><button class="btn btn-secondary btn-sm" id="btn-dl-no-reply" type="button">⤓ CSV</button></div>
+      </div>` : ''}
     </div>
     ${outside > 0 ? `
     <div class="alert warning" id="analysis-callout">
-      <div style="flex:1"><div class="alert-title">${fmtNum(outside)} uploaded ID${outside === 1 ? '' : 's'} share a cluster with a profile that is NOT in your list</div>
+      <div style="flex:1"><div class="alert-title">${fmtNum(outside)} uploaded ID${outside === 1 ? '' : 's'} share a cluster with a profile that is NOT in your file</div>
         ${fmtNum(s.otherProfiles.notInList)} such profile${s.otherProfiles.notInList === 1 ? '' : 's'} in total. Planning with
         <b>linked identities</b> (the default) also deletes those profiles' identities. Review them, or plan
-        <b>uploaded IDs only</b> to delete just your list.</div>
+        <b>uploaded IDs only</b> to delete just the IDs in your file.</div>
       <button class="btn btn-secondary" id="btn-show-outside" style="align-self:center; white-space:nowrap">Show these IDs</button>
     </div>` : `
-    <div class="alert success" id="analysis-callout-ok"><div>No uploaded ID shares a cluster with a profile outside your list.</div></div>`}
+    <div class="alert success" id="analysis-callout-ok"><div>No uploaded ID shares a cluster with a profile outside your file.</div></div>`}
     <div class="cat-cards">
       ${ANALYSIS_CATS.map(c => {
         const n = s.byCategory[c.key] || 0;
         return `<button type="button" class="cat-card ${c.key}${view.category === c.key ? ' active' : ''}${c.key === 'merged_outside_list' && n > 0 ? ' warn' : ''}" data-cat="${c.key}" title="${escape(c.hint)}">
           <span class="cat-card-label">${escape(c.label)}</span>
-          <span class="cat-card-n">${fmtNum(n)}</span>
-          <span class="cat-card-sub">${share(n)} of uploaded IDs</span>
+          <span class="cat-card-n">${unknownCat(c.key) ? '—' : fmtNum(n)}</span>
+          <span class="cat-card-sub">${unknownCat(c.key) ? 'Rebuild to see' : `${share(n)} of uploaded IDs`}</span>
         </button>`;
       }).join('')}
     </div>
+    ${legacyNotFound ? `
+    <div class="alert info" id="analysis-legacy"><div>This analysis was built before “Not found in AEP” existed, so uploaded IDs
+      AEP doesn't know are still counted under “Only itself”. Click <b>↻ Rebuild</b> above to see them.</div></div>` : ''}
+    ${(s.noReply || 0) > 0 ? `
+    <div class="alert info" id="analysis-no-reply"><div><b>No reply from AEP: ${fmtNum(s.noReply)} uploaded ID${s.noReply === 1 ? '' : 's'}.</b>
+      AEP left ${s.noReply === 1 ? 'it' : 'them'} out of its answer, even when asked again, so ${s.noReply === 1 ? 'it is' : 'they are'} not
+      in the plan and nothing will be deleted for ${s.noReply === 1 ? 'it' : 'them'}. Download the list under Downloads.</div></div>` : ''}
     <div class="stat-grid">
-      <div class="stat"><div class="stat-label">Other profiles · in your list</div><div class="stat-value">${fmtNum(s.otherProfiles.inList)}</div><div class="stat-sub">merged with another uploaded ID</div></div>
-      <div class="stat${s.otherProfiles.notInList ? ' warn' : ''}"><div class="stat-label">Other profiles · not in list</div><div class="stat-value">${fmtNum(s.otherProfiles.notInList)}</div><div class="stat-sub">also deleted with linked identities</div></div>
+      <div class="stat"><div class="stat-label">Other profiles · in your file</div><div class="stat-value">${fmtNum(s.otherProfiles.inList)}</div><div class="stat-sub">merged with another uploaded ID</div></div>
+      <div class="stat${s.otherProfiles.notInList ? ' warn' : ''}"><div class="stat-label">Other profiles · NOT in your file</div><div class="stat-value">${fmtNum(s.otherProfiles.notInList)}</div><div class="stat-sub">also deleted with linked identities</div></div>
       <div class="stat"><div class="stat-label">Linked identities</div><div class="stat-value">${fmtNum(nsTotal)}</div><div class="stat-sub">summed over the uploaded IDs</div></div>
     </div>
     ${nsRows.length ? `
@@ -1637,7 +1671,7 @@ function renderAnalysisReady(a) {
     <div class="section"><div class="section-head">Uploaded IDs</div><div class="section-sub">Click a row to see every identity in its cluster.</div></div>
     <div class="analysis-controls">
       <div class="filter-chips" role="tablist">
-        ${chips.map(c => `<button type="button" class="filter-chip${view.category === c.key ? ' active' : ''}" data-cat="${c.key}">${escape(c.label)} <span class="n">${fmtNum(c.n)}</span></button>`).join('')}
+        ${chips.map(c => `<button type="button" class="filter-chip${view.category === c.key ? ' active' : ''}" data-cat="${c.key}">${escape(c.label)} <span class="n">${c.n == null ? '—' : fmtNum(c.n)}</span></button>`).join('')}
       </div>
       <div class="analysis-search-row">
         <input type="search" id="analysis-search" placeholder="Find a ${escape(srcNs)} (exact or prefix)" value="${escape(view.search)}" maxlength="512" autocomplete="off" spellcheck="false">
@@ -1717,7 +1751,7 @@ async function loadAnalysisRows() {
       <td><span class="cat-badge ${escape(row.category)}">${escape(analysisCatLabel(row.category))}</span></td>
       <td class="num">${fmtNum(row.identities_total)}</td>
       <td>${row.other_in_list || row.other_not_in_list
-        ? `${fmtNum(row.other_in_list)} in list${row.other_not_in_list ? ` · <b class="warn-text">${fmtNum(row.other_not_in_list)} not in list</b>` : ''}`
+        ? `${fmtNum(row.other_in_list)} in your file${row.other_not_in_list ? ` · <b class="warn-text">${fmtNum(row.other_not_in_list)} NOT in your file</b>` : ''}`
         : '<span class="muted">—</span>'}</td>
       <td>${nsCountsHtml(row.ns_counts)}</td>
     </tr>`).join('')
@@ -1770,7 +1804,7 @@ async function openAnalysisDrill(sourceId) {
         ${items.map(i => `<div class="drill-row">
           <span class="ns-badge ${nsClass(i.namespace)}">${escape(i.namespace || `nsid ${i.nsid}`)}</span>
           <span class="drill-val mono">${escape(i.value)}</span>
-          ${rel === 'other_profile' ? (i.inList ? '<span class="in-list yes">in your list</span>' : '<span class="in-list no">⚠ not in list</span>') : ''}
+          ${rel === 'other_profile' ? (i.inList ? '<span class="in-list yes">in your file</span>' : '<span class="in-list no">⚠ NOT in your file</span>') : ''}
         </div>`).join('')}</div>`;
     }).join('')}
     ${d.truncated ? `<div class="f-hint">Showing the first ${fmtNum(d.identities.length)} of ${fmtNum(d.total)}.</div>` : ''}`;
@@ -1808,6 +1842,10 @@ function bindAnalysisDownloads() {
       await new Promise(r => setTimeout(r, 3000));     // no double-download on a rapid re-click
     });
   }
+  onClickGuarded($('#btn-dl-no-reply'), async () => {
+    window.location.href = `${API}/jobs/${state.job.id}/no-reply`;
+    await new Promise(r => setTimeout(r, 3000));
+  });
 }
 // Excel report: build in the background, poll while building, then download.
 function paintExcelReport(report) {
@@ -1933,6 +1971,7 @@ async function renderScopeChooser(target, { replan = false } = {}) {
   const summary = analysis?.status === 'ready' ? analysis.summary : null;
   const est = window.AepJobView.scopeEstimates(job, summary, 100000);
   const outside = summary?.byCategory?.merged_outside_list || 0;
+  const noReply = job.no_reply_count || 0;
   let scope = off ? 'source_only'
     : (state.planScope?.jobId === job.id ? state.planScope.value : (job.delete_scope || 'cluster'));
   const card = (value, title, desc, e) => `
@@ -1947,8 +1986,11 @@ async function renderScopeChooser(target, { replan = false } = {}) {
       <div class="section-head">${replan ? 'Change what this plan deletes' : 'What should this plan delete?'}</div>
       <div class="section-sub">${off
         ? 'Identity expansion was off for this job, so only the uploaded IDs can be deleted.'
+        : noReply > 0 ? 'Both options delete every uploaded ID AEP answered for; they differ in what else is deleted.'
         : 'Both options delete every uploaded ID; they differ in what else is deleted.'}</div>
     </div>
+    ${noReply > 0 ? `<div class="alert info" id="plan-no-reply"><div>${fmtNum(noReply)} uploaded ID${noReply === 1 ? '' : 's'} got no reply from AEP and ${noReply === 1 ? 'is' : 'are'} not in this plan.
+      <a href="${API}/jobs/${escape(job.id)}/no-reply">Download the list</a></div></div>` : ''}
     <fieldset class="choice-cards" id="plan-scope">
       ${off ? '' : card('cluster', 'Uploaded IDs + linked identities <span class="choice-tag">Recommended</span>',
         "Deletes each uploaded ID's whole Identity Graph cluster (email, ECID, phone, …), so the profile is fully removed.", est.cluster)}
@@ -1967,7 +2009,7 @@ async function renderScopeChooser(target, { replan = false } = {}) {
     if (scope === 'cluster' && outside > 0) {
       const profiles = summary.otherProfiles.notInList;
       el.innerHTML = `<div class="alert warning"><div style="flex:1">
-          <div class="alert-title">${fmtNum(outside)} uploaded ID${outside === 1 ? '' : 's'} share a cluster with a profile NOT in your list</div>
+          <div class="alert-title">${fmtNum(outside)} uploaded ID${outside === 1 ? '' : 's'} share a cluster with a profile NOT in your file</div>
           Deleting linked identities also deletes those ${fmtNum(profiles)} profile${profiles === 1 ? "'s" : "s'"} identities.
           Review them on the Analysis tab, or choose <b>Uploaded IDs only</b>.</div>
         <button class="btn btn-secondary" data-goto="analysis" type="button" style="align-self:center; white-space:nowrap">Review →</button></div>`;

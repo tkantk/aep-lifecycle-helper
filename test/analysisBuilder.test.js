@@ -46,7 +46,8 @@ const classify = (sourceId, rows, sourceNs = KOC) =>
   classifySource({ sourceId, sourceNs, rows, isInList: (v) => inList.has(v) });
 
 test('classifySource: the four categories, dedup, namespace counts, self excluded', () => {
-  assert.equal(classify('A', [r('hashedKocid', 5000, 'A')]).category, 'source_only');
+  // Adobe lists an ID it knows in its own cluster: two own rows (one alone = not found, 2026-10-08).
+  assert.equal(classify('A', [r('hashedKocid', 5000, 'A'), r('hashedKocid', 5000, 'A')]).category, 'source_only');
   const b = classify('B', [r('hashedKocid', 5000, 'B'), r('email', 6, 'b@x'), r('ECID', 4, 'e1'),
     r('ECID', 4, 'e1'), r('hashedKocid', 5000, 'B')]);
   assert.deepEqual([b.category, b.identitiesTotal, b.linkedTotal, b.nsCounts],
@@ -79,7 +80,7 @@ function seed({ mode = 'cluster', status = 'expanded', sourceNamespace = 'hashed
   // member (Adobe's member list includes the source itself).
   const S = (s, members) => [[jobId, 'hashedKocid', 5000, s, s], ...members.map(([ns, id, v]) => [jobId, ns, id, v, s])];
   bulkInsertIdentities([
-    ...S('A', []),
+    ...S('A', [['hashedKocid', 5000, 'A']]),
     ...S('B', [['email', 6, 'b@x'], ['ECID', 4, 'eb']]),
     ...S('C', [['hashedKocid', 5000, 'C'], ['hashedKocid', 5000, 'D'], ['email', 6, 'cd@x']]),
     ...S('D', [['hashedKocid', 5000, 'D'], ['hashedKocid', 5000, 'C'], ['email', 6, 'cd@x']]),
@@ -101,7 +102,7 @@ test('buildAnalysis classifies every uploaded ID across pages and stores totals'
   assert.equal(got.E.other_not_in_list, 1, 'X only appears as a member — it is NOT in the list');
   assert.deepEqual(JSON.parse(got.B.ns_counts_json), { email: 1, ECID: 1 });
   assert.deepEqual([got.C.identities_total, got.C.linked_total], [3, 2], 'the duplicated self member is counted once');
-  assert.deepEqual(summary.byCategory, { source_only: 1, linked: 1, merged_in_list: 2, merged_outside_list: 1 });
+  assert.deepEqual(summary.byCategory, { not_found: 0, source_only: 1, linked: 1, merged_in_list: 2, merged_outside_list: 1 });
   assert.deepEqual(summary.otherProfiles, { inList: 2, notInList: 1 });
   assert.equal(summary.sources, 5);
   assert.equal(summary.identities, 10, "the job's distinct identities (found_count) — shared ones counted once");

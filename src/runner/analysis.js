@@ -23,10 +23,11 @@ export { ANALYSIS_CATEGORIES, classifySource, describeSourceIdentities };
  *   cluster of an uploaded ID  its distinct stored identities (ns + value)
  *   other profile              a cluster identity in the SOURCE namespace that
  *                              is not the uploaded ID itself
- *   in your list               an other profile that is itself an uploaded
- *                              (processed) ID of THIS job
- *   category                   source_only | linked | merged_in_list |
- *                              merged_outside_list (see classifySource)
+ *   in your file               an other profile that is itself an uploaded ID
+ *                              of THIS job (stored, or no reply from AEP)
+ *   category                   not_found | source_only | linked |
+ *                              merged_in_list | merged_outside_list
+ *                              (see classifySource)
  */
 
 
@@ -166,6 +167,7 @@ export async function buildAnalysis(jobId, { pageSize = PAGE_SIZE } = {}) {
     // The job-wide DISTINCT identity count expansion computed (shared identities
     // counted once) — what deleting with linked identities removes.
     summary.identities = q().getJob.get(jobId)?.found_count ?? 0;
+    summary.noReply = q().getJob.get(jobId)?.no_reply_count ?? 0;   // never analysed: no identities (2026-10-08)
     summary.builtAt = new Date().toISOString();
     q().finishJobAnalysis.run(JSON.stringify(summary), summary.sources, jobId);
     logger.info({ jobId, sources: summary.sources, byCategory: summary.byCategory, ms: Date.now() - t0 },

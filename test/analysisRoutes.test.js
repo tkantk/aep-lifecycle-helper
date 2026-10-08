@@ -61,7 +61,7 @@ function makeJob({ mode = 'cluster' } = {}) {
 function seedFive(jobId) {
   const S = (s, members) => [[jobId, 'hashedKocid', 5000, s, s], ...members.map(([ns, id, v]) => [jobId, ns, id, v, s])];
   bulkInsertIdentities([
-    ...S('A', []),
+    ...S('A', [['hashedKocid', 5000, 'A']]),   // Adobe lists the ID itself (one own row alone = not found)
     ...S('B', [['email', 6, 'b@x'], ['ECID', 4, 'eb']]),
     ...S('C', [['hashedKocid', 5000, 'C'], ['hashedKocid', 5000, 'D'], ['email', 6, 'cd@x']]),
     ...S('D', [['hashedKocid', 5000, 'D'], ['hashedKocid', 5000, 'C'], ['email', 6, 'cd@x']]),
@@ -105,7 +105,7 @@ test('GET /analysis reports availability, status and the summary', async () => {
   const r = await get(`/api/jobs/${ready}/analysis`);
   assert.equal(r.body.status, 'ready');
   assert.equal(r.body.sourcesDone, 5);
-  assert.deepEqual(r.body.summary.byCategory, { source_only: 1, linked: 1, merged_in_list: 2, merged_outside_list: 1 });
+  assert.deepEqual(r.body.summary.byCategory, { not_found: 0, source_only: 1, linked: 1, merged_in_list: 2, merged_outside_list: 1 });
   assert.equal((await get(`/api/jobs/${uuid()}/analysis`)).status, 404);
 });
 
