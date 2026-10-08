@@ -170,6 +170,14 @@ demo — never for production. See CLAUDE.md I12.
                      failed build marks only the analysis failed; one still
                      'building' at startup is marked failed (restart). Read by
                      the Analysis tab via routes/analysisRoutes.js.
+                     EXCEL REPORT (2026-10-07, on demand): runner/analysisReport.js
+                     starts analysisReportWorker.js — a worker thread on its own
+                     read-only connection — which streams analysisWorkbook.js's
+                     workbook (Summary dashboard + one sheet per merged category,
+                     each merged uploaded ID with all its identities in one row)
+                     to data/output/job_<id>_analysis.xlsx. One build at a time;
+                     kept until the analysis is rebuilt or the job deleted; state
+                     in job_analysis.report_*.
 
   4. PLAN            Only after a FINISHED expansion (2026-10-06): planWorkOrders
      │               throws PlanNotReadyError (409 'not_expanded') unless the job
@@ -476,12 +484,24 @@ src/
 │   │                       the next day (R5 hold); never leaves an empty day
 │   │                       label. Writes only changed labels in one transaction.
 │   │                       Shipped WOs are immutable.
-│   ├── analysis.js         Identity analysis (2026-10-06): classifySource (pure),
-│   │                       buildAnalysis (keyset pages + yields, pages re-sized to
-│   │                       ~100 ms of work, one build per job, errors recorded on
-│   │                       the analysis only),
-│   │                       queueAnalysisBuild (after a cluster expansion),
-│   │                       describeSourceIdentities (drill-down + detail CSV).
+│   ├── analysis.js         Identity analysis (2026-10-06): buildAnalysis (keyset
+│   │                       pages + yields, pages re-sized to ~100 ms of work, one
+│   │                       build per job, errors recorded on the analysis only),
+│   │                       queueAnalysisBuild (after a cluster expansion); re-exports
+│   │                       the pure functions from analysisCore.js.
+│   ├── analysisCore.js     IMPORT-FREE analysis logic shared with the report worker:
+│   │                       classifySource, describeSourceIdentities, sourceNsMatcher,
+│   │                       resolveSourceNamespace, categoryChunkReader (2026-10-07).
+│   ├── analysisSql.js      IMPORT-FREE SQL text shared by the main thread and the
+│   │                       report worker (category walks, identities, top clusters).
+│   ├── analysisWorkbook.js The Excel report (ExcelJS streaming writer): Summary
+│   │                       dashboard + merged-ID sheets; identity values as TEXT
+│   │                       cells, 32,767-char cut, sheets continue past 1,048,575 rows.
+│   ├── analysisReport.js   Report orchestration on the main thread: start (one at a
+│   │                       time), state (never stale: built_for = the analysis
+│   │                       finished_at, file must exist), discard (analysis rebuild,
+│   │                       job delete), startup marks interrupted builds failed.
+│   ├── analysisReportWorker.js  Worker thread: read-only connection → workbook file.
 │   ├── identityExport.js   Expanded-identities CSV (GET /:id/export) written by
 │   │                       identityExportWorker.js in a worker thread (2026-10-06);
 │   │                       in-process only for an in-memory DB.
@@ -530,7 +550,11 @@ src/
 │   │                       GET /:id/analysis/sources (category / prefix search /
 │   │                       size|id sort / paging; 409 analysis_not_ready),
 │   │                       GET /:id/analysis/sources/:sourceId,
-│   │                       GET /:id/analysis/export?kind=summary|detail.
+│   │                       GET /:id/analysis/export?kind=summary|detail,
+│   │                       POST /:id/analysis/report[?rebuild=1] (409
+│   │                       analysis_not_ready / report_building / report_busy),
+│   │                       GET /:id/analysis/report (the .xlsx; 409 report_not_ready);
+│   │                       GET /:id/analysis also returns `report` (its state).
 │   │                       Downloads read in .all() keyset chunks (5,000 IDs in
 │   │                       ID order; 500 when rows are scattered — detail, or
 │   │                       ONE category, which walks idx_sa_job_cat_size,
@@ -730,7 +754,7 @@ data/                       Runtime state; in .gitignore.
 | `jobs` | One per upload. Status: created → expanding → expanded → ready → submitting → submitted/partial/failed. `projected_months` (Phase 2) tracks the redistributor's max month_index for shift detection. `plan_anchor_month` (2026-10-06, 'YYYY-MM' UTC) anchors month labels to the calendar (Month N = anchor + N-1). `source_column` (2026-05-31, default `'0'`) persists the upload-time CSV column so crash-recovery resumes against the same column. `expansion_mode` (2026-10-06, `'cluster'` default \| `'none'` = uploaded IDs only, set once at upload). `delete_scope` (2026-10-06, written by planning: `'cluster'` \| `'source_only'`; NULL on plans made before it existed = cluster). | FK creds_id |
 | `expanded_identities` | One row per (cluster member, source). No unique index — dedup deferred to planning via `GROUP BY` in `streamIdentitiesBySource`. Only `idx_ei_job_source(job_id, source_id)` remains; `idx_ei_job_ns` was dropped 2026-05-29 (proven via EXPLAIN QUERY PLAN to be redundant — every reader falls back to `idx_ei_job_source` with an identical plan). | FK job_id |
 | `work_orders` | One per Adobe work order. Statuses: planned → submitting → submitted → completed/failed/deferred. `month_index` (Phase 2) + `day_index` form the bucket label assigned by the redistributor on un-shipped WOs only. `last_polled_at` (2026-05-31) is the monitor's fairness cursor so >100 open WOs all get polled (no starvation). `ns_summary_json` (2026-10-06) holds per-namespace counts so list/poll/monitor paths never read `namespaces_identities` (~6 MB per 100k-id WO). (R2's `reserved_monthly` column was removed in R4 — the per-WO `quota_reservations` table records each WO's own period/count, so recovery releases exactly what was reserved.) | FK job_id, ordered by rowid |
-| `job_analysis` | (2026-10-06) One row per analysed job: status building/ready/failed, progress, `summary_json` totals. Review-only. | PK job_id, FK jobs ON DELETE CASCADE |
+| `job_analysis` | (2026-10-06) One row per analysed job: status building/ready/failed, progress, `summary_json` totals. Review-only. `report_*` (2026-10-07): the Excel report's status, rows done/total, bytes, error, `report_built_for` (the analysis `finished_at` it was made from — any other value means stale), started/finished. | PK job_id, FK jobs ON DELETE CASCADE |
 | `source_analysis` | (2026-10-06) One row per uploaded ID of an analysed job: category, cluster size, per-namespace counts, other profiles in / not in the upload. Indexed for paging by category and size. | PK(job_id, source_id), FK jobs ON DELETE CASCADE |
 | `quota_usage` | Per-period **adobe_floor** = Adobe's observed consumed (R4: `used` is vestigial; an R5 boot backfill folds any legacy `used` into `adobe_floor`). Raised ONLY by `seedFloor` (MAX with live /quota). Nothing else touches the floor — an accepted WO is held as an active reservation, never folded in, so there is no double-count vs the MAX (R5). | PK(ims_org_id, utc_date) |
 | `quota_usage_monthly` | Monthly counterpart of `quota_usage`'s `adobe_floor`. | PK(ims_org_id, utc_year_month) |

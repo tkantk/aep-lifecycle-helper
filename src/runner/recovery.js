@@ -8,6 +8,7 @@ import { decryptCreds } from '../utils/crypto.js';
 import { reactivate, markAccepted, release } from '../services/quotaManager.js';
 import { isWorkOrderPosting, markReconciling, unmarkReconciling, isWorkOrderReconciling } from './postingState.js';
 import { isDefinitiveRejection } from './submission.js';
+import { markInterruptedReports } from './analysisReport.js';
 
 // Bounded concurrency for reconcile Adobe lookups (review R10 #3). The orphans
 // are marked reconciling UP FRONT, but their lookups run in PARALLEL so one slow
@@ -601,6 +602,8 @@ export async function runStartupRecovery() {
     // still 'building' now died with the previous process (2026-10-06).
     const interrupted = q().markInterruptedAnalysesFailed.run().changes;
     if (interrupted > 0) logger.info({ interrupted }, 'startup: marked interrupted analysis builds failed');
+    const reports = markInterruptedReports();
+    if (reports > 0) logger.info({ reports }, 'startup: marked interrupted Excel report builds failed');
 
     // GC orphan quota reservations (no surviving work order) that no longer
     // count: inactive ones, OR prior-month tombstones (already excluded from the

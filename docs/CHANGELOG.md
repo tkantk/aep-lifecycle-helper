@@ -9,6 +9,62 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-10-07 — Analysis Excel report + Downloads card
+
+A shareable Excel report of the identity analysis, and all analysis downloads in one
+place. Review-only: planning, submission, quota and deletion are untouched. Suite
+**382 → 406**; browser smokes 72/72; fresh whole-change review (no Critical; three
+Important, all fixed test-first).
+
+- **Backend — the Excel report.** `POST /api/jobs/:id/analysis/report[?rebuild=1]` builds
+  `data/output/job_<id>_analysis.xlsx` in a **worker thread** on its own read-only
+  connection (`src/runner/analysisReport.js` + `analysisReportWorker.js`), so the server
+  never pauses; `GET /api/jobs/:id/analysis/report` downloads it (named after the job);
+  `GET /api/jobs/:id/analysis` returns its state. One build at a time app-wide; the file
+  is kept until the analysis is rebuilt or the job deleted (both discard it, even
+  mid-build); a report is only ever served for the analysis it was built from
+  (`job_analysis.report_built_for`), and an interrupted build is marked failed at startup.
+  New additive `job_analysis.report_*` columns.
+- **The workbook** (`src/runner/analysisWorkbook.js`, ExcelJS streaming writer):
+  - **Summary** — a dashboard in the app's Adobe colours (navy band, Adobe-red stripe):
+    tiles for uploaded IDs, distinct identities, IDs merged with a profile NOT in the
+    upload, and the **distinct** such profiles; category and namespace tables with
+    coloured in-cell bars; the 25 largest clusters; job details; a legend.
+  - **⚠ Merged · NOT in list** and **Merged · in list** — one row per merged uploaded ID,
+    largest clusters first: category, cluster size, other profiles NOT in / in the upload,
+    then one column per namespace with that ID's identities joined by "; " (plus an
+    "Other namespaces" catch-all). Identity values are text cells, never formulas; a cell
+    past Excel's 32,767-character limit ends "… (+N more)"; a sheet past 1,048,575 rows
+    continues on "(2)"; header frozen with filters.
+  - Fonts are Arial throughout (Calibri/Consolas ship only with Office — elsewhere they
+    fell back to a serif in previews).
+- **Refactor.** Pure analysis logic and its SQL moved into import-free modules
+  (`analysisCore.js`, `analysisSql.js`) shared by the main thread and the worker, which
+  must never load `db.js`. No behaviour change.
+- **Frontend — Downloads card** on the Analysis tab, replacing the easy-to-miss buttons:
+  Excel report (Build → live progress → ⤓ Download · size · built time · Rebuild; "Try
+  again" with the reason on failure), Summary CSV (follows the filter chip), Detail CSV
+  with a scope — Flagged IDs / **Every ID** / This category.
+- **Fixes from the review.** (1) The workbook was buffered in memory until the end
+  (~1.2 KB per row, ~1 GB at 0.9M rows): the writer now waits for the zip to catch up
+  after every chunk, so memory stays flat and the file grows as rows are written. (2) The
+  Excel poll shared a timer with the analysis-build poll, so rebuilding the analysis
+  during a report build froze its progress view: the Excel poll now has its own timer.
+  (3) Jobs planned before plan scopes existed read "Plan: not planned yet" in the report:
+  now "uploaded IDs + linked identities", as the app's badges show.
+- **Scale (synthetic 6.8M uploaded IDs → 33M stored identities, 894,724 merged IDs, dev
+  Mac).** Report built in **7.2 min** (target was 5: like the analysis it is disk-bound —
+  each ID's identities are scattered across a 10 GB table — and it runs entirely in the
+  background): 240 MB file, one "NOT in list" sheet (64,236 rows) and one "in list" sheet
+  (830,488 rows, under Excel's limit). The server's longest pause during the build was
+  **7 ms**; process memory grew **+151 MB** (the unfixed version buffered ~1 GB). The
+  analysis build itself took 15.2 min.
+- **Dependency.** `exceljs` ^4.4.0 (MIT, pure JS). Run `npm install` after pulling.
+- **Tests.** `analysisCore`, `analysisWorkbook`, `analysisReport`, `analysisReportRoutes`
+  (+ `webJobView` cases). Browser smokes: Downloads card 18/18 (the downloaded workbook
+  read back with openpyxl), the earlier analysis 42/42 and fix 8/8 smokes, and a poll
+  test 4/4 with intercepted server responses.
+
 ## 2026-10-06 — Identity analysis tab, "uploaded IDs only" deletion, job progress UI
 
 Adds a review report of which uploaded IDs share an Identity Graph cluster with other

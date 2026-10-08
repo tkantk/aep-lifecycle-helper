@@ -117,6 +117,7 @@ const STEPS = {
 
 function goto(step) {
   if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
+  stopExcelPoll();
   state.step = step;
   const meta = STEPS[step];
   $('#page-title').textContent = meta.title;
@@ -1049,6 +1050,7 @@ async function switchToJob(jobId) {
     // in-progress job from this point on).
     clearAutoLoadSuppression();
     if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
+    stopExcelPoll();
     // Re-render whatever tab the operator was on.
     const meta = STEPS[state.step];
     if (meta) await meta.render();
@@ -1454,6 +1456,7 @@ function analysisView() {
 const onAnalysisTab = (jobId) => state.step === 'analysis' && state.job?.id === jobId;
 
 async function renderAnalysis() {
+  stopExcelPoll();          // a ready report restarts it (paintExcelReport) if a build is running
   $('#analysis-body').innerHTML = stateHtml({ kind: 'loading', body: 'Looking for active job…' });
   await ensureActiveJobLoaded();
   if (state.step !== 'analysis') return;
@@ -1573,6 +1576,28 @@ function renderAnalysisReady(a) {
       <span>Built ${escape(formatRelativeTime(a.finishedAt))} · ${fmtNum(total)} uploaded IDs · ${fmtNum(s.identities)} distinct identities in their clusters</span>
       <button class="link-btn" id="btn-rebuild-analysis" type="button" ${a.available ? '' : 'disabled'}>↻ Rebuild</button>
     </div>
+    <div class="dl-card" id="analysis-downloads">
+      <div class="dl-card-title">Downloads</div>
+      <div class="dl-row">
+        <div class="dl-what"><b>Excel report</b><span>Dashboard + every merged ID with all its identities in one row</span></div>
+        <div class="dl-action" id="dl-excel"></div>
+      </div>
+      <div class="dl-row">
+        <div class="dl-what"><b>Summary CSV</b><span>One row per uploaded ID — follows the filter below (All = every ID)</span></div>
+        <div class="dl-action"><button class="btn btn-secondary btn-sm" id="btn-dl-summary" type="button">⤓ Summary CSV</button></div>
+      </div>
+      <div class="dl-row">
+        <div class="dl-what"><b>Detail CSV</b><span>One row per identity</span>
+          <div class="dl-scope">
+            <label><input type="radio" name="dl-detail-scope" value="flagged" checked> Flagged IDs</label>
+            <label><input type="radio" name="dl-detail-scope" value="all"> Every ID</label>
+            <label id="dl-scope-category" hidden><input type="radio" name="dl-detail-scope" value="category"> <span></span></label>
+          </div>
+          <span class="dl-note">"Every ID" is very large on big jobs (about 5 rows per uploaded ID).</span>
+        </div>
+        <div class="dl-action"><button class="btn btn-secondary btn-sm" id="btn-dl-detail" type="button">⤓ Detail CSV</button></div>
+      </div>
+    </div>
     ${outside > 0 ? `
     <div class="alert warning" id="analysis-callout">
       <div style="flex:1"><div class="alert-title">${fmtNum(outside)} uploaded ID${outside === 1 ? '' : 's'} share a cluster with a profile that is NOT in your list</div>
@@ -1609,13 +1634,7 @@ function renderAnalysisReady(a) {
         </tr>`).join('')}</tbody>
       </table></div>
     </details>` : ''}
-    <div class="section analysis-list-head">
-      <div><div class="section-head">Uploaded IDs</div><div class="section-sub">Click a row to see every identity in its cluster.</div></div>
-      <div class="analysis-dl">
-        <button class="btn btn-secondary btn-sm" id="btn-dl-summary" type="button">⤓ Summary CSV</button>
-        <button class="btn btn-secondary btn-sm" id="btn-dl-detail" type="button">⤓ Detail CSV</button>
-      </div>
-    </div>
+    <div class="section"><div class="section-head">Uploaded IDs</div><div class="section-sub">Click a row to see every identity in its cluster.</div></div>
     <div class="analysis-controls">
       <div class="filter-chips" role="tablist">
         ${chips.map(c => `<button type="button" class="filter-chip${view.category === c.key ? ' active' : ''}" data-cat="${c.key}">${escape(c.label)} <span class="n">${fmtNum(c.n)}</span></button>`).join('')}
@@ -1640,7 +1659,7 @@ function renderAnalysisReady(a) {
   const setCategory = (cat) => {
     view.category = cat; view.offset = 0;
     $$('#analysis-body .filter-chip, #analysis-body .cat-card').forEach(el => el.classList.toggle('active', el.dataset.cat === cat));
-    updateAnalysisDownloads();
+    syncDetailScope();
     loadAnalysisRows();
   };
   $$('#analysis-body .filter-chip, #analysis-body .cat-card').forEach(el =>
@@ -1666,7 +1685,8 @@ function renderAnalysisReady(a) {
   });
   onClickGuarded($('#btn-rebuild-analysis'), startAnalysisBuild, { loadingText: 'Starting…' });
   bindAnalysisDownloads();
-  updateAnalysisDownloads();
+  syncDetailScope();
+  paintExcelReport(a.report);
   loadAnalysisRows();
 }
 
@@ -1764,28 +1784,85 @@ async function openAnalysisDrill(sourceId) {
 function analysisDownloadUrl(kind) {
   const view = analysisView();
   const qs = new URLSearchParams({ kind });
-  if (view.category !== 'all') qs.set('category', view.category);
+  if (kind === 'summary') { if (view.category !== 'all') qs.set('category', view.category); }
+  else {
+    const scope = $('input[name="dl-detail-scope"]:checked')?.value || 'flagged';
+    if (scope === 'all') qs.set('category', 'all');
+    else if (scope === 'category' && view.category !== 'all') qs.set('category', view.category);
+  }
   return `${API}/jobs/${state.job.id}/analysis/export?${qs}`;
 }
-function updateAnalysisDownloads() {
+// "This category" is offered only while a category chip is active.
+function syncDetailScope() {
   const view = analysisView();
-  const label = view.category === 'all' ? null : analysisCatLabel(view.category).replace(/^⚠\s*/, '');
-  const sum = $('#btn-dl-summary'); const det = $('#btn-dl-detail');
-  if (sum) sum.textContent = `⤓ Summary CSV (${label || 'all IDs'})`;
-  if (det) det.textContent = `⤓ Detail CSV (${label || 'flagged IDs'})`;
+  const wrap = $('#dl-scope-category');
+  if (!wrap) return;
+  wrap.hidden = view.category === 'all';
+  wrap.querySelector('span').textContent = view.category === 'all' ? '' : `This category (${analysisCatLabel(view.category).replace(/^⚠\s*/, '')})`;
+  if (wrap.hidden && wrap.querySelector('input').checked) $('input[name="dl-detail-scope"][value="flagged"]').checked = true;
 }
-// The download buttons are re-created with each report render; they read the
-// current filter at click time.
 function bindAnalysisDownloads() {
   for (const [sel, kind] of [['#btn-dl-summary', 'summary'], ['#btn-dl-detail', 'detail']]) {
-    const btn = $(sel);
-    if (!btn || btn.dataset.bound) continue;
-    btn.dataset.bound = '1';
-    onClickGuarded(btn, async () => {
+    onClickGuarded($(sel), async () => {
       window.location.href = analysisDownloadUrl(kind);
       await new Promise(r => setTimeout(r, 3000));     // no double-download on a rapid re-click
     });
   }
+}
+// Excel report: build in the background, poll while building, then download.
+function paintExcelReport(report) {
+  const el = $('#dl-excel');
+  if (!el) return;
+  const v = window.AepJobView.excelReportView(report);
+  const when = report?.finishedAt ? ` · built ${escape(formatRelativeTime(report.finishedAt))}` : '';
+  el.innerHTML = v.state === 'building'
+    ? `<div class="dl-progress"><div class="progress-bar"><div class="progress-fill" style="width:${v.pct}%"></div></div>
+         <span>${escape(v.label)} · ${fmtNum(report.rowsDone)} of ${fmtNum(report.rowsTotal)} rows</span></div>`
+    : v.state === 'ready'
+      ? `<button class="btn btn-primary btn-sm" id="btn-dl-excel" type="button">${escape(v.label)}</button>
+         <span class="dl-meta">${escape(v.size)}${when}</span>
+         <button class="link-btn" id="btn-excel-rebuild" type="button">Rebuild</button>`
+      : `<button class="btn btn-primary btn-sm" id="btn-excel-build" type="button">${escape(v.label)}</button>
+         ${v.error ? `<span class="dl-error">${escape(v.error)}</span>` : ''}`;
+  onClickGuarded($('#btn-excel-build'), () => startExcelReport(false), { loadingText: 'Starting…' });
+  onClickGuarded($('#btn-excel-rebuild'), () => startExcelReport(true), { loadingText: 'Starting…' });
+  onClickGuarded($('#btn-dl-excel'), async () => {
+    window.location.href = `${API}/jobs/${state.job.id}/analysis/report`;
+    await new Promise(r => setTimeout(r, 3000));
+  });
+  if (v.state === 'building') pollExcelReport();
+}
+async function startExcelReport(rebuild) {
+  try {
+    paintExcelReport(await http('POST', `/jobs/${state.job.id}/analysis/report${rebuild ? '?rebuild=1' : ''}`));
+  } catch (err) {
+    // Already building (e.g. started from another tab): follow its progress.
+    if (err.status === 409 && err.data?.error === 'report_building') { pollExcelReport(); return; }
+    showToast(err.data?.message || `Could not build the Excel report: ${err.message}`, { kind: err.status === 409 ? 'warning' : 'error' });
+  }
+}
+// The Excel poll has its OWN timer: sharing state.pollTimer with the analysis
+// build's poll let a rebuild started mid-report find a timer "already running",
+// skip its own poll, and freeze at its first progress value (review, 2026-10-07).
+let excelPollTimer = null;
+function stopExcelPoll() {
+  if (excelPollTimer) { clearInterval(excelPollTimer); excelPollTimer = null; }
+}
+function pollExcelReport() {
+  if (excelPollTimer) return;
+  const jobId = state.job.id;
+  let busy = false;
+  excelPollTimer = setInterval(async () => {
+    if (busy) return;
+    busy = true;
+    try {
+      const a = await http('GET', `/jobs/${jobId}/analysis`);
+      if (!onAnalysisTab(jobId)) { stopExcelPoll(); return; }
+      if (a.report?.status !== 'building') stopExcelPoll();
+      paintExcelReport(a.report);
+    } catch { /* transient — keep polling */ }
+    finally { busy = false; }
+  }, 2000);
 }
 
 // ─── Plan ─────────────────────────────────────────────────────────────

@@ -175,7 +175,9 @@ Turn the concurrency dial up from the conservative default of 5 (e.g.
                    identities or other profiles — ⚠ "Merged · not in list"
                    means deleting with linked identities also deletes a
                    profile you did not upload. Filter, search, drill into a
-                   cluster, download Summary / Detail CSVs. Review only.
+                   cluster. The Downloads card offers an Excel report (a
+                   dashboard sheet + every merged ID with all its identities
+                   in one row), a Summary CSV and a Detail CSV. Review only.
       ↓
 4. Batch Planning  Choose what the plan deletes: uploaded IDs + linked
                    identities (default) or uploaded IDs only. Re-planning
@@ -347,7 +349,9 @@ All under `/api/` on `http://127.0.0.1:3000`.
 | GET | `/api/jobs/:id/analysis` | Analysis status, progress and totals |
 | GET | `/api/jobs/:id/analysis/sources?category=&search=&sort=size\|id&limit=&offset=` | Page through the per-ID report |
 | GET | `/api/jobs/:id/analysis/sources/:sourceId` | One uploaded ID's cluster, each identity's relation |
-| GET | `/api/jobs/:id/analysis/export?kind=summary\|detail&category=` | Streamed Summary / Detail CSV |
+| GET | `/api/jobs/:id/analysis/export?kind=summary\|detail&category=` | Streamed Summary / Detail CSV (`category=all` = every ID) |
+| POST | `/api/jobs/:id/analysis/report[?rebuild=1]` | Build the Excel report in the background (one at a time) |
+| GET | `/api/jobs/:id/analysis/report` | Download the finished Excel report (`.xlsx`) |
 
 ### Settings
 
@@ -443,11 +447,15 @@ the in-progress job from where it left off.
 
 - **Disk.** A 6.8M-ID job with identity expansion stores ~36M identity rows
   (~12 GB in `data/state.db`); the Analysis report built after expansion adds
-  ~3–4 GB more. Back up `data/state.db` and check free space first.
+  ~3–4 GB more, and each Excel report file (in `data/output/`) is about
+  270 MB per million merged IDs (240 MB at a 6.8M-ID test job — Excel takes a while
+  to open a file that size). Back up `data/state.db` and check free space first.
+- **New dependency (2026-10-07).** The Excel report uses `exceljs`; run
+  `npm install` on the machine after pulling this version.
 - **Don't plan or delete a large job while a submission is running.** Planning
   a 6.8M-ID job with linked identities runs ~15 minutes and deleting a job
   removes every row in one statement — both pause the whole server meanwhile.
-  (Export CSV and the Analysis downloads are safe: they never pause it.)
+  (Export CSV, the Analysis downloads and the Excel report are safe: they never pause it.)
 - **Check the prod machine first:** run `npm test` with the Node version it
   uses, open the Analysis tab and download an Export CSV on a small job.
 

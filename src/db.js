@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { config } from './config.js';
 import { logger } from './utils/logger.js';
+import { IDENTITIES_FOR_SOURCE_RANGE_SQL, HAS_PROCESSED_SOURCE_SQL } from './runner/analysisSql.js';
 
 /**
  * SQLite state store.
@@ -340,6 +341,16 @@ export function initDb() {
     // planWorkOrders with the work orders; NULL on jobs planned before this
     // column existed (they were planned as 'cluster').
     { table: 'jobs', column: 'delete_scope', type: 'TEXT' },
+    // 2026-10-07: the analysis Excel report (runner/analysisReport.js) — one per
+    // job's analysis; built_for = the analysis finished_at it was built from.
+    { table: 'job_analysis', column: 'report_status', type: 'TEXT' },
+    { table: 'job_analysis', column: 'report_rows_done', type: 'INTEGER NOT NULL DEFAULT 0' },
+    { table: 'job_analysis', column: 'report_rows_total', type: 'INTEGER' },
+    { table: 'job_analysis', column: 'report_bytes', type: 'INTEGER' },
+    { table: 'job_analysis', column: 'report_error', type: 'TEXT' },
+    { table: 'job_analysis', column: 'report_built_for', type: 'TEXT' },
+    { table: 'job_analysis', column: 'report_started_at', type: 'TEXT' },
+    { table: 'job_analysis', column: 'report_finished_at', type: 'TEXT' },
   ];
   for (const { table, column, type } of additiveColumns) {
     try {
@@ -941,6 +952,20 @@ function prepared() {
     `),
     getJobAnalysis: db.prepare('SELECT * FROM job_analysis WHERE job_id = ?'),
     getSourceAnalysis: db.prepare('SELECT * FROM source_analysis WHERE job_id = ? AND source_id = ?'),
+    startReport: db.prepare(`UPDATE job_analysis SET report_status = 'building', report_rows_done = 0,
+      report_rows_total = @rowsTotal, report_bytes = NULL, report_error = NULL, report_built_for = @builtFor,
+      report_started_at = datetime('now'), report_finished_at = NULL WHERE job_id = @jobId`),
+    finishReport: db.prepare(`UPDATE job_analysis SET report_status = 'ready', report_rows_done = @rowsDone,
+      report_bytes = @bytes, report_error = NULL, report_finished_at = datetime('now') WHERE job_id = @jobId`),
+    failReport: db.prepare(`UPDATE job_analysis SET report_status = 'failed', report_error = ?,
+      report_finished_at = datetime('now') WHERE job_id = ?`),
+    clearReport: db.prepare(`UPDATE job_analysis SET report_status = NULL, report_rows_done = 0, report_rows_total = NULL,
+      report_bytes = NULL, report_error = NULL, report_built_for = NULL, report_started_at = NULL,
+      report_finished_at = NULL WHERE job_id = ?`),
+    listBuildingReports: db.prepare(`SELECT job_id FROM job_analysis WHERE report_status = 'building'`),
+    markInterruptedReportsFailed: db.prepare(`UPDATE job_analysis SET report_status = 'failed',
+      report_error = 'interrupted by restart — build it again', report_finished_at = datetime('now')
+      WHERE report_status = 'building'`),
     // A build only runs inside this process; one still 'building' at startup died
     // with the previous process.
     markInterruptedAnalysesFailed: db.prepare(`
@@ -965,10 +990,7 @@ function prepared() {
        ORDER BY source_id LIMIT ?
     `),
     // Every stored identity of a contiguous range of uploaded IDs.
-    identitiesForSourceRange: db.prepare(`
-      SELECT source_id, ns_code, ns_id, identity_id FROM expanded_identities
-       WHERE job_id = ? AND source_id >= ? AND source_id <= ?
-    `),
+    identitiesForSourceRange: db.prepare(IDENTITIES_FOR_SOURCE_RANGE_SQL),
     // The canonical {code, id} expansion stored for an uploaded ID's own row —
     // used when the job has no stored source nsid (jobs planned before it was
     // persisted). The first rows of a job are source rows, so this stops early.
@@ -977,9 +999,7 @@ function prepared() {
        WHERE job_id = ? AND identity_id = source_id AND ns_id IS NOT NULL
        LIMIT 1
     `),
-    hasProcessedSource: db.prepare(`
-      SELECT 1 FROM expanded_identities WHERE job_id = ? AND source_id = ? LIMIT 1
-    `),
+    hasProcessedSource: db.prepare(HAS_PROCESSED_SOURCE_SQL),
     // Work orders stuck mid-submission: process was killed after quota reserve
     // but before (or during) the Adobe POST. Adobe may or may not have received
     // it — reconciliation queries Adobe and updates status accordingly.
