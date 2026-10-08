@@ -9,6 +9,7 @@ import { decryptCreds } from '../utils/crypto.js';
 import { liveProgress } from '../runner/expansion.js';
 import { registerAnalysisRoutes } from './analysisRoutes.js';
 import { exportIdentitiesCsv } from '../runner/identityExport.js';
+import { discardAnalysisReport } from '../runner/analysisReport.js';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { registerUuidParamGuards, UUID_RE } from '../middleware/security.js';
@@ -509,6 +510,9 @@ router.delete('/:id', async (req, res, next) => {
     q().deleteReservationsForJob.run({ jobId });
     // CASCADE FK constraints on expanded_identities + work_orders collapse all
     // dependent rows in this single statement (the deletion is atomic).
+    // Stop an Excel-report build for this job and remove its file (the
+    // analysis rows go with the cascade below).
+    discardAnalysisReport(jobId);
     q().deleteJob.run(jobId);
 
     // Best-effort filesystem cleanup. Failures here aren't fatal — the DB

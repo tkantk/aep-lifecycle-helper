@@ -4,6 +4,9 @@ import {
   analysisAvailability, isAnalysisBuilding, buildAnalysis, describeSourceIdentities, sourceNamespaceOf,
   ANALYSIS_CATEGORIES, AnalysisUnavailableError, AnalysisRunningError,
 } from '../runner/analysis.js';
+import { categoryChunkReader } from '../runner/analysisCore.js';
+import { startAnalysisReport, reportState, reportPath, reportDownloadName } from '../runner/analysisReport.js';
+import { SA_COLS, SA_CATEGORY_FIRST_SQL, SA_CATEGORY_SAME_SIZE_SQL, SA_CATEGORY_SMALLER_SQL } from '../runner/analysisSql.js';
 import { streamCsv } from '../utils/csv.js';
 import { logger } from '../utils/logger.js';
 
@@ -94,29 +97,16 @@ function pageStatement({ category, sort, search }) {
 // source_only) walks the primary key in uploaded-ID order. ONE category walks
 // idx_sa_job_cat_size, largest clusters first: in ID order a sparse category
 // (1% of 6.8M IDs) scanned ~500k rows for every chunk — 2.6 s event-loop blocks.
-const CHUNK_COLS = 'source_id, category, identities_total, linked_total, ns_counts_json, other_in_list, other_not_in_list';
 const chunkStatements = new Map();
 function chunkStatement(filter) {
   let st = chunkStatements.get(filter);
   if (!st) {
     if (filter === 'one') {
-      st = [
-        // the category's first chunk
-        db.prepare(`SELECT ${CHUNK_COLS} FROM source_analysis
-                     WHERE job_id = @jobId AND category = @category
-                     ORDER BY identities_total DESC, source_id LIMIT @limit`),
-        // the rest of the current cluster size …
-        db.prepare(`SELECT ${CHUNK_COLS} FROM source_analysis
-                     WHERE job_id = @jobId AND category = @category AND identities_total = @size AND source_id > @after
-                     ORDER BY source_id LIMIT @limit`),
-        // … then the next smaller sizes
-        db.prepare(`SELECT ${CHUNK_COLS} FROM source_analysis
-                     WHERE job_id = @jobId AND category = @category AND identities_total < @size
-                     ORDER BY identities_total DESC, source_id LIMIT @limit`),
-      ];
+      // first chunk · rest of the current cluster size · then smaller sizes
+      st = [db.prepare(SA_CATEGORY_FIRST_SQL), db.prepare(SA_CATEGORY_SAME_SIZE_SQL), db.prepare(SA_CATEGORY_SMALLER_SQL)];
     } else {
       const cond = filter === 'flagged' ? "AND category <> 'source_only'" : '';
-      st = db.prepare(`SELECT ${CHUNK_COLS} FROM source_analysis
+      st = db.prepare(`SELECT ${SA_COLS} FROM source_analysis
                         WHERE job_id = @jobId AND source_id > @after ${cond}
                         ORDER BY source_id LIMIT @limit`);
     }
@@ -131,13 +121,7 @@ async function* analysisChunks(jobId, filter, category, chunkSize = EXPORT_CHUNK
   const next = (() => {
     if (filter === 'one') {
       const [first, sameSize, smaller] = chunkStatement('one');
-      return (last) => {
-        if (!last) return first.all({ jobId, category, limit: chunkSize });
-        const chunk = sameSize.all({ jobId, category, size: last.identities_total, after: last.source_id, limit: chunkSize });
-        return chunk.length < chunkSize
-          ? chunk.concat(smaller.all({ jobId, category, size: last.identities_total, limit: chunkSize - chunk.length }))
-          : chunk;
-      };
+      return categoryChunkReader({ first, sameSize, smaller }, { jobId, category, chunkSize });
     }
     const st = chunkStatement(filter);
     return (last) => st.all({ jobId, after: last ? last.source_id : '', limit: chunkSize });
@@ -192,6 +176,32 @@ export function registerAnalysisRoutes(router) {
         error: a?.error ?? null,
         startedAt: a?.started_at ?? null,
         finishedAt: a?.finished_at ?? null,
+        report: a ? reportState(job.id) : null,       // the Excel report (2026-10-07)
+      });
+    } catch (err) { next(err); }
+  });
+
+  /** POST /api/jobs/:id/analysis/report[?rebuild=1] — build the Excel report in a
+   *  worker thread (2026-10-07). 409 analysis_not_ready / report_building /
+   *  report_busy. Poll GET /:id/analysis → report. */
+  router.post('/:id/analysis/report', (req, res, next) => {
+    try {
+      const job = loadJob(req, res);
+      if (!job) return;
+      res.json(startAnalysisReport(job.id, { rebuild: req.query.rebuild === '1' }));
+    } catch (err) { next(err); }
+  });
+
+  /** GET /api/jobs/:id/analysis/report — the finished workbook (409 report_not_ready). */
+  router.get('/:id/analysis/report', (req, res, next) => {
+    try {
+      const job = loadJob(req, res);
+      if (!job) return;
+      if (reportState(job.id).status !== 'ready') {
+        throw httpError(409, 'report_not_ready', 'The Excel report is not ready — build it first.');
+      }
+      res.download(reportPath(job.id), reportDownloadName(job), {
+        headers: { 'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', 'Cache-Control': 'no-store' },
       });
     } catch (err) { next(err); }
   });

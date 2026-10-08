@@ -1196,10 +1196,24 @@ tbody.loading { opacity: 0.55; transition: opacity 0.15s; }
 /* Action bars wrap as whole buttons instead of squeezing labels onto two lines. */
 .actions { flex-wrap: wrap; }
 .actions .btn { white-space: nowrap; }
-.section.analysis-list-head { flex-direction: row; justify-content: space-between; align-items: flex-end; gap: 12px; flex-wrap: wrap; }
-.analysis-dl { display: flex; gap: 8px; flex-wrap: wrap; }
 .plan-scope-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; font-size: 13px; }
 .show-all-row { margin: 8px 14px 12px; }
 .modal-badges { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
 
 @media (max-width: 900px) { .choice-cards { grid-template-columns: 1fr; } }
+
+/* ─── Analysis downloads card (2026-10-07) ───────────────── */
+.dl-card { border: 1px solid var(--g200); border-radius: 6px; padding: 4px 14px; margin-bottom: 16px; background: white; }
+.dl-card-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.3px; color: var(--g700); padding: 10px 0 2px; }
+.dl-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 10px 0; border-top: 1px solid var(--g100); }
+.dl-card-title + .dl-row { border-top: none; }
+.dl-what { display: flex; flex-direction: column; gap: 2px; font-size: 12.5px; min-width: 0; }
+.dl-what span { color: var(--g600); }
+.dl-scope { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 4px; font-size: 12px; }
+.dl-scope label { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+.dl-note { font-size: 11px; color: var(--g500); }
+.dl-action { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+.dl-meta { font-size: 11.5px; color: var(--g600); white-space: nowrap; }
+.dl-error { font-size: 11.5px; color: var(--red600); max-width: 260px; }
+.dl-progress { display: flex; align-items: center; gap: 10px; font-size: 11.5px; color: var(--g600); white-space: nowrap; }
+.dl-progress .progress-bar { width: 120px; }

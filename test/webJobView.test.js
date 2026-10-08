@@ -100,3 +100,15 @@ test('scope estimates: from the analysis summary when ready, else from the job c
   assert.deepEqual(plain(V.scopeEstimates(job({ found_count: 0, processed_count: 0, total_source_ids: 0 }), null, 100)),
     { cluster: { identities: 0, workOrders: 0 }, sourceOnly: { identities: 0, workOrders: 0 } });
 });
+
+test('excelReportView: the Excel button for every report state', () => {
+  assert.deepEqual(plain(V.excelReportView(null)), { state: 'none', label: 'Build Excel report', pct: 0, size: '', error: '', action: 'build' });
+  assert.deepEqual(plain(V.excelReportView({ status: 'building', rowsDone: 405112, rowsTotal: 894724 })),
+    { state: 'building', label: 'Building… 45%', pct: 45, size: '', error: '', action: null });
+  assert.deepEqual(plain(V.excelReportView({ status: 'ready', bytes: 93323264 })),
+    { state: 'ready', label: '⤓ Download Excel report', pct: 100, size: '89.0 MB', error: '', action: 'download' });
+  assert.deepEqual(plain(V.excelReportView({ status: 'ready', bytes: 524288 })).size, '512 KB');
+  assert.deepEqual(plain(V.excelReportView({ status: 'failed', error: 'disk full' })),
+    { state: 'failed', label: 'Try again', pct: 0, size: '', error: 'disk full', action: 'build' });
+  assert.equal(V.excelReportView({ status: 'building', rowsDone: 0, rowsTotal: 0 }).pct, 0);
+});

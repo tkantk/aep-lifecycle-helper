@@ -134,10 +134,27 @@
     return { cluster: off ? null : est(linked), sourceOnly: est(sources) };
   }
 
+  /** The Excel-report button for a report state (GET /analysis → report). */
+  function excelReportView(report) {
+    var r = report || {};
+    function size(b) {
+      if (!(b > 0)) return '';
+      return b >= 1048576 ? (b / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(b / 1024)) + ' KB';
+    }
+    if (r.status === 'building') {
+      var pct = r.rowsTotal > 0 ? Math.min(100, Math.floor(100 * (r.rowsDone || 0) / r.rowsTotal)) : 0;
+      return { state: 'building', label: 'Building… ' + pct + '%', pct: pct, size: '', error: '', action: null };
+    }
+    if (r.status === 'ready') return { state: 'ready', label: '⤓ Download Excel report', pct: 100, size: size(r.bytes), error: '', action: 'download' };
+    if (r.status === 'failed') return { state: 'failed', label: 'Try again', pct: 0, size: '', error: r.error || 'The build failed.', action: 'build' };
+    return { state: 'none', label: 'Build Excel report', pct: 0, size: '', error: '', action: 'build' };
+  }
+
   root.AepJobView = {
     steps: steps,
     badges: badges,
     scopeEstimates: scopeEstimates,
     submitProgress: submitProgress,
+    excelReportView: excelReportView,
   };
 })(typeof window !== 'undefined' ? window : globalThis);
