@@ -64,12 +64,13 @@ test('expansion fails closed when the Identity Graph returns zero linked members
     { id: 11124296, code: 'hashedKocid', name: 'Hashed KOCID', custom: true, status: 'ACTIVE' },
   ]);
   // Adobe returns NO clusters at all — the wrong-region/empty fingerprint.
-  nock(REGION).post('/data/core/identity/clusters/members').reply(200, { version: '1.1.0', clusters: [] });
+  // Twice: the batch, then the re-ask for the IDs it left out (2026-10-08).
+  nock(REGION).post('/data/core/identity/clusters/members').times(2).reply(200, { version: '1.1.0', clusters: [] });
 
   await assert.rejects(() => runExpansion({
     jobId, uploadPath: csv, sourceNamespace: 'hashedKocid', sourceNamespaceId: 11124296,
     credsId, sandboxName: 'prod', column: 0,
-  }));
+  }), /0 linked identities across all/);
 
   assert.equal(q().getJob.get(jobId).status, 'failed',
     'an all-empty graph must mark the job failed, not expanded');
@@ -103,13 +104,14 @@ test('empty-graph fail-closed also fires on a RESUME (crash mid-empty-expansion 
   nock(REGION).get('/data/core/idnamespace/identities').reply(200, [
     { id: 11124296, code: 'hashedKocid', name: 'Hashed KOCID', custom: true, status: 'ACTIVE' },
   ]);
-  nock(REGION).post('/data/core/identity/clusters/members').reply(200, { version: '1.1.0', clusters: [] });
+  // Twice: the batch, then the re-ask for the IDs it left out (2026-10-08).
+  nock(REGION).post('/data/core/identity/clusters/members').times(2).reply(200, { version: '1.1.0', clusters: [] });
 
   await assert.rejects(() => runExpansion({
     jobId, uploadPath: csv, sourceNamespace: 'hashedKocid', sourceNamespaceId: 11124296,
     credsId, sandboxName: 'prod', column: 0,
     skipSourceIds: new Set(['src-a']),   // RESUME
-  }));
+  }), /0 linked identities across all/);
 
   assert.equal(q().getJob.get(jobId).status, 'failed',
     'a resume of an all-empty expansion must still fail closed');

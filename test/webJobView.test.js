@@ -112,3 +112,8 @@ test('excelReportView: the Excel button for every report state', () => {
     { state: 'failed', label: 'Try again', pct: 0, size: '', error: 'disk full', action: 'build' });
   assert.equal(V.excelReportView({ status: 'building', rowsDone: 0, rowsTotal: 0 }).pct, 0);
 });
+
+test('the Expand step mentions IDs with no reply from AEP', () => {
+  assert.equal(byKey(V.steps(job({ found_count: 450, no_reply_count: 3 }))).expand.hint, '450 identities found · 3 no reply from AEP');
+  assert.equal(byKey(V.steps(job({ found_count: 450 }))).expand.hint, '450 identities found');
+});

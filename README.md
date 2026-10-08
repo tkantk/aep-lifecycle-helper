@@ -169,15 +169,23 @@ Turn the concurrency dial up from the conservative default of 5 (e.g.
                    deleted). Fixed for the job once uploaded.
 3. Expansion       Batches of 1000 IDs to /identity/clusters/members,
                    5 concurrent. Results inserted to SQLite (dedup at plan).
+                   IDs Adobe leaves out of its reply are asked about once
+                   more; any still missing are "No reply from AEP": listed
+                   (Expansion tab, ⤓ CSV), not planned on their own, and the
+                   job still finishes. If AEP answers nothing at all for the
+                   whole job (usually a wrong region/namespace) it stops
+                   instead, and Resume asks about every ID again once fixed.
       ↓
 3a. Analysis       Built automatically after expansion (Identity Graph jobs).
-                   Shows which uploaded IDs share a cluster with other
-                   identities or other profiles — ⚠ "Merged · not in list"
-                   means deleting with linked identities also deletes a
-                   profile you did not upload. Filter, search, drill into a
-                   cluster. The Downloads card offers an Excel report (a
-                   dashboard sheet + every merged ID with all its identities
-                   in one row), a Summary CSV and a Detail CSV. Review only.
+                   Puts every uploaded ID in one group: Not found in AEP ·
+                   Only itself · Linked identities · Merged with a profile in
+                   your file · ⚠ Merged with a profile NOT in your file (deleting
+                   with linked identities also deletes that profile's
+                   identities). Filter, search, drill into a cluster. The
+                   Downloads card offers an Excel report (a dashboard sheet +
+                   every merged ID with all its identities in one row + the
+                   Not found / No reply lists), a Summary CSV, a Detail CSV and
+                   the No reply list. Review only.
       ↓
 4. Batch Planning  Choose what the plan deletes: uploaded IDs + linked
                    identities (default) or uploaded IDs only. Re-planning
@@ -352,6 +360,7 @@ All under `/api/` on `http://127.0.0.1:3000`.
 | GET | `/api/jobs/:id/analysis/export?kind=summary\|detail&category=` | Streamed Summary / Detail CSV (`category=all` = every ID) |
 | POST | `/api/jobs/:id/analysis/report[?rebuild=1]` | Build the Excel report in the background (one at a time) |
 | GET | `/api/jobs/:id/analysis/report` | Download the finished Excel report (`.xlsx`) |
+| GET | `/api/jobs/:id/no-reply` | CSV of the uploaded IDs AEP never answered for, even when asked again — not in any plan |
 
 ### Settings
 
@@ -490,6 +499,9 @@ the in-progress job from where it left off.
 | `403` on quota or plan — "needs Data Hygiene product profile" | Integration lacks hygiene permissions | See **Permissions** section below |
 | `429` spikes during expansion | Concurrency too high | Lower `IDENTITY_CONCURRENCY` in `.env` |
 | Expansion stuck at 0% | No Identity Graph data for namespace | Verify the source namespace matches what's in AEP |
+| Expansion finished with "No reply from AEP for N uploaded IDs" | Adobe's reply left those IDs out, even when asked again (why is not known — Adobe documents an empty answer for IDs it doesn't know) | They are not planned on their own. Download the list; look a few up in AEP; upload the list as a new job to try them again |
+| Expansion stops: "Identity Graph reply could not be read" | Adobe's reply held entries the tool can't match while IDs were missing — a reply-format problem, not unknown IDs | Resume retries the batch; if it repeats, share the message with whoever maintains the tool |
+| Expansion fails: "0 linked identities across all N source(s)" | Wrong region/namespace, or none of the IDs exist in AEP any more | Check the credential region and source namespace, then press **Resume** — it asks Adobe about every ID again. If AEP knows none of these IDs (e.g. already deleted), there is nothing to delete |
 | `Work order has N ids, exceeds per-order limit` | Bug in planner | Re-run plan step (orders are re-created) |
 | Plan blocked with "Adobe quota unreachable" | `/quota` returned 403/network error or no recent cache | Check permissions first (see below); then confirm IMS auth is still valid |
 | Submit denied: `quota_unavailable` 503 | Adobe `/quota` outage + no recent cache | Try again once Adobe is reachable; the 24h hard floor protects against blind shipping |

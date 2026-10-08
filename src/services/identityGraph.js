@@ -27,9 +27,12 @@ import { canonicalizeNamespace } from './namespaces.js';
  * `compositeXid.id` (Adobe documents "one entry per requested XID regardless of
  * cluster association"). There is NO positional fallback (review R4 #2) —
  * guessing by array position could silently mis-assign one source's cluster to
- * another. The batch FAILS CLOSED on any source Adobe didn't return, on
- * Adobe-reported `unprocessedXids`/`unprocessedNids`, or on an unrecognized
- * response shape, rather than emit a source-only partial delete.
+ * another. expandBatch FAILS CLOSED on any source Adobe didn't return;
+ * expandBatchDetailed reports a clean omission in `missing` (the runner re-asks,
+ * then records "no reply from AEP" — never planned or deleted). Both fail closed
+ * on Adobe-reported `unprocessedXids`/`unprocessedNids`, an unrecognized response
+ * shape, or unreadable entries while IDs are missing, rather than emit a
+ * source-only partial delete.
  */
 
 // Defence-in-depth allowlist — see services/namespaces.js for the rationale.
@@ -63,10 +66,11 @@ function endpoint(region) {
  * @param {number} [p.namespaceId]      Numeric nsid if known - preferred for custom namespaces
  * @param {string[]} p.ids
  * @param {object} [p.namespaceIndex]   Output of buildNamespaceIndex(), used to canonicalize results
- * @returns {Promise<Array<{ sourceId, sourceNamespace: {code, id}, linkedIdentities: [{namespace:{code, id}, id}] }>>}
+ * @returns {Promise<{ results: Array<{ sourceId, sourceNamespace: {code, id}, linkedIdentities: [{namespace:{code, id}, id}] }>,
+ *                     missing: string[] }>}  missing = IDs sent that the reply cleanly left out
  */
-export async function expandBatch({ creds, sandboxName, namespace, namespaceId, ids, namespaceIndex }) {
-  if (ids.length === 0) return [];
+export async function expandBatchDetailed({ creds, sandboxName, namespace, namespaceId, ids, namespaceIndex }) {
+  if (ids.length === 0) return { results: [], missing: [] };
   if (ids.length > 1000) throw new Error(`Batch too large: ${ids.length} (max 1000)`);
 
   const client = createAdobeClient(creds, sandboxName);
@@ -146,15 +150,19 @@ export async function expandBatch({ creds, sandboxName, namespace, namespaceId, 
     { ns: namespace, nsid: namespaceId }, namespaceIndex
   );
 
-  // REQUIRE every requested source to be matched by id — NO positional fallback
-  // (review #2). Adobe documents "one entry per requested XID regardless of
-  // cluster association"; a missing entry is anomalous (wrong region / partial
-  // response). Guessing by array position would silently mis-assign a source to
-  // another source's cluster. Fail closed on any unmatched source.
-  const unmatched = [];
-  const out = ids.map((sourceId) => {
+  // Every requested source is matched by id — NO positional fallback (review #2).
+  // Adobe documents "one entry per requested XID regardless of cluster
+  // association". A CLEAN omission — some IDs absent while every entry Adobe did
+  // return matches an ID we sent — goes back to the caller in `missing` (the
+  // runner re-asks once, then records "no reply from AEP"; 2026-10-08). Entries
+  // that match no ID we sent while IDs are missing may be those IDs in another
+  // form, so that fails closed: skipping them could leave real profiles undeleted.
+  const requested = new Set(ids);
+  const missing = [];
+  const results = [];
+  for (const sourceId of ids) {
     const cluster = clusterBySourceId.get(sourceId);
-    if (!cluster) { unmatched.push(sourceId); return null; }
+    if (!cluster) { missing.push(sourceId); continue; }
     const rawMembers = cluster.members || cluster.identities || [];
     const linkedIdentities = rawMembers.map(node => {
       const ns = canonicalizeNamespace(
@@ -162,14 +170,50 @@ export async function expandBatch({ creds, sandboxName, namespace, namespaceId, 
       );
       return { namespace: ns, id: node.id };
     });
-    return { sourceId, sourceNamespace: sourceNs, linkedIdentities };
-  });
+    results.push({ sourceId, sourceNamespace: sourceNs, linkedIdentities });
+  }
+  if (missing.length) {
+    const unreadable = clustersArray.filter(c => !requested.has(c?.compositeXid?.id ?? c?.xid));
+    if (unreadable.length) {
+      throw new Error(
+        `Identity Graph reply could not be read: ${unreadable.length} of its ${clustersArray.length} ` +
+        `entries match none of the ${ids.length} IDs sent (entry keys: ${describeEntryKeys(unreadable)}), and ` +
+        `${missing.length} ID(s) sent got no entry (e.g. ${missing.slice(0, 3).join(', ')}). This looks like a ` +
+        `reply-format problem, not unknown IDs — the expansion stopped so nothing is deleted by halves. ` +
+        `Resume retries the batch; if it repeats, share this message with whoever maintains the tool.`);
+    }
+  }
+  return { results, missing };
+}
 
-  if (unmatched.length) {
+// Field names a reply entry may carry (current + legacy shapes). Only these are
+// named in the reply-format error; other keys are only counted — an unknown key
+// may itself be an identity value, and ID lists never go to logs (final review #2).
+const KNOWN_ENTRY_KEYS = new Set(['compositeXid', 'xid', 'members', 'identities', 'nsid', 'ns', 'id']);
+
+function describeEntryKeys(entries) {
+  const known = new Set(), other = new Set(), types = new Set();
+  for (const c of entries) {
+    if (c && typeof c === 'object') for (const k of Object.keys(c)) (KNOWN_ENTRY_KEYS.has(k) ? known : other).add(k);
+    else types.add(c === null ? 'null' : typeof c);
+  }
+  let keys = [...known].sort().join(', ');
+  if (other.size) keys += `${keys ? ' ' : ''}(+${other.size} other key${other.size === 1 ? '' : 's'})`;
+  return [keys, ...[...types].sort()].filter(Boolean).join(', ') || 'none';
+}
+
+/**
+ * Expand a batch, failing closed on ANY source Adobe's reply left out — the
+ * original contract, kept for every caller except the expansion runner (which
+ * uses expandBatchDetailed to re-ask and record "no reply from AEP").
+ */
+export async function expandBatch(args) {
+  const { results, missing } = await expandBatchDetailed(args);
+  if (missing.length) {
     throw new Error(
-      `Identity Graph response did not include ${unmatched.length} of ${ids.length} ` +
-      `requested source identity(ies) (e.g. ${unmatched.slice(0, 3).join(', ')}) — refusing to ` +
+      `Identity Graph response did not include ${missing.length} of ${args.ids.length} ` +
+      `requested source identity(ies) (e.g. ${missing.slice(0, 3).join(', ')}) — refusing to ` +
       `emit them as source-only deletions. Retry; verify the credential region and source namespace.`);
   }
-  return out;
+  return results;
 }

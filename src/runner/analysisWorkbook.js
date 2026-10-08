@@ -4,7 +4,8 @@ import { describeSourceIdentities, sourceNsMatcher } from './analysisCore.js';
 /**
  * The identity-analysis Excel report (2026-10-07): a "Summary" dashboard sheet in
  * Adobe colours, then one sheet per merged category listing every uploaded ID with
- * all of its identities in ONE row (one column per namespace). Streamed with
+ * all of its identities in ONE row (one column per namespace), and one-column lists
+ * of the uploaded IDs not found in AEP / with no reply from AEP (2026-10-08). Streamed with
  * ExcelJS (rows are written and released as they go); runs in a worker thread
  * (analysisReportWorker.js), so it must not import db.js / config.js. Identity
  * values are TEXT cells, never formulas. The writer waits for the zip to catch up
@@ -12,22 +13,31 @@ import { describeSourceIdentities, sourceNsMatcher } from './analysisCore.js';
  */
 export const EXCEL_MAX_DATA_ROWS = 1_048_575;   // 1,048,576 rows per sheet incl. the header
 export const EXCEL_MAX_CELL_CHARS = 32_767;
-export const REPORT_SHEETS = { merged_outside_list: '⚠ Merged · NOT in list', merged_in_list: 'Merged · in list' };
+// Tab names stay ≤ 31 chars even with an overflow suffix up to " (10)".
+export const REPORT_SHEETS = { merged_outside_list: '⚠ Merged · NOT in file', merged_in_list: 'Merged · in file',
+  not_found: 'Not found in AEP', no_reply: 'No reply from AEP' };
 export const CATEGORY_LABEL = {
-  source_only: 'Only itself', linked: 'Linked identities',
-  merged_in_list: 'Merged · in your list', merged_outside_list: '⚠ Merged · NOT in list',
+  not_found: 'Not found in AEP', source_only: 'Only itself', linked: 'Linked identities',
+  merged_in_list: 'Merged with a profile in your file', merged_outside_list: '⚠ Merged with a profile NOT in your file',
 };
 const CATEGORY_MEANING = {
-  source_only: 'Nothing else is in its cluster.',
-  linked: 'Other identities (email, ECID, …) but no other profile.',
-  merged_in_list: 'Shares its cluster with other uploaded IDs of this job.',
-  merged_outside_list: 'Shares its cluster with a profile you did NOT upload.',
+  not_found: 'AEP has no identities for it — deleted on its own.',
+  source_only: 'In AEP, nothing else linked.',
+  linked: 'Its own email, ECID, phone… no other profile.',
+  merged_in_list: 'That profile is being deleted too.',
+  merged_outside_list: "Deleting also removes that profile's identities.",
 };
-const ORDER = ['source_only', 'linked', 'merged_in_list', 'merged_outside_list'];
+// An analysis built before "Not found in AEP" existed (no not_found key): those IDs
+// are still counted under "Only itself" — say so rather than show 0 (final review #4).
+const legacyAnalysis = (summary) => !Object.prototype.hasOwnProperty.call(summary.byCategory || {}, 'not_found');
+const LEGACY_NOT_FOUND = 'This analysis was built before "Not found in AEP" existed — rebuild the analysis, then this report, to see these IDs.';
+const NO_REPLY_LABEL = 'No reply from AEP';
+const NO_REPLY_MEANING = "AEP didn't answer for it, even when asked again — not in the plan.";
+const ORDER = ['not_found', 'source_only', 'linked', 'merged_in_list', 'merged_outside_list'];
 const COLOR = { navy: 'FF000B1D', red: 'FFFA0F00', blue: 'FF1473E6', purple: 'FF9256D9', orange: 'FFE68619',
-  grey50: 'FFF5F5F5', grey200: 'FFE1E1E1', grey500: 'FF8E8E8E', grey600: 'FF6E6E6E', ink: 'FF1F1F1F', white: 'FFFFFFFF' };
-const CATEGORY_COLOR = { source_only: COLOR.grey500, linked: COLOR.blue, merged_in_list: COLOR.purple, merged_outside_list: COLOR.orange };
-const CATEGORY_TINT = { source_only: 'FFF0F0F0', linked: 'FFE8F1FC', merged_in_list: 'FFF2EBFA', merged_outside_list: 'FFFCEFE2' };
+  grey50: 'FFF5F5F5', grey200: 'FFE1E1E1', grey500: 'FF8E8E8E', grey600: 'FF6E6E6E', grey700: 'FF4B4B4B', ink: 'FF1F1F1F', white: 'FFFFFFFF' };
+const CATEGORY_COLOR = { not_found: COLOR.grey700, source_only: COLOR.grey500, linked: COLOR.blue, merged_in_list: COLOR.purple, merged_outside_list: COLOR.orange };
+const CATEGORY_TINT = { not_found: 'FFEAEAEA', source_only: 'FFF0F0F0', linked: 'FFE8F1FC', merged_in_list: 'FFF2EBFA', merged_outside_list: 'FFFCEFE2' };
 const BAR = 20;                                   // cells per in-cell bar
 const FIRST_BAR = 5, LAST_COL = 26;               // E..X = bar, Z = notes
 const solid = (argb) => ({ type: 'pattern', pattern: 'solid', fgColor: { argb } });
@@ -128,12 +138,15 @@ function writeSummary(wb, { meta, summary, outsideProfiles, topClusters }) {
   span(5, 2, LAST_COL, `Analysis built ${meta.analysisBuiltAt} · Report generated ${meta.generatedAt}`,
     { font: font({ size: 9, color: { argb: COLOR.grey600 } }) });
 
-  // Tiles (rows 7-9).
+  // Tiles (rows 7-9). "Asked" = every uploaded ID Adobe was asked about: the
+  // analysed ones plus those it never answered for (no reply, 2026-10-08).
+  const notFound = summary.byCategory.not_found || 0, noReply = summary.noReply || 0, asked = summary.sources + noReply;
   const tiles = [
-    [2, 2, 'UPLOADED IDS', summary.sources, 'analysed', COLOR.navy],
+    [2, 2, 'UPLOADED IDS', asked, notFound || noReply
+      ? `${notFound.toLocaleString('en-US')} not found · ${noReply.toLocaleString('en-US')} no reply` : 'analysed', COLOR.navy],
     [3, 4, 'DISTINCT IDENTITIES', summary.identities, 'in their clusters', COLOR.blue],
-    [5, 24, '⚠ MERGED · NOT IN LIST', summary.byCategory.merged_outside_list || 0, 'uploaded IDs', COLOR.orange],
-    [26, 26, 'PROFILES NOT IN YOUR LIST', outsideProfiles, 'distinct — also deleted with linked identities', COLOR.orange],
+    [5, 24, '⚠ MERGED · NOT IN FILE', summary.byCategory.merged_outside_list || 0, 'uploaded IDs', COLOR.orange],
+    [26, 26, 'PROFILES NOT IN YOUR FILE', outsideProfiles, 'distinct — also deleted with linked identities', COLOR.orange],
   ];
   for (const [c1, c2, label, value, sub, argb] of tiles) {
     for (let r = 7; r <= 9; r++) paint(r, c1, c2, { fill: solid(COLOR.grey50) });
@@ -153,10 +166,23 @@ function writeSummary(wb, { meta, summary, outsideProfiles, topClusters }) {
     row++;
     const n = summary.byCategory[cat] || 0;
     style(ws.getCell(row, 2), { value: CATEGORY_LABEL[cat], font: font({ bold: true, color: { argb: CATEGORY_COLOR[cat] } }) });
+    if (cat === 'not_found' && legacyAnalysis(summary)) {
+      style(ws.getCell(row, 3), { value: '—', font: font(), alignment: { horizontal: 'right' } });
+      style(ws.getCell(row, 26), { value: LEGACY_NOT_FOUND, font: font({ color: { argb: COLOR.grey600 } }) });
+      continue;
+    }
     style(ws.getCell(row, 3), { value: n, numFmt: '#,##0', font: font() });
-    style(ws.getCell(row, 4), { value: pct(n, summary.sources), numFmt: '0.0%', font: font() });
-    bar(row, pct(n, summary.sources), CATEGORY_COLOR[cat]);
+    style(ws.getCell(row, 4), { value: pct(n, asked), numFmt: '0.0%', font: font() });
+    bar(row, pct(n, asked), CATEGORY_COLOR[cat]);
     style(ws.getCell(row, 26), { value: CATEGORY_MEANING[cat], font: font({ color: { argb: COLOR.grey600 } }) });
+  }
+  if (noReply > 0) {
+    row++;
+    style(ws.getCell(row, 2), { value: NO_REPLY_LABEL, font: font({ bold: true, color: { argb: COLOR.red } }) });
+    style(ws.getCell(row, 3), { value: noReply, numFmt: '#,##0', font: font() });
+    style(ws.getCell(row, 4), { value: pct(noReply, asked), numFmt: '0.0%', font: font() });
+    bar(row, pct(noReply, asked), COLOR.red);
+    style(ws.getCell(row, 26), { value: NO_REPLY_MEANING, font: font({ color: { argb: COLOR.grey600 } }) });
   }
 
   const srcKey = meta.sourceNamespace;
@@ -173,12 +199,12 @@ function writeSummary(wb, { meta, summary, outsideProfiles, topClusters }) {
   }
 
   section('TOP 25 LARGEST CLUSTERS');
-  head([[2, 'Uploaded ID'], [5, 'Category'], [26, 'Identities · profiles NOT in your list']]);
+  head([[2, 'Uploaded ID'], [5, 'Category'], [26, 'Identities · profiles NOT in your file']]);
   for (const t of topClusters) {
     row++;
     span(row, 2, 4, t.source_id, { font: font({ size: 9 }) });
     span(row, 5, 24, CATEGORY_LABEL[t.category] || t.category, { font: font({ color: { argb: CATEGORY_COLOR[t.category] || COLOR.ink } }) });
-    style(ws.getCell(row, 26), { value: `${t.identities_total.toLocaleString('en-US')} identities · ${(t.other_not_in_list || 0).toLocaleString('en-US')} NOT in list`, font: font() });
+    style(ws.getCell(row, 26), { value: `${t.identities_total.toLocaleString('en-US')} identities · ${(t.other_not_in_list || 0).toLocaleString('en-US')} NOT in your file`, font: font() });
   }
 
   section('JOB DETAILS');
@@ -186,7 +212,8 @@ function writeSummary(wb, { meta, summary, outsideProfiles, topClusters }) {
     ['Job ID', meta.jobId], ['Job name', meta.jobName], ['Created', meta.createdAt], ['Sandbox', meta.sandbox],
     ['Source namespace', meta.sourceNamespace], ['Identity expansion', meta.expansionMode === 'none' ? 'Off — uploaded IDs only' : 'On — Identity Graph'],
     ['Plan (when generated)', scopeText(meta.deleteScope).replace('Plan: ', '')], ['Uploaded IDs (file rows)', meta.totalSourceIds],
-    ['Distinct identities', meta.foundCount], ['Analysis built', meta.analysisBuiltAt], ['Report generated', meta.generatedAt],
+    ['Distinct identities', meta.foundCount], ['No reply from AEP (not in plan)', noReply],
+    ['Analysis built', meta.analysisBuiltAt], ['Report generated', meta.generatedAt],
   ]) {
     row++;
     style(ws.getCell(row, 2), { value: label, font: font({ color: { argb: COLOR.grey600 } }) });
@@ -200,15 +227,20 @@ function writeSummary(wb, { meta, summary, outsideProfiles, topClusters }) {
     style(ws.getCell(row, 2), { value: CATEGORY_LABEL[cat], font: font({ bold: true, color: { argb: CATEGORY_COLOR[cat] } }) });
     span(row, 3, LAST_COL, CATEGORY_MEANING[cat], { font: font() });
   }
+  if (noReply > 0) {                              // explains a row that exists
+    row++;
+    style(ws.getCell(row, 2), { value: NO_REPLY_LABEL, font: font({ bold: true, color: { argb: COLOR.red } }) });
+    span(row, 3, LAST_COL, NO_REPLY_MEANING, { font: font() });
+  }
   row++;
-  span(row, 3, LAST_COL, "Deleting with linked identities removes every identity in each uploaded ID's cluster — including profiles NOT in your list.",
+  span(row, 3, LAST_COL, "Deleting with linked identities removes every identity in each uploaded ID's cluster — including profiles NOT in your file.",
     { font: font({ bold: true, color: { argb: COLOR.orange } }) });
   ws.commit();
 }
 
 async function writeCategorySheets(wb, { category, meta, namespaces, readers, describe, maxRowsPerSheet, progress }) {
   const title = REPORT_SHEETS[category];
-  const headers = [meta.sourceNamespace, 'Category', 'Identities', 'Profiles NOT in list', 'Profiles in list', ...namespaces, 'Other namespaces'];
+  const headers = [meta.sourceNamespace, 'Category', 'Identities', 'Profiles NOT in your file', 'Profiles in your file', ...namespaces, 'Other namespaces'];
   const columns = new Set(namespaces);
   let part = 0, inSheet = 0, total = 0, ws = null;
   const open = () => {
@@ -260,6 +292,43 @@ async function writeCategorySheets(wb, { category, meta, namespaces, readers, de
   return total;
 }
 
+/** A one-column list of uploaded IDs (Not found in AEP · No reply from AEP), continued on "(2)". */
+async function writeListSheet(wb, { title, header, argb, chunks, maxRowsPerSheet, progress, emptyNote }) {
+  let part = 0, inSheet = 0, total = 0, ws = null;
+  const open = () => {
+    part++;
+    ws = wb.addWorksheet(part === 1 ? title : `${title} (${part})`, {
+      views: [{ state: 'frozen', ySplit: 1 }], properties: { tabColor: { argb } },
+    });
+    ws.columns = [{ header, width: 66 }];
+    const head = ws.getRow(1);
+    head.font = font({ bold: true, color: { argb: COLOR.white } });
+    head.fill = solid(COLOR.navy);
+    head.height = 20;
+    head.commit();
+    inSheet = 0;
+  };
+  open();
+  for await (const chunk of chunks) {
+    for (const r of chunk) {
+      if (inSheet === maxRowsPerSheet) { ws.commit(); open(); }
+      const added = ws.addRow([r.source_id]);
+      added.font = font();
+      added.commit();
+      inSheet++; total++;
+    }
+    await letZipCatchUp(ws);
+    progress(chunk.length);
+  }
+  if (total === 0 && emptyNote) {
+    const note = ws.addRow([emptyNote]);
+    note.font = font({ italic: true, color: { argb: COLOR.grey600 } });
+    note.commit();
+  }
+  ws.commit();
+  return total;
+}
+
 export async function writeAnalysisWorkbook({ filename, meta, summary, sourceNs, readers,
   maxRowsPerSheet = EXCEL_MAX_DATA_ROWS, onProgress = () => {} }) {
   const describe = (sourceId) => describeSourceIdentities({ sourceId, sourceNs, rows: readers.identitiesOf(sourceId), isInList: readers.isInList });
@@ -276,6 +345,13 @@ export async function writeAnalysisWorkbook({ filename, meta, summary, sourceNs,
   const progress = (n) => { rows += n; onProgress(rows); };
   for (const category of ['merged_outside_list', 'merged_in_list']) {
     await writeCategorySheets(wb, { category, meta, namespaces, readers, describe, maxRowsPerSheet, progress });
+  }
+  await writeListSheet(wb, { title: REPORT_SHEETS.not_found, header: meta.sourceNamespace, argb: CATEGORY_COLOR.not_found,
+    chunks: readers.categoryChunks('not_found'), maxRowsPerSheet, progress,
+    emptyNote: legacyAnalysis(summary) ? LEGACY_NOT_FOUND : 'No uploaded ID came back from AEP with no identities.' });
+  if ((summary.noReply || 0) > 0) {
+    await writeListSheet(wb, { title: REPORT_SHEETS.no_reply, header: meta.sourceNamespace, argb: COLOR.red,
+      chunks: readers.noReplyChunks(), maxRowsPerSheet, progress });
   }
   await wb.commit();
   return { rows, outsideProfiles: outside.size };

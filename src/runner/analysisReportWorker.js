@@ -8,7 +8,7 @@ import { parentPort, workerData } from 'node:worker_threads';
 import Database from 'better-sqlite3';
 import { categoryChunkReader } from './analysisCore.js';
 import { SA_CATEGORY_FIRST_SQL, SA_CATEGORY_SAME_SIZE_SQL, SA_CATEGORY_SMALLER_SQL,
-  IDENTITIES_FOR_SOURCE_RANGE_SQL, HAS_PROCESSED_SOURCE_SQL, TOP_CLUSTERS_SQL } from './analysisSql.js';
+  IDENTITIES_FOR_SOURCE_RANGE_SQL, HAS_PROCESSED_SOURCE_SQL, TOP_CLUSTERS_SQL, NO_REPLY_CHUNK_SQL } from './analysisSql.js';
 import { writeAnalysisWorkbook } from './analysisWorkbook.js';
 
 const { dbPath, jobId, tmpPath, meta, summary, sourceNs, maxRowsPerSheet } = workerData;
@@ -22,6 +22,7 @@ try {
   const identities = conn.prepare(IDENTITIES_FOR_SOURCE_RANGE_SQL);
   const processed = conn.prepare(HAS_PROCESSED_SOURCE_SQL);
   const top = conn.prepare(TOP_CLUSTERS_SQL);
+  const noReply = conn.prepare(NO_REPLY_CHUNK_SQL);
   const readers = {
     async *categoryChunks(category) {
       const next = categoryChunkReader(stmts, { jobId, category, chunkSize: CHUNK });
@@ -30,6 +31,9 @@ try {
     identitiesOf: (sourceId) => identities.all(jobId, sourceId, sourceId),
     isInList: (value) => !!processed.get(jobId, value),
     topClusters: (n) => top.all(jobId, n),
+    async *noReplyChunks() {
+      for (let after = '', chunk; (chunk = noReply.all(jobId, after, CHUNK)).length; after = chunk[chunk.length - 1].source_id) yield chunk;
+    },
   };
   const res = await writeAnalysisWorkbook({ filename: tmpPath, meta, summary, sourceNs, readers,
     maxRowsPerSheet: maxRowsPerSheet || undefined,

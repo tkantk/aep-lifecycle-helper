@@ -131,6 +131,17 @@ demo — never for production. See CLAUDE.md I12.
                      via namespace registry index → {code, id}. Plain INSERT into
                      expanded_identities (no unique index — dedup is deferred to
                      planning time via GROUP BY in streamIdentitiesBySource).
+                     IDs the reply cleanly leaves out (2026-10-08) are asked about
+                     ONCE more on their own; any still missing go to
+                     no_reply_sources (+ jobs.no_reply_count) in the SAME
+                     transaction as the batch's rows — never planned or deleted,
+                     listed via GET /api/jobs/:id/no-reply — and the job finishes
+                     (failing the batch stalled it for good: Resume re-sends the
+                     same IDs first). Resume skips them (HAS_PROCESSED_SOURCE_SQL
+                     = stored identities OR no reply) — except after the
+                     empty-graph guard trips: AEP answered nothing for the whole
+                     job (wrong region/namespace), so clearNoReply() forgets them
+                     and Resume asks again once the setup is fixed.
                      Wave-based scheduling: WAVE_SIZE = concurrency × 2 tasks
                      run in parallel; onRow is async so the CSV stream pauses
                      when the wave fills, capping peak heap at O(concurrency ×
@@ -161,10 +172,14 @@ demo — never for production. See CLAUDE.md I12.
 
   3b. ANALYSE        runner/analysis.js — a REVIEW report, never read by
      │               planning or submission. Keyset pages of 2,000 uploaded
-     ▼               IDs; each cluster classified source_only | linked |
-                     merged_in_list | merged_outside_list ("other profile" =
-                     another identity in the source namespace; "in list" =
-                     it is itself an uploaded ID of this job). One transaction
+     ▼               IDs; each cluster classified not_found | source_only |
+                     linked | merged_in_list | merged_outside_list ("other
+                     profile" = another identity in the source namespace; "in
+                     your file" = it is itself an uploaded ID of this job,
+                     stored or no reply). not_found (2026-10-08) = one own row
+                     and nothing else: Adobe answered with no identities (it
+                     lists an ID it knows in its own cluster, which adds a
+                     second own row); still planned as a single-ID delete. One transaction
                      per page into source_analysis, a setImmediate yield
                      between pages, totals in job_analysis.summary_json. A
                      failed build marks only the analysis failed; one still
@@ -174,7 +189,8 @@ demo — never for production. See CLAUDE.md I12.
                      starts analysisReportWorker.js — a worker thread on its own
                      read-only connection — which streams analysisWorkbook.js's
                      workbook (Summary dashboard + one sheet per merged category,
-                     each merged uploaded ID with all its identities in one row)
+                     each merged uploaded ID with all its identities in one row,
+                     + "Not found in AEP" / "No reply from AEP" ID lists)
                      to data/output/job_<id>_analysis.xlsx. One build at a time;
                      kept until the analysis is rebuilt or the job deleted; state
                      in job_analysis.report_*.
@@ -393,6 +409,9 @@ src/
 │   │                       Tagged {idempotent:true} (POST as side-effect-free
 │   │                       query). Parses current shape {version, clusters:[
 │   │                       {compositeXid, members}]} AND legacy bare-array.
+│   │                       expandBatchDetailed → {results, missing} (2026-10-08:
+│   │                       a clean omission is reported, not thrown); expandBatch
+│   │                       keeps the throw-on-missing contract.
 │   ├── hygiene.js          POST /hygiene/workorder + exhaustive pre-network
 │   │                       validation (datasetId, namespacesIdentities,
 │   │                       targetServices). Throws WorkOrderValidationError
@@ -554,7 +573,9 @@ src/
 │   │                       POST /:id/analysis/report[?rebuild=1] (409
 │   │                       analysis_not_ready / report_building / report_busy),
 │   │                       GET /:id/analysis/report (the .xlsx; 409 report_not_ready);
-│   │                       GET /:id/analysis also returns `report` (its state).
+│   │                       GET /:id/analysis also returns `report` (its state);
+│   │                       GET /:id/no-reply (2026-10-08: CSV of the uploaded IDs
+│   │                       AEP never answered for).
 │   │                       Downloads read in .all() keyset chunks (5,000 IDs in
 │   │                       ID order; 500 when rows are scattered — detail, or
 │   │                       ONE category, which walks idx_sa_job_cat_size,
@@ -722,7 +743,7 @@ data/                       Runtime state; in .gitignore.
 - Request: `{ compositeXids:[{ns,nsid,id}], "graph-type": "Private Graph" }`
 - **Current response** (AEP v1.1.0, observed): `{ version, clusters:[{compositeXid:{nsid,id}, members:[{nsid,id},...]}] }` — members have no `ns` code; canonicalize via registry.
 - **Legacy response** (older regions may still emit): bare array `[{xid, identities:[{ns,nsid,id}]}]`.
-- Matching: STRICTLY by `compositeXid.id` (no positional fallback, review R4 #2). Fails closed on any unmatched source, on `unprocessedXids`/`unprocessedNids`, or on an unrecognized shape.
+- Matching: STRICTLY by `compositeXid.id` (no positional fallback, review R4 #2). Fails closed on `unprocessedXids`/`unprocessedNids` or an unrecognized shape. Adobe documents one entry per ID sent; a **clean omission** (some IDs absent, every returned entry matches an ID sent) is asked about once more, and IDs still absent are recorded as "no reply from AEP" — never planned or deleted (2026-10-08). Entries that match no ID sent **while IDs are missing** fail closed ("reply could not be read") — they may be those IDs in another form. `expandBatch` (non-runner callers) still throws on any missing ID.
 
 **Work order** `POST platform.adobe.io/data/core/hygiene/workorder`
 - See CLAUDE.md I1 for the exact payload contract. Key rules: `action: "delete_identity"`, `datasetId` ∈ `ALL` | single | comma list, `targetServices` iff `datasetId === "ALL"`, total ids ≤ 100k, each namespace group identified by `code` OR `id` OR both.
@@ -751,11 +772,12 @@ data/                       Runtime state; in .gitignore.
 |---|---|---|
 | `credentials` | AES-GCM encrypted secrets | UNIQUE(environment, ims_org_id, client_id) |
 | `sandbox_configs` | Cached sandbox metadata + datasets + namespaces | PK(creds_id, sandbox_name) |
-| `jobs` | One per upload. Status: created → expanding → expanded → ready → submitting → submitted/partial/failed. `projected_months` (Phase 2) tracks the redistributor's max month_index for shift detection. `plan_anchor_month` (2026-10-06, 'YYYY-MM' UTC) anchors month labels to the calendar (Month N = anchor + N-1). `source_column` (2026-05-31, default `'0'`) persists the upload-time CSV column so crash-recovery resumes against the same column. `expansion_mode` (2026-10-06, `'cluster'` default \| `'none'` = uploaded IDs only, set once at upload). `delete_scope` (2026-10-06, written by planning: `'cluster'` \| `'source_only'`; NULL on plans made before it existed = cluster). | FK creds_id |
+| `jobs` | One per upload. Status: created → expanding → expanded → ready → submitting → submitted/partial/failed. `projected_months` (Phase 2) tracks the redistributor's max month_index for shift detection. `plan_anchor_month` (2026-10-06, 'YYYY-MM' UTC) anchors month labels to the calendar (Month N = anchor + N-1). `source_column` (2026-05-31, default `'0'`) persists the upload-time CSV column so crash-recovery resumes against the same column. `expansion_mode` (2026-10-06, `'cluster'` default \| `'none'` = uploaded IDs only, set once at upload). `delete_scope` (2026-10-06, written by planning: `'cluster'` \| `'source_only'`; NULL on plans made before it existed = cluster). `no_reply_count` (2026-10-08) = rows in `no_reply_sources`. | FK creds_id |
 | `expanded_identities` | One row per (cluster member, source). No unique index — dedup deferred to planning via `GROUP BY` in `streamIdentitiesBySource`. Only `idx_ei_job_source(job_id, source_id)` remains; `idx_ei_job_ns` was dropped 2026-05-29 (proven via EXPLAIN QUERY PLAN to be redundant — every reader falls back to `idx_ei_job_source` with an identical plan). | FK job_id |
 | `work_orders` | One per Adobe work order. Statuses: planned → submitting → submitted → completed/failed/deferred. `month_index` (Phase 2) + `day_index` form the bucket label assigned by the redistributor on un-shipped WOs only. `last_polled_at` (2026-05-31) is the monitor's fairness cursor so >100 open WOs all get polled (no starvation). `ns_summary_json` (2026-10-06) holds per-namespace counts so list/poll/monitor paths never read `namespaces_identities` (~6 MB per 100k-id WO). (R2's `reserved_monthly` column was removed in R4 — the per-WO `quota_reservations` table records each WO's own period/count, so recovery releases exactly what was reserved.) | FK job_id, ordered by rowid |
 | `job_analysis` | (2026-10-06) One row per analysed job: status building/ready/failed, progress, `summary_json` totals. Review-only. `report_*` (2026-10-07): the Excel report's status, rows done/total, bytes, error, `report_built_for` (the analysis `finished_at` it was made from — any other value means stale), started/finished. | PK job_id, FK jobs ON DELETE CASCADE |
-| `source_analysis` | (2026-10-06) One row per uploaded ID of an analysed job: category, cluster size, per-namespace counts, other profiles in / not in the upload. Indexed for paging by category and size. | PK(job_id, source_id), FK jobs ON DELETE CASCADE |
+| `source_analysis` | (2026-10-06) One row per uploaded ID of an analysed job: category (`not_found` added 2026-10-08), cluster size, per-namespace counts, other profiles in / not in the upload. Indexed for paging by category and size. | PK(job_id, source_id), FK jobs ON DELETE CASCADE |
+| `no_reply_sources` | (2026-10-08) Uploaded IDs the Identity Graph left out of its reply even when asked again. No `expanded_identities` rows, so never planned or deleted; written in the batch's transaction; skipped on Resume; listed by `GET /api/jobs/:id/no-reply`. | PK(job_id, source_id) WITHOUT ROWID, FK jobs ON DELETE CASCADE |
 | `quota_usage` | Per-period **adobe_floor** = Adobe's observed consumed (R4: `used` is vestigial; an R5 boot backfill folds any legacy `used` into `adobe_floor`). Raised ONLY by `seedFloor` (MAX with live /quota). Nothing else touches the floor — an accepted WO is held as an active reservation, never folded in, so there is no double-count vs the MAX (R5). | PK(ims_org_id, utc_date) |
 | `quota_usage_monthly` | Monthly counterpart of `quota_usage`'s `adobe_floor`. | PK(ims_org_id, utc_year_month) |
 | `quota_reservations` | **Per-work-order quota reservation** (R4 #1; R5 lifecycle): (work_order_id) → count + utc_date + utc_year_month + active + **accepted**. `effective_used(period) = adobe_floor(period) + Σ active reservations(period)`. `reserve`→pending(accepted=0); `markAccepted`→accepted=1 (Adobe acked); `release` deactivates IFF accepted=0; `reactivate`→active+accepted. **HOLD-UNTIL-ROLLOVER (R5):** an accepted reservation is NEVER dropped mid-period (no `complete()`, no timer/floor-delta drop — all over-ship under a concurrent external consumer); it's held until the period-keyed SUM stops matching it at UTC day/month rollover. | PK(work_order_id) |

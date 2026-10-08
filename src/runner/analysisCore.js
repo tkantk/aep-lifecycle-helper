@@ -4,7 +4,7 @@
  * the Excel-report worker thread (analysisReportWorker.js), which must never load
  * db.js — that would open the app database inside the worker.
  */
-export const ANALYSIS_CATEGORIES = ['source_only', 'linked', 'merged_in_list', 'merged_outside_list'];
+export const ANALYSIS_CATEGORIES = ['not_found', 'source_only', 'linked', 'merged_in_list', 'merged_outside_list'];
 
 export const nsKeyOf = (row) => row.ns_code || (row.ns_id != null ? `nsid:${row.ns_id}` : 'unknown');
 
@@ -26,7 +26,8 @@ export function sourceNsMatcher(sourceNs) {
 }
 
 /**
- * Classify ONE uploaded ID from its stored identity rows (pure).
+ * Classify ONE uploaded ID from its stored identity rows (pure): not_found ·
+ * source_only · linked · merged_in_list · merged_outside_list.
  *
  * @param {{ sourceId: string, sourceNs: {code?: string|null, id?: number|null},
  *           rows: Array<{ns_code, ns_id, identity_id}>, isInList: (value: string) => boolean }} args
@@ -35,7 +36,7 @@ export function sourceNsMatcher(sourceNs) {
 export function classifySource({ sourceId, sourceNs, rows, isInList }) {
   const { matches: inSourceNs, key: srcKey } = sourceNsMatcher(sourceNs);
 
-  let selfSeen = false;
+  let selfRows = 0;
   const otherProfiles = new Set();     // values — same namespace, so the value is the identity
   const seenLinked = new Set();        // `${nsKey}\0${value}` for every other namespace
   const nsCounts = new Map();
@@ -44,7 +45,7 @@ export function classifySource({ sourceId, sourceNs, rows, isInList }) {
     const value = row.identity_id;
     let key;
     if (inSourceNs(row)) {
-      if (value === sourceId) { selfSeen = true; continue; }
+      if (value === sourceId) { selfRows++; continue; }
       if (otherProfiles.has(value)) continue;
       otherProfiles.add(value);
       key = srcKey;
@@ -63,12 +64,18 @@ export function classifySource({ sourceId, sourceNs, rows, isInList }) {
   const otherNotInList = otherProfiles.size - otherInList;
 
   let category;
-  if (otherProfiles.size === 0) category = linkedTotal === 0 ? 'source_only' : 'linked';
-  else category = otherNotInList > 0 ? 'merged_outside_list' : 'merged_in_list';
+  if (otherProfiles.size > 0) category = otherNotInList > 0 ? 'merged_outside_list' : 'merged_in_list';
+  else if (linkedTotal > 0) category = 'linked';
+  // Expansion stores the uploaded ID once on its own, and once more for every
+  // reply that lists it as a cluster member — Adobe lists an ID it knows in its
+  // own cluster. One own row and nothing else = Adobe returned no identities:
+  // AEP doesn't know this ID (2026-10-08). Limit: an unknown ID uploaded twice
+  // has two own rows and reads "Only itself".
+  else category = selfRows < 2 ? 'not_found' : 'source_only';
 
   return {
     category,
-    identitiesTotal: linkedTotal + (selfSeen ? 1 : 0),
+    identitiesTotal: linkedTotal + (selfRows > 0 ? 1 : 0),
     linkedTotal,
     nsCounts: Object.fromEntries(nsCounts),
     otherInList,

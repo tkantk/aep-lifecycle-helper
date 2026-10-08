@@ -335,10 +335,12 @@
         <div class="panel drill-panel" id="analysis-drill" hidden></div>
         <div class="panel">
           <div class="panel-title">Categories</div>
-          <p><span class="cat-badge source_only">Only itself</span> the cluster holds nothing but the uploaded ID.</p>
-          <p><span class="cat-badge linked">Linked identities</span> other identities (email, ECID, …) but no other profile.</p>
-          <p><span class="cat-badge merged_in_list">Merged · in your list</span> the cluster also holds other uploaded IDs of this job.</p>
-          <p><span class="cat-badge merged_outside_list">⚠ Merged · not in list</span> the cluster holds a profile that is <b>not</b> in your upload. Deleting with linked identities also deletes that profile's identities.</p>
+          <p><span class="cat-badge not_found">Not found in AEP</span> AEP has no identities for the uploaded ID. It is still deleted on its own.</p>
+          <p><span class="cat-badge source_only">Only itself</span> in AEP, but nothing else is linked to it.</p>
+          <p><span class="cat-badge linked">Linked identities</span> its own email, ECID, phone… but no other profile.</p>
+          <p><span class="cat-badge merged_in_list">Merged with a profile in your file</span> AEP merged it with another uploaded ID — that profile is being deleted too.</p>
+          <p><span class="cat-badge merged_outside_list">⚠ Merged with a profile NOT in your file</span> AEP merged it with a profile you did <b>not</b> upload. Deleting with linked identities also deletes that profile's identities.</p>
+          <p><span class="cat-badge no_reply">No reply from AEP</span> AEP left the ID out of its answer, even when asked again. It is not in the plan.</p>
         </div>
         <div class="panel">
           <div class="panel-title">Downloads</div>

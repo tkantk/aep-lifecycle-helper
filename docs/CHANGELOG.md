@@ -9,6 +9,98 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-10-08 — IDs AEP doesn't answer for, "Not found in AEP", clearer group names
+
+A colleague's 1M-ID expansion stopped with *"Identity Graph response did not include N of M
+requested source identity(ies)"*, and every Resume stopped again. Reproduced against a mock:
+a failed batch is re-sent first on Resume, so a job whose IDs Adobe keeps leaving out of its
+reply can never finish. Adobe documents one reply entry per requested ID, even with no
+cluster; why it left these out is unproven (the error names up to 3 examples to look up in
+AEP). Nothing was ever at risk: expansion only reads from AEP.
+
+- **Backend — re-ask, then "No reply from AEP".**
+  - `identityGraph.expandBatchDetailed` returns `{ results, missing }`: a clean omission
+    (every entry Adobe returned matches an ID sent) is reported instead of thrown.
+  - `expandBatch` keeps the throw-on-missing contract for every other caller.
+  - The expansion runner asks once more for just the missing IDs. Any still missing are
+    written to the new `no_reply_sources` table (+ `jobs.no_reply_count`) in the same
+    transaction as the batch's identities.
+  - They get no `expanded_identities` rows, so they are **never planned or deleted**, and the
+    job finishes.
+  - Resume skips them: `HAS_PROCESSED_SOURCE_SQL` is now "stored identities OR no reply",
+    two indexed point lookups. The same lookup makes the analysis count such an ID as "in
+    your file".
+- **Safety — still fails closed:** on an unrecognized reply shape, on Adobe's
+  `unprocessedXids`/`unprocessedNids`, on **unreadable entries while IDs are missing** (they
+  may be those IDs in another form; new message *"Identity Graph reply could not be
+  read…"*), and on an all-empty graph.
+  - Only a clean omission that survives a re-ask proceeds, and those IDs are not deleted, so
+    no partial delete is possible. The worst case is an ID AEP does know being left
+    undeleted, and it is listed.
+  - The empty-graph stop now also says "or that none of these IDs exist in AEP any more" and
+    how many got no reply.
+  - **When AEP answers nothing for the whole job** (the documented wrong-region reply is
+    `{clusters: []}`), the guard also clears that job's "no reply" records
+    (`db.clearNoReply`). After the region is fixed, Resume asks Adobe about every ID again,
+    as it did before this change. Final review #1: without this, the job could never
+    recover. A still-wrong setup just fails again; the guard is never bypassed.
+- **"Not found in AEP"** — a new analysis group (`not_found`, first in the display order).
+  - It means Adobe answered with no identities: the ID has one stored row of its own and
+    nothing else. Adobe lists an ID it knows in its own cluster, which adds a second row.
+  - It works on jobs already expanded: **rebuild the analysis** to see it.
+  - These IDs are still planned as single-ID deletions, as before.
+  - Known limit: an unknown ID that appears twice in the upload reads "Only itself".
+  - The Detail CSV's "Flagged IDs" leaves the group out. CSVs keep the category keys, so
+    `not_found` is a new value in the `category` column.
+- **Names that say whose profile:** Not found in AEP · Only itself · Linked identities ·
+  Merged with a profile in your file · ⚠ Merged with a profile NOT in your file. They're used
+  everywhere: cards, chips, legend, drill-down, the Plan warning and Excel. Every "in your
+  list / not in list" became "in your file / NOT in your file".
+- **Frontend:**
+  - The Expansion tab notice reads "No reply from AEP for N uploaded IDs" (⤓ Download the
+    list); the Expand step hint adds "· N no reply from AEP".
+  - The Analysis tab adds:
+    - the "Not found in AEP" card;
+    - a "No reply from AEP" line and a Downloads row;
+    - header count and shares that cover every uploaded ID AEP was asked about, the same base
+      as Excel.
+  - The Plan tab adds the note "N uploaded IDs got no reply from AEP and are not in this
+    plan".
+  - `GET /api/jobs/:id/no-reply` streams the list as a formula-safe CSV.
+- **Excel report:**
+  - The categories table and legend gain "Not found in AEP" and, when there are any, "No
+    reply from AEP"; the % base is every uploaded ID asked.
+  - Tiles now read "UPLOADED IDS" with the "X not found · N no reply" sub-line,
+    "⚠ MERGED · NOT IN FILE" and "PROFILES NOT IN YOUR FILE".
+  - New one-column sheets: "Not found in AEP" (always written) and "No reply from AEP" (when
+    there are any).
+  - Tabs renamed to "⚠ Merged · NOT in file" / "Merged · in file", so a name plus " (10)"
+    stays within Excel's 31 characters.
+- **Your colleague's job:** after upgrading, press **Resume** on it. The re-ask applies to
+  resumed batches, so it finishes without a re-upload.
+- **Final review fixes** (fresh reviewer: no Critical; one Important, plus two minors raised
+  to Important because of their effect):
+  - **(1)** The wrong-region job recovers on Resume: see above.
+  - **(2)** The reply-format error names only known field names (`xid`, `members`, …) and
+    counts the others. An entry keyed by an ID can no longer put hundreds of IDs into logs,
+    `last_error` or the banner.
+  - **(3)** An analysis built before this change (no `not_found` count) shows "—", "Rebuild to
+    see" and a rebuild prompt instead of "Not found in AEP 0". Its Excel report says to
+    rebuild. A current report's empty "Not found" sheet no longer claims every ID was found.
+- **Tests:** suite **406 → 437**. New suites:
+  - `identityGraphMissing` (7);
+  - `noReply` (5);
+  - `expansionNoReply` (7, including the re-ask carrying only the missing IDs, a re-ask that
+    fails, a duplicate ID, the all-empty case and wrong region → fix → Resume);
+  - `analysisNotFound` (5);
+  - `noReplyRoute` (2).
+
+  Also new: Excel names/lists and an end-to-end report test. The old "Only itself" fixtures
+  gain Adobe's self-listing row; the fail-closed empty-graph tests register the re-ask.
+  Browser smokes: the new no-reply smoke 23/23 (the colleague's case end to end, a stopped
+  job finishing on Resume, and a pre-upgrade analysis asking for a rebuild), plus analysis
+  42/42, report 18/18, fix 8/8, poll 4/4.
+
 ## 2026-10-07 — Analysis Excel report + Downloads card
 
 A shareable Excel report of the identity analysis, and all analysis downloads in one
