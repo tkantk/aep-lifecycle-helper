@@ -115,10 +115,75 @@ const STEPS = {
   monitor: { title: 'Work Order Monitor',        sub: 'Track status of submitted work orders across downstream services.', crumbs: ['Data Lifecycle', 'Monitor'],                render: renderMonitor },
 };
 
-function goto(step) {
+// ─── Routes (2026-10-09) ────────────────────────────────────────────────
+// The address bar mirrors where the operator is, so the browser's Back /
+// Forward walk through tabs and jobs and a refresh stays put (before, Back left
+// the app). #<tab> = a job tab with no job open (its Recent jobs list);
+// #<tab>/<jobId> = that tab for one job. Environment, Source CSV and Monitor
+// don't carry a job (Monitor keeps its own job list).
+const JOB_TABS = new Set(['expand', 'analysis', 'plan', 'submit']);
+let appliedHash = null;      // the route on screen — popstate/hashchange ignore it
+let routeSeq = 0;
+function routeHash(step) {
+  return JOB_TABS.has(step) && state.job ? `#${step}/${encodeURIComponent(state.job.id)}` : `#${step}`;
+}
+function parseRoute(hash) {
+  const m = /^#([a-z]+)(?:\/([A-Za-z0-9-]{1,64}))?$/.exec(hash || '');
+  return m && STEPS[m[1]] ? { step: m[1], jobId: m[2] || null } : null;
+}
+/** Put the current tab (+ open job) in the address bar: a new history entry,
+ *  or `replace` the current one (e.g. a job auto-opened on this tab). */
+function recordRoute(step, { replace = false } = {}) {
+  const hash = routeHash(step);
+  if (!replace) routeSeq++;     // a click supersedes a Back/Forward still loading its job
+  if (location.hash !== hash) history[replace ? 'replaceState' : 'pushState'](null, '', hash);
+  appliedHash = hash;
+}
+/** Show what an address says — Back/Forward, a refresh, a pasted link. A later
+ *  Back/Forward or click (routeSeq) wins over one still loading its job. */
+async function applyRoute(route) {
+  const seq = ++routeSeq;
+  if (!route) {
+    history.replaceState(null, '', '#config');
+    appliedHash = '#config';
+    goto('config', { record: false });
+    return;
+  }
+  if (JOB_TABS.has(route.step)) {
+    if (route.jobId && route.jobId !== state.job?.id) {
+      let job = null, err = null;
+      try { job = (await http('GET', `/jobs/${route.jobId}`)).job; } catch (e) { err = e; }
+      if (seq !== routeSeq) return;            // a newer address arrived meanwhile — it wins
+      if (job) setActiveJob(job);
+      else {
+        clearActiveJob();
+        suppressAutoLoadOnce();
+        const gone = err?.status === 404;
+        showToast(gone ? 'That job no longer exists — showing the job list.'
+          : `Could not load job: ${err?.message || 'no job in the reply'}`, { kind: gone ? 'warning' : 'error' });
+        history.replaceState(null, '', `#${route.step}`);
+      }
+    } else if (!route.jobId && state.job) {
+      clearActiveJob();          // the address says "job list" — no auto-opening either
+      suppressAutoLoadOnce();
+    }
+  }
+  appliedHash = location.hash;
+  goto(route.step, { record: false });
+}
+function onRouteChange() {
+  if (location.hash === appliedHash) return;
+  appliedHash = location.hash;   // claim it now: popstate AND hashchange fire for one change
+  applyRoute(parseRoute(location.hash));
+}
+window.addEventListener('popstate', onRouteChange);
+window.addEventListener('hashchange', onRouteChange);
+
+function goto(step, { record = true } = {}) {
   if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
   stopExcelPoll();
   state.step = step;
+  if (record) recordRoute(step);
   const meta = STEPS[step];
   $('#page-title').textContent = meta.title;
   $('#page-sub').textContent   = meta.sub;
@@ -1017,11 +1082,36 @@ async function ensureActiveJobLoaded(preferredStatuses = null) {
     const detail = await http('GET', `/jobs/${candidate.id}`);
     state.job = detail.job;
     state.workOrders = []; // force re-fetch on next Plan/Submit render
+    recordRoute(state.step, { replace: true });   // the address shows the job that opened itself
     return state.job;
   } catch (err) {
     console.warn('ensureActiveJobLoaded: /jobs/:id detail failed', err);
     return null;
   }
+}
+
+/** Make `job` the open job, dropping everything cached for the previous one. */
+function setActiveJob(job) {
+  clearActiveJob();
+  state.job = job;
+  clearAutoLoadSuppression();
+}
+function clearActiveJob() {
+  state.job = null;
+  state.workOrders = [];
+  state.progress = null;
+  state.submitView = null;
+  state.submitTrackIds = null;
+  state.analysis = null;
+  state.analysisView = null;
+}
+/** "← All jobs" (2026-10-09): close the open job and show the Recent jobs list —
+ *  on this tab and every job tab — until the operator picks one; nothing opens
+ *  itself meanwhile (same suppression as after Delete Job). */
+function showAllJobs() {
+  clearActiveJob();
+  suppressAutoLoadOnce();
+  goto(state.step);
 }
 
 /**
@@ -1038,17 +1128,10 @@ async function switchToJob(jobId) {
   if (body) body.innerHTML = '<div class="empty-state"><div class="big-icon spin">↻</div><div>Loading job…</div></div>';
   try {
     const detail = await http('GET', `/jobs/${jobId}`);
-    state.job = detail.job;
-    state.workOrders = [];
-    state.progress = null;
-    state.submitView = null;
-    state.submitTrackIds = null;
-    state.analysis = null;
-    state.analysisView = null;
-    // Explicit pick — clear the post-delete auto-load suppression so
-    // subsequent tab navigations behave normally (auto-resume any
-    // in-progress job from this point on).
-    clearAutoLoadSuppression();
+    // Explicit pick — also clears the post-delete / "All jobs" auto-load
+    // suppression so later tab navigations behave normally.
+    setActiveJob(detail.job);
+    recordRoute(state.step);
     if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
     stopExcelPoll();
     // Re-render whatever tab the operator was on.
@@ -1083,10 +1166,6 @@ async function renderJobsPickerInto(containerSelector, { activeJobId = null, hea
       <div class="big-icon">!</div>
       <div>No jobs yet. <a href="#" data-goto="upload" style="color: var(--blue600)">Upload a CSV</a> first.</div>
     </div>`;
-    container.querySelector('[data-goto]')?.addEventListener('click', (ev) => {
-      ev.preventDefault();
-      goto(ev.currentTarget.dataset.goto);
-    });
     return;
   }
   container.innerHTML = `
@@ -1197,29 +1276,16 @@ function renderActiveJobHeader(tabBodyId, data = {}) {
   const paint = () => {
     header.innerHTML = `
       <div class="ajh-top">
+        <button class="btn btn-secondary btn-sm ajh-all-jobs" type="button" title="Close this job and show the list of recent jobs">← All jobs</button>
         <div class="ajh-title">
           <span class="ajh-label">Active job:</span>
           <span class="ajh-name">${escape(job.name || job.id.slice(0, 8))}</span>
           <span class="pill ${escape(job.status)}">${escape(job.status)}</span>
           ${badgesHtml(job)}
         </div>
-        <button class="link-btn ajh-switch" type="button">↻ Switch job</button>
       </div>
       ${stepperHtml(job)}`;
-    header.querySelector('.ajh-switch').addEventListener('click', async () => {
-      // Show the picker inline below the header. Click on a row swaps the
-      // active job and re-renders the tab, which rebuilds the header.
-      let popover = body.querySelector('.active-job-popover');
-      if (popover) { popover.remove(); return; }   // toggle
-      popover = document.createElement('div');
-      popover.className = 'active-job-popover';
-      popover.style.cssText = 'margin-bottom: 16px';
-      popover.id = `${tabBodyId}-picker`;
-      header.after(popover);
-      await renderJobsPickerInto('#' + popover.id, {
-        activeJobId: state.job.id, headline: 'Switch to another job',
-      });
-    });
+    header.querySelector('.ajh-all-jobs').addEventListener('click', showAllJobs);
   };
   paint();
   refreshJobChromeData(job).then(changed => {
@@ -1944,7 +2010,6 @@ async function renderPlan() {
           <button class="btn btn-secondary" data-goto="expand" style="margin-top:16px">Go to Expand</button>
         </div>`;
       renderActiveJobHeader('plan-body');
-      $('#plan-body').querySelector('[data-goto]')?.addEventListener('click', () => goto('expand'));
       return;
     }
     // No plan yet: choose what to delete, then build (2026-10-06).
@@ -2324,9 +2389,6 @@ async function renderSubmit() {
       <div>No work orders yet for this job. <a href="#" data-goto="plan" style="color: var(--blue600)">Plan</a> first.</div>
     </div>`;
     renderActiveJobHeader('submit-body');
-    $('#submit-body').querySelector('[data-goto]')?.addEventListener('click', (ev) => {
-      ev.preventDefault(); goto(ev.currentTarget.dataset.goto);
-    });
     return;
   }
   // ─── Batches: one (month, day) bucket per Submit (2026-10-06 fix 3) ────
@@ -3476,7 +3538,9 @@ async function bootstrap() {
   }
   updateClientNameDisplay();
 
-  goto('config');
+  // Open what the address says (a refresh, Back into the app, a pasted link);
+  // no or unknown address → Environment (2026-10-09).
+  await applyRoute(parseRoute(location.hash));
 
   // If a credential was restored, auto-verify the token and load sandboxes in
   // the background — avoids a manual Test Connection click on every reload.

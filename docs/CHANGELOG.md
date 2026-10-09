@@ -9,6 +9,49 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-10-09 — Navigation: browser Back / Forward, "← All jobs", clearer buttons
+
+The user reported that tab navigation didn't route back, and that once a job was open in Analysis
+there was no way back to the list of recent jobs. A scripted browser reproduced three causes:
+
+1. Tabs and jobs never changed the address (it stayed `/`, no history entry), so the browser's Back
+   button left the app.
+2. With a job open, every tab showed that job. The only way back was a small "↻ Switch job" link
+   that opened an inline list.
+3. The bottom "← Back" button meant "previous step" (Analysis → Expansion) and didn't say so.
+
+Fixes:
+
+- **Frontend — routes** (`src/web/app.js`):
+  - **Addresses:** `goto()` records `#<tab>`, or `#<tab>/<jobId>` on the job tabs (Expansion,
+    Analysis, Batch Planning, Submit), with `history.pushState`.
+  - **Back / Forward:** `popstate`/`hashchange` → `applyRoute()` opens or closes the job named in
+    the address.
+  - **Refresh:** reloads the page into that address. Unknown addresses open Environment, and a link
+    to a deleted job shows that tab's job list with one message.
+  - **Fast clicks:** route changes are sequence-guarded. A fast double Back can't let an older,
+    slower load win, and a tab clicked while Back is still loading its job stays put (before, the
+    late load snapped the screen back while the address said otherwise). One address change applies
+    once, although the browser fires two events.
+  - **Auto-opened jobs:** a job that opens itself (still expanding or submitting) replaces the
+    history entry, so the address always names the job on screen.
+- **"← All jobs":** a button at the left of the job header, replacing "↻ Switch job". It closes the
+  job and shows the recent-jobs list on every job tab until one is picked. Nothing opens itself
+  meanwhile, using the same sessionStorage suppression as after Delete Job (ARCHITECTURE §7.20).
+- **Bottom buttons say where they go:** ← Environment, ← Source CSV, ← Expansion, ← Batch Planning.
+- **Double navigation fixed.** Three links had their own click handler as well as the page-wide
+  `[data-goto]` handler, so one click switched tabs twice (two history entries once routes
+  existed). On Plan and Submit, the extra handler even grabbed the first link in the tab body,
+  which is a progress-bar step.
+- **Tests:** new browser smoke `nav_smoke.py`, 36/36:
+  - tab ↔ list ↔ job, Back, Forward, refresh;
+  - picking another job, the bottom buttons on every tab, one history entry per click;
+  - a deleted or unknown job link, Delete Job then Back;
+  - an expanding job opening itself and staying closed after "← All jobs";
+  - a click during a slow Back load.
+
+  The other browser smokes still pass (131/131 in total); `npm test` 437/437.
+
 ## 2026-10-08 — IDs AEP doesn't answer for, "Not found in AEP", clearer group names
 
 A colleague's 1M-ID expansion stopped with *"Identity Graph response did not include N of M

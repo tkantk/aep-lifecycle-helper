@@ -227,6 +227,14 @@ State is persisted at every step — **close the app and reopen it** and
 you can pick up where you left off. The startup-recovery routine handles
 jobs stuck mid-expansion or mid-submission.
 
+Every tab and open job has its own address — `#analysis` is the Analysis
+tab's list of recent jobs, `#analysis/<job id>` one job's analysis — so the
+browser's **Back / Forward** buttons step through the tabs and jobs you
+visited and a **refresh** keeps your place. **← All jobs** in the job header
+(on Expansion, Analysis, Batch Planning and Submit) closes the job and shows
+the list of recent jobs. The bottom buttons name where they go
+(← Source CSV, ← Expansion, ← Batch Planning).
+
 ---
 
 ## Configuration
