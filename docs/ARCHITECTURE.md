@@ -675,6 +675,12 @@ src/
     │                       .cred-picker / .identity-lock-row / .page-header
     │                       gradient. .f-hint convention for help text below inputs.
     ├── app.js              State object + fetch-based API calls + step navigator.
+    │                       Routes (2026-10-09): goto() records #<tab> or
+    │                       #<tab>/<jobId> (job tabs: expand · analysis · plan ·
+    │                       submit) with history.pushState; popstate/hashchange →
+    │                       applyRoute() (loads or closes the job, sequence-
+    │                       guarded); bootstrap opens the address it was loaded
+    │                       with. "← All jobs" (showAllJobs) closes the job.
     │                       Credential-picker functions: refreshCredPicker,
     │                       addNewCredentialFlow, removeCurrentCredential,
     │                       applyIdentityLockState. Save & Continue PATCHes when
@@ -832,8 +838,11 @@ source of truth (CLAUDE.md I15), and monthly is ALWAYS tracked (R4 #4 removed th
 20. UI auto-load (`ensureActiveJobLoaded`) is narrow — only loads jobs in
     `expanding` or `submitting` status (truly-in-progress, where auto-resume
     is the right call). For every other status the jobs picker shows so the
-    operator explicitly chooses. Set-once-per-delete suppression flag in
-    sessionStorage prevents surprise loads after an explicit Delete Job.
+    operator explicitly chooses. Set-once suppression flag in sessionStorage
+    prevents surprise loads after an explicit Delete Job, after "← All jobs",
+    and when the address names a tab's job list (2026-10-09); an explicit job
+    pick clears it. A job that opens itself replaces the history entry, so the
+    address always names the job on screen.
 
 ---
 
