@@ -18,6 +18,17 @@ export function snapshotAndResetRateLimitHits() {
 export function getRateLimitHitsTotal() {
   return _rateLimitHitsTotal;
 }
+// Same idea for lookups retried after Adobe didn't answer within the timeout
+// (2026-10-09) — the expansion summary reports them per 50-batch window.
+let _timeoutRetriesTotal = 0;
+export function snapshotAndResetTimeoutRetries() {
+  const n = _timeoutRetriesTotal;
+  _timeoutRetriesTotal = 0;
+  return n;
+}
+// axios's own timeout. ETIMEDOUT is the OS (TCP connect timeout, dropped
+// connection) — a network error, retried on every idempotent request as before.
+const isTimeout = (error) => !error.response && error.code === 'ECONNABORTED';
 
 /**
  * Axios client factory for Adobe APIs. Handles:
@@ -30,8 +41,26 @@ export function createAdobeClient(creds, sandboxName) {
   const client = axios.create({ timeout: config.requestTimeoutMs });
 
   client.interceptors.request.use(async (cfg) => {
-    const headers = await getAuthHeaders(creds, sandboxName);
-    cfg.headers = { ...headers, ...cfg.headers };
+    let headers;
+    try {
+      headers = await getAuthHeaders(creds, sandboxName);
+    } catch (err) {
+      // The sign-in (IMS token) fetch failed BEFORE this request was sent. Its
+      // AxiosError carries the IMS request's config, so axios-retry used to
+      // "retry" the IMS call through this client and resolve THIS request — e.g.
+      // a work-order POST — with the IMS reply, as if it had succeeded without
+      // ever being sent (final review #8, 2026-10-09). Throw a plain error about
+      // this request instead: never retried here, and clearly not sent.
+      const e = new Error(`Adobe sign-in (IMS token) failed — the request was not sent: ${err.message}`);
+      e.code = 'IMS_TOKEN_FAILED';
+      e.notSent = true;
+      e.cause = err;
+      throw e;
+    }
+    // The fresh auth headers win: a retry re-sends this config, and the old
+    // Authorization in it must not override the token fetched after a 401
+    // (final review #7). No caller sets its own auth headers.
+    cfg.headers = { ...cfg.headers, ...headers };
     cfg.metadata = { startTime: Date.now() };
     return cfg;
   });
@@ -78,6 +107,17 @@ export function createAdobeClient(creds, sandboxName) {
         ? true
         : (error.config?.idempotent === true);
 
+      // Timeouts (2026-10-09): axios-retry never counts them as network errors,
+      // so ONE slow Identity Graph reply used to fail a whole expansion. Only
+      // requests that opt in (retryOnTimeout — the side-effect-free lookups) are
+      // retried; everything else keeps failing fast (the Monitor tick and the
+      // submit quota check rely on it), and a work-order POST never retries.
+      if (isTimeout(error)) return idempotent && error.config?.retryOnTimeout === true;
+      // A 2xx reply that broke off mid-body (final review #4): axios attaches the
+      // 2xx response to its error, so it matched neither rule below. For a
+      // side-effect-free request it is a network error — ask again. A work-order
+      // POST never: Adobe answered 2xx, so it was received.
+      if (s >= 200 && s < 300) return idempotent;
       // Network errors on non-idempotent requests: we don't know if Adobe
       // received the body, so never retry.
       if (isNet && !idempotent) return false;
@@ -105,6 +145,10 @@ export function createAdobeClient(creds, sandboxName) {
           retryAfter: ra || '(none)',
           waitSec: waitSec != null ? Math.round(waitSec) : null,
         }, 'ADOBE RATE LIMIT (HTTP 429) — backing off; reduce IDENTITY_CONCURRENCY if this is frequent');
+      } else if (isTimeout(err)) {
+        _timeoutRetriesTotal++;
+        logger.warn({ url: cfg.url, attempt: n, timeoutSec: Math.round((cfg.timeout || 0) / 1000) },
+          'Adobe did not answer in time — retrying');
       } else {
         logger.warn({ url: cfg.url, status, attempt: n }, 'retrying');
       }
@@ -117,6 +161,14 @@ export function createAdobeClient(creds, sandboxName) {
 function enrichAdobeError(err) {
   const status = err.response?.status;
   if (!status) return;
+  // A 2xx can only be an error when the reply broke off mid-body — never call
+  // it "HTTP 200 OK" (final review #4).
+  if (status < 300) {
+    err.originalMessage = err.message;
+    err.message = `Adobe answered ${status} but its reply broke off before it was complete (${err.message})`;
+    return;
+  }
+  if (status < 400) return;
 
   const extracted = extractAdobeMessage(err.response.data);
   const statusText = err.response.statusText || '';

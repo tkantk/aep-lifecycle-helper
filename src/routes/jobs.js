@@ -99,6 +99,13 @@ router.get('/:id/progress', (req, res) => {
     processed: live?.processed ?? job.processed_count,
     found: live?.found ?? job.found_count,
     total: job.total_source_ids,
+    // What the expansion is doing right now (2026-10-09): 'resuming' (skipping
+    // IDs already expanded: checked / skipped rows) or 'expanding'; `waiting` =
+    // { inFlight, oldestMs } while no batch has come back from Adobe for a while.
+    phase: live?.phase ?? null,
+    checked: live?.checked ?? 0,
+    skipped: live?.skipped ?? 0,
+    waiting: live?.waiting ?? null,
   });
 });
 

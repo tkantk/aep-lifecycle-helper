@@ -230,3 +230,143 @@ test('retry: GET retries on 5xx (always idempotent)', async () => {
   assert.equal(res.status, 200);
   assert.equal(calls, 2);
 });
+
+test('retry: an Identity Graph lookup that times out is retried, each attempt with the full timeout (2026-10-09)', async () => {
+  // One slow Adobe reply used to fail the whole expansion: axios-retry skips
+  // timeouts (ECONNABORTED), and without shouldResetTimeout a retry would only
+  // get the time left over (none).
+  mockAuthOk();
+  let calls = 0;
+  nock(AEP_HOST)
+    .post('/data/core/identity/clusters/members').delay(700)
+    .reply(() => { calls++; return [200, { version: '1.1.0', clusters: [] }]; })
+    .post('/data/core/identity/clusters/members').delay(150)    // fits a FRESH 400 ms, not the remainder
+    .reply(() => { calls++; return [200, { version: '1.1.0', clusters: [] }]; });
+  const client = createAdobeClient(creds, 'sbx');
+  const res = await client.post(`${AEP_HOST}/data/core/identity/clusters/members`, { compositeXids: [] },
+    { idempotent: true, timeout: 400, retryOnTimeout: true, 'axios-retry': { shouldResetTimeout: true } });   // as identityGraph sends it
+  assert.equal(res.status, 200);
+  assert.equal(calls, 2, 'the timed-out lookup was asked again');
+});
+
+test('retry: a work-order POST that times out is NOT retried — Adobe may have received it', async () => {
+  mockAuthOk();
+  let calls = 0;
+  nock(AEP_HOST)
+    .post('/data/core/hygiene/workorder').delay(700).reply(() => { calls++; return [200, {}]; })
+    .post('/data/core/hygiene/workorder').reply(() => { calls++; return [200, {}]; });
+  const client = createAdobeClient(creds, 'sbx');
+  await assert.rejects(() => client.post(`${AEP_HOST}/data/core/hygiene/workorder`, {}, { timeout: 400 }), /timeout/);
+  await new Promise(r => setTimeout(r, 900));       // a retry, if any, would have been sent by now
+  assert.equal(calls, 1, 'never resend a deletion request after a timeout');
+});
+
+test('retry: other read-only calls that time out still fail fast (Monitor and quota checks rely on it)', async () => {
+  // Only Identity Graph lookups opt in to timeout retries (retryOnTimeout). A
+  // retried GET would stretch the Monitor tick's 15 s budget and the submit
+  // quota check — both are meant to fail fast and try again later.
+  mockAuthOk();
+  let calls = 0;
+  nock(AEP_HOST)
+    .get('/data/core/hygiene/workorder/WO-1').delay(700).reply(() => { calls++; return [200, {}]; })
+    .get('/data/core/hygiene/workorder/WO-1').reply(() => { calls++; return [200, {}]; });
+  const client = createAdobeClient(creds, 'sbx');
+  await assert.rejects(() => client.get(`${AEP_HOST}/data/core/hygiene/workorder/WO-1`, { timeout: 400 }), /timeout/);
+  await new Promise(r => setTimeout(r, 900));
+  assert.equal(calls, 1, 'a GET that timed out is not retried');
+});
+
+test('retry: an operating-system ETIMEDOUT on a GET is retried as a network error (final review #1)', async () => {
+  // axios's own timeouts are ECONNABORTED; ETIMEDOUT only comes from the OS (a
+  // TCP connect timeout or a dropped connection) and master retried it on GETs.
+  mockAuthOk();
+  let calls = 0;
+  nock(AEP_HOST)
+    .get('/data/core/idnamespace/identities').replyWithError({ code: 'ETIMEDOUT', message: 'connect ETIMEDOUT 1.2.3.4:443' })
+    .get('/data/core/idnamespace/identities').reply(() => { calls++; return [200, []]; });
+  const client = createAdobeClient(creds, 'sbx');
+  client.interceptors.request.use((cfg) => { calls++; return cfg; });
+  const res = await client.get(`${AEP_HOST}/data/core/idnamespace/identities`);
+  assert.equal(res.status, 200);
+  assert.equal(calls, 3, 'one failed attempt, then a retry that succeeded');
+});
+
+test('a sign-in (IMS) failure never resolves the request with the sign-in reply — it fails as "not sent" (final review #8)', async () => {
+  // The token fetch's AxiosError carries the IMS request's config, so axios-retry
+  // "retried" the IMS call through this client and the work-order POST resolved
+  // with { access_token } — recorded as submitted though it was never sent.
+  const fresh = { clientId: 'c429-test', imsOrgId: 'o429@AcmeOrg', clientSecret: 's' };
+  let imsCalls = 0, woCalls = 0;
+  nock(IMS_HOST).post('/ims/token/v3').reply(() => { imsCalls++; return [429, { error: 'too_many_requests' }]; });
+  nock(IMS_HOST).persist().post('/ims/token/v3').reply(() => { imsCalls++; return [200, { access_token: 'tok', expires_in: 3600 }]; });
+  nock(AEP_HOST).persist().post('/data/core/hygiene/workorder').reply(() => { woCalls++; return [201, { workorderId: 'DI-1' }]; });
+  const client = createAdobeClient(fresh, 'sbx');
+  await assert.rejects(() => client.post(`${AEP_HOST}/data/core/hygiene/workorder`, { displayName: 'x' }), (err) => {
+    assert.equal(err.code, 'IMS_TOKEN_FAILED');
+    assert.equal(err.notSent, true);
+    assert.match(err.message, /not sent/);
+    return true;
+  });
+  assert.deepEqual([imsCalls, woCalls], [1, 0], 'no IMS call is "retried" through the Adobe client; nothing was sent');
+});
+
+test('a 401 retry carries the fresh token, not the stale one (final review #7)', async () => {
+  const fresh = { clientId: 'c401-test', imsOrgId: 'o401@AcmeOrg', clientSecret: 's' };
+  let n = 0;
+  nock(IMS_HOST).persist().post('/ims/token/v3').reply(() => [200, { access_token: `tok${++n}`, expires_in: 3600 }]);
+  const seen = [];
+  nock(AEP_HOST)
+    .get('/data/foundation/sandbox-management/').reply(function () { seen.push(this.req.headers.authorization); return [401, { message: 'expired' }]; })
+    .get('/data/foundation/sandbox-management/').reply(function () { seen.push(this.req.headers.authorization); return [200, { sandboxes: [] }]; });
+  const client = createAdobeClient(fresh, null);
+  const res = await client.get(`${AEP_HOST}/data/foundation/sandbox-management/`);
+  assert.equal(res.status, 200);
+  assert.deepEqual(seen, ['Bearer tok1', 'Bearer tok2'], 'the retry used the token fetched after the 401');
+});
+
+// A real local server: nock can't cut a reply off mid-body.
+async function cutOffServer(mode) {
+  const http = await import('node:http');
+  let hits = 0;
+  const server = http.createServer((req, res) => {
+    hits++;
+    req.resume();
+    if (hits === 1) {
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': '200' });
+      res.write('{"version":"1.1.0","clus');
+      setTimeout(() => (mode === 'close' ? res.socket.end() : res.socket.destroy()), 30);
+    } else {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ version: '1.1.0', clusters: [] }));
+    }
+  });
+  await new Promise(r => server.listen(0, '127.0.0.1', r));
+  return { url: `http://127.0.0.1:${server.address().port}/data/core/identity/clusters/members`, hits: () => hits, close: () => server.close() };
+}
+
+test('a lookup whose 2xx reply breaks off mid-body is retried (final review #4)', async () => {
+  for (const mode of ['close', 'destroy']) {
+    mockAuthOk();
+    const srv = await cutOffServer(mode);
+    try {
+      const client = createAdobeClient({ clientId: `cut-${mode}`, imsOrgId: 'cut@AcmeOrg', clientSecret: 's' }, 'sbx');
+      const res = await client.post(srv.url, { compositeXids: [] },
+        { idempotent: true, retryOnTimeout: true, 'axios-retry': { shouldResetTimeout: true } });
+      assert.equal(res.status, 200, mode);
+      assert.equal(srv.hits(), 2, `${mode}: asked again after the cut-off`);
+    } finally { srv.close(); }
+  }
+});
+
+test('a work-order POST whose 2xx reply breaks off is NOT resent, and its error never reads "HTTP 200 OK"', async () => {
+  mockAuthOk();
+  const srv = await cutOffServer('close');
+  try {
+    const client = createAdobeClient({ clientId: 'cut-wo', imsOrgId: 'cut@AcmeOrg', clientSecret: 's' }, 'sbx');
+    await assert.rejects(() => client.post(srv.url, { displayName: 'x' }), (err) => {
+      assert.doesNotMatch(err.message, /HTTP 200/);
+      return true;
+    });
+    assert.equal(srv.hits(), 1, 'Adobe answered 2xx — the request was received; never send it twice');
+  } finally { srv.close(); }
+});

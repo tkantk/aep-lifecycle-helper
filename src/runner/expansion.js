@@ -1,7 +1,7 @@
 import pLimit from 'p-limit';
 import { expandBatchDetailed } from '../services/identityGraph.js';
 import { listNamespaces, buildNamespaceIndex, canonicalizeNamespace } from '../services/namespaces.js';
-import { snapshotAndResetRateLimitHits } from '../services/adobeClient.js';
+import { snapshotAndResetRateLimitHits, snapshotAndResetTimeoutRetries } from '../services/adobeClient.js';
 import { insertIdentitiesAndCount, clearNoReply, q } from '../db.js';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
@@ -50,6 +50,11 @@ export async function runExpansion({
   const progress = skipSourceIds
     ? { processed: job.processed_count || 0, total, found: job.found_count || 0 }
     : { processed: 0, total, found: 0 };
+  // What the expansion is doing (2026-10-09), shown on the Expansion tab:
+  // 'resuming' while a Resume skips IDs already expanded (checked / skipped
+  // rows), then 'expanding'; `waiting` = { inFlight, oldestMs } when no batch
+  // has finished for EXPANSION_HEARTBEAT_MS.
+  Object.assign(progress, { phase: skipSourceIds ? 'resuming' : 'expanding', checked: 0, skipped: 0, waiting: null });
   liveProgress.set(jobId, progress);
 
   q().updateJobStatus.run('expanding', null, jobId);
@@ -150,6 +155,43 @@ export async function runExpansion({
   let wave   = [];
   let aborted = false;
   let skipped = 0;
+  // The first batch to fail stops the run (final review #3, 2026-10-09): its
+  // group's other lookups — and their retries, up to ~12 min with timeout
+  // retries — are cancelled, and the job records THAT first error (drainWave
+  // used to report whichever rejection came first in array order).
+  const abortCtl = new AbortController();
+  let firstError = null;
+  const abortRun = () => { aborted = true; if (!abortCtl.signal.aborted) abortCtl.abort(); };
+
+  // ─── Activity heartbeat (2026-10-09) ──────────────────────────────────
+  // A batch waiting on Adobe used to log nothing until it returned — up to the
+  // timeout, per attempt — so a slow Adobe looked like a dead app. Every
+  // EXPANSION_HEARTBEAT_MS without a finished batch, say what we're waiting for
+  // (log + Expansion tab). Cleared in the finally below.
+  const inFlight = new Map();          // batch number → start time
+  let batchNo = 0;
+  let lastBatchAt = Date.now();
+  // A tick that fires late means THIS process was paused — text selected in the
+  // Windows console (QuickEdit), the laptop asleep, or a heavy page refresh
+  // blocking the server. Say so: such a pause turns answers Adobe already sent
+  // into "timeouts", and would otherwise be blamed on Adobe (final review #5).
+  const PAUSE_REPORT_MS = Math.min(5000, config.expansionHeartbeatMs * 5);
+  let lastTick = Date.now();
+  const heartbeat = setInterval(() => {
+    const now = Date.now();
+    const lateMs = now - lastTick - config.expansionHeartbeatMs;
+    lastTick = now;
+    if (lateMs >= PAUSE_REPORT_MS) {
+      logger.warn({ jobId, pausedSec: Math.round(lateMs / 100) / 10 },
+        'the app itself was paused — not waiting on Adobe');
+    }
+    if (inFlight.size === 0 || Date.now() - lastBatchAt < config.expansionHeartbeatMs) return;
+    const oldestMs = Date.now() - Math.min(...inFlight.values());
+    progress.waiting = { inFlight: inFlight.size, oldestMs };
+    logger.info({ jobId, inFlight: inFlight.size, oldestSec: Math.round(oldestMs / 1000),
+      processed: progress.processed, total }, 'still waiting on Adobe');
+  }, config.expansionHeartbeatMs);
+  heartbeat.unref?.();
 
   // ─── Per-batch timing instrumentation ─────────────────────────────────
   // Tracks rolling p50/p95 of `adobeMs` (Identity Graph round-trip) and
@@ -173,6 +215,8 @@ export async function runExpansion({
 
   const submitBatch = (batch) => limit(async () => {
     if (aborted) return;
+    const no = ++batchNo;
+    inFlight.set(no, Date.now());
     try {
       const t0 = Date.now();
       // Row shape: [job_id, ns_code, ns_id, identity_id, source_id]
@@ -190,6 +234,7 @@ export async function runExpansion({
           namespaceId: resolvedNsid,
           ids,
           namespaceIndex,
+          signal: abortCtl.signal,
         });
         const first = await ask(batch);
         let results = first.results;
@@ -259,6 +304,7 @@ export async function runExpansion({
         // sleeping on Retry-After, not Adobe being slow. Fix: lower
         // IDENTITY_CONCURRENCY (5 is the conservative default; raise only if 0 429s).
         const rateLimitHits = snapshotAndResetRateLimitHits();
+        const timeoutRetries = snapshotAndResetTimeoutRetries();
         logger.info({
           jobId,
           progress: `${progress.processed.toLocaleString()}/${total.toLocaleString()} (${pctDone}%)`,
@@ -270,15 +316,25 @@ export async function runExpansion({
           sqliteMs_p95: pct(recent.sqliteMs, 0.95),
           sqliteMs_avgAll: Math.round(totalSqliteMs / totalBatches),
           rateLimitHits,   // # of HTTP 429s Adobe sent in this 50-batch window
+          timeoutRetries,  // # of lookups retried because Adobe didn't answer in time
           rateLimitHint: rateLimitHits > 0
             ? 'Adobe is throttling — reduce IDENTITY_CONCURRENCY in .env'
             : undefined,
         }, `── expansion summary @ ${pctDone}% ──`);
       }
     } catch (err) {
-      aborted = true;
-      logger.error({ jobId, batchSize: batch.length, err: err.message }, 'expansion batch failed');
+      // A cancelled lookup is a consequence of an earlier failure, not news.
+      const cancelled = abortCtl.signal.aborted && (err?.code === 'ERR_CANCELED' || err?.name === 'CanceledError');
+      if (!cancelled) {
+        if (!firstError) firstError = err;
+        logger.error({ jobId, batchSize: batch.length, err: err.message }, 'expansion batch failed');
+      }
+      abortRun();
       throw err;
+    } finally {
+      inFlight.delete(no);
+      lastBatchAt = Date.now();
+      progress.waiting = null;
     }
   });
 
@@ -302,7 +358,7 @@ export async function runExpansion({
     wave = [];
     const results = await Promise.allSettled(current);
     const rejection = results.find(r => r.status === 'rejected');
-    if (rejection) throw rejection.reason;
+    if (rejection) throw firstError || rejection.reason;
   };
 
   // Push helper: also attaches a no-op .catch() to silence V8's
@@ -336,7 +392,23 @@ export async function runExpansion({
       column,
       onRow: async (value) => {
         if (aborted) return;
-        if (skipSourceIds?.has(value)) { skipped++; return; }
+        if (skipSourceIds) {
+          // A Resume re-reads the file from the top; say how far it has got
+          // (2026-10-09) — it used to log only once the whole file was read.
+          progress.checked++;
+          if (skipSourceIds.has(value)) {
+            progress.skipped = ++skipped;
+            if (skipped % config.resumeLogEvery === 0) {
+              logger.info({ jobId, checked: progress.checked, skipped }, 'resuming: skipping IDs already expanded');
+            }
+            return;
+          }
+          if (progress.phase === 'resuming') {
+            progress.phase = 'expanding';
+            logger.info({ jobId, checked: progress.checked, skipped },
+              'resuming: reached IDs not yet expanded — sending batches again');
+          }
+        }
         buffer.push(value);
         if (buffer.length >= config.identityBatchSize) {
           pushBatch(buffer);
@@ -403,12 +475,19 @@ export async function runExpansion({
   } catch (err) {
     // Let any batch still in flight settle first, so nothing writes rows or
     // counters after the job is recorded 'failed' (a resume could start then).
-    aborted = true;
+    // Cancelled lookups settle at once.
+    abortRun();
     await Promise.allSettled(wave);
     q().updateJobStatus.run('failed', err.message, jobId);
     throw err;
   } finally {
-    setTimeout(() => liveProgress.delete(jobId), 60_000);
+    clearInterval(heartbeat);
+    progress.waiting = null;
+    // Only THIS run's entry: a Resume started within the window has replaced
+    // it, and deleting that would blank its status mid-run (final review #2).
+    const mine = progress;
+    setTimeout(() => { if (liveProgress.get(jobId) === mine) liveProgress.delete(jobId); }, config.liveProgressRetainMs)
+      .unref?.();     // never the only thing keeping the process alive
   }
 
   return progress;

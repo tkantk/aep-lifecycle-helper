@@ -682,7 +682,11 @@ export async function runSubmission({ jobId, dayIndex, monthIndex, workOrderIds 
         // 408 (a proxy timed out after forwarding), 409, … — is as uncertain as a
         // 5xx/timeout: hold the reservation and let reconcile find out.
         const isLocalValidation = err.name === 'WorkOrderValidationError';
-        const isDefinitive = isLocalValidation || isDefinitiveRejection(status);
+        // Never sent (2026-10-09, final review #8): the sign-in (IMS token) fetch
+        // failed before the POST left — and any earlier attempt in its retry
+        // chain was refused (401/429), so nothing can have been created.
+        const isNotSent = err.notSent === true;
+        const isDefinitive = isLocalValidation || isNotSent || isDefinitiveRejection(status);
 
         if (isDefinitive) {
           release(wo.id);
@@ -692,7 +696,9 @@ export async function runSubmission({ jobId, dayIndex, monthIndex, workOrderIds 
           q().markWorkOrderFailedDefinitive.run(err.message, wo.id);
           failed++;
           logger.error({ localId: wo.id, status: status ?? '(not sent)', err: err.message },
-            isLocalValidation ? 'submission failed validation — not sent' : 'submission failed (Adobe rejected)');
+            isLocalValidation ? 'submission failed validation — not sent'
+              : isNotSent ? 'submission not sent (Adobe sign-in failed) — released for retry'
+              : 'submission failed (Adobe rejected)');
         } else {
           // Keep status='submitting' so listSubmittingOrphanOrders picks
           // it up on next startup. Persist last_error so the operator can

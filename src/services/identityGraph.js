@@ -69,7 +69,7 @@ function endpoint(region) {
  * @returns {Promise<{ results: Array<{ sourceId, sourceNamespace: {code, id}, linkedIdentities: [{namespace:{code, id}, id}] }>,
  *                     missing: string[] }>}  missing = IDs sent that the reply cleanly left out
  */
-export async function expandBatchDetailed({ creds, sandboxName, namespace, namespaceId, ids, namespaceIndex }) {
+export async function expandBatchDetailed({ creds, sandboxName, namespace, namespaceId, ids, namespaceIndex, signal }) {
   if (ids.length === 0) return { results: [], missing: [] };
   if (ids.length > 1000) throw new Error(`Batch too large: ${ids.length} (max 1000)`);
 
@@ -94,7 +94,15 @@ export async function expandBatchDetailed({ creds, sandboxName, namespace, names
 
   // /clusters/members is a side-effect-free query despite being POST (the
   // request body just carries a list of XIDs). Safe to retry on 5xx/429.
-  const { data } = await client.post(endpoint(creds.region), body, { idempotent: true });
+  // A lookup that times out is retried (2026-10-09), each attempt with the full
+  // timeout — without shouldResetTimeout a retry gets only the time left over.
+  const { data } = await client.post(endpoint(creds.region), body, {
+    idempotent: true, timeout: config.identityTimeoutMs, retryOnTimeout: true,
+    'axios-retry': { shouldResetTimeout: true },
+    // The runner cancels a run's other lookups (and their retry waits) once one
+    // batch has failed — final review #3.
+    ...(signal && { signal }),
+  });
 
   // Adobe's /clusters/members response shape (observed against AEP production
   // API v1.1.0; the legacy shape in the bare-array form also still occurs on

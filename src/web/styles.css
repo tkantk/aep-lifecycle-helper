@@ -1062,6 +1062,9 @@ input.locked, select.locked {
   background: var(--g100); color: var(--g700);
 }
 .cat-badge.not_found { background: var(--g200); color: var(--g800); }
+/* What a running expansion is doing (2026-10-09): resuming / waiting on Adobe. */
+.expand-activity { margin-top: 10px; font-size: 13px; color: var(--g700); }
+.expand-activity.waiting { color: #B5650F; }
 .cat-badge.no_reply { background: rgba(215,55,63,0.1); color: var(--red600); }
 .cat-badge.linked { background: rgba(38,128,235,0.1); color: var(--blue700); }
 .cat-badge.merged_in_list { background: rgba(146,86,217,0.12); color: var(--purple500); }

@@ -252,6 +252,10 @@ AEP_IDENTITY_REGION=va7        # va7 | nld2 | aus5 | can2
 # Throughput
 IDENTITY_CONCURRENCY=5
 IDENTITY_BATCH_SIZE=1000
+IDENTITY_TIMEOUT_MS=120000          # per Identity Graph lookup (default 120 s, or REQUEST_TIMEOUT_MS if higher); retried up to 5×
+REQUEST_TIMEOUT_MS=60000            # every other Adobe call (a work-order submit is never retried)
+EXPANSION_HEARTBEAT_MS=30000        # "still waiting on Adobe" log + Expansion-tab notice after this long
+RESUME_LOG_EVERY=100000             # Resume progress line every N already-expanded IDs skipped
 WORK_ORDER_CONCURRENCY=2
 MAX_IDS_PER_WORK_ORDER=100000
 DAILY_IDENTIFIER_LIMIT=1000000        # FALLBACK ONLY — live /quota wins
@@ -506,6 +510,9 @@ the in-progress job from where it left off.
 | `401` from Adobe | Bad creds / wrong IMS org | Click **Test Connection** on the Environment tab |
 | `403` on quota or plan — "needs Data Hygiene product profile" | Integration lacks hygiene permissions | See **Permissions** section below |
 | `429` spikes during expansion | Concurrency too high | Lower `IDENTITY_CONCURRENCY` in `.env` |
+| Expansion seems stuck; log says `still waiting on Adobe` / Expansion tab shows "Waiting for Adobe" | Adobe is answering slowly; lookups that time out are retried automatically (`Adobe did not answer in time — retrying`) | Usually nothing — it continues once Adobe answers. If it keeps failing, lower `IDENTITY_CONCURRENCY` (e.g. 3) or `IDENTITY_BATCH_SIZE` (e.g. 500), or raise `IDENTITY_TIMEOUT_MS`, restart, then **Resume** |
+| The app froze — nothing logged at all, then timeouts; log says `the app itself was paused — not waiting on Adobe` | On Windows, text selected in the app's console window pauses the whole app (the window title starts with "Select"); or the laptop went to sleep | Press **Esc** in the console window (or right-click → disable QuickEdit in its Properties); keep the laptop awake during long runs |
+| After **Resume**, nothing new in the log for a while | Resume re-reads the file from the top and skips IDs already expanded | Watch `resuming: skipping IDs already expanded` (every 100,000) and the Expansion tab's "Resuming — checked N rows"; lookups restart at `resuming: reached IDs not yet expanded` |
 | Expansion stuck at 0% | No Identity Graph data for namespace | Verify the source namespace matches what's in AEP |
 | Expansion finished with "No reply from AEP for N uploaded IDs" | Adobe's reply left those IDs out, even when asked again (why is not known — Adobe documents an empty answer for IDs it doesn't know) | They are not planned on their own. Download the list; look a few up in AEP; upload the list as a new job to try them again |
 | Expansion stops: "Identity Graph reply could not be read" | Adobe's reply held entries the tool can't match while IDs were missing — a reply-format problem, not unknown IDs | Resume retries the batch; if it repeats, share the message with whoever maintains the tool |

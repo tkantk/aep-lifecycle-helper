@@ -1394,15 +1394,27 @@ async function renderExpand() {
     <div>Loading expansion progress…</div>
   </div>`;
 
-  // Poll progress
+  // Poll progress. While the job expands, only the cheap endpoints: the
+  // per-namespace breakdown (?breakdown=1) is a GROUP BY over every stored
+  // identity, run on the server's only thread — seconds per call on a big job.
+  // Polled every 1.5 s (and on, after the job finished) it starved the expansion
+  // itself: 60 lookups/min instead of ~290 (final review #6, 2026-10-09). Now it
+  // is fetched ONCE, when the job is no longer expanding; polls never overlap,
+  // and polling stops when there is nothing left to watch.
+  let breakdown = null;
+  let busy = false;
   const render = async () => {
-    const [p, j] = await Promise.all([
-      http('GET', `/jobs/${state.job.id}/progress`),
-      // ?breakdown=1: the Expand tab is the ONLY consumer of byNamespace, and
-      // that GROUP-BY is heavy on a large job — every other caller (job switch,
-      // Submit) omits it so the hot path doesn't freeze the event loop.
-      http('GET', `/jobs/${state.job.id}?breakdown=1`),
-    ]);
+    if (busy) return;
+    busy = true;
+    try { await paint(); } catch { /* a missed poll — the next one retries */ } finally { busy = false; }
+  };
+  const paint = async () => {
+    const p = await http('GET', `/jobs/${state.job.id}/progress`);
+    const expanding = p.status === 'expanding';
+    const wantBreakdown = !expanding && !breakdown;
+    const j = await http('GET', `/jobs/${state.job.id}${wantBreakdown ? '?breakdown=1' : ''}`);
+    if (wantBreakdown) breakdown = j.breakdown || { byNamespace: [] };
+    if (!expanding && state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
     state.progress = p; state.job = j.job;
 
     const pct = p.total ? Math.round((p.processed / p.total) * 100) : 0;
@@ -1412,7 +1424,7 @@ async function renderExpand() {
     const done = p.status !== 'expanding' && !failed;
     const ratio = p.processed ? (p.found / p.processed).toFixed(2) + '×' : '—';
 
-    const byNs = j.breakdown.byNamespace || [];
+    const byNs = (breakdown && breakdown.byNamespace) || [];   // shown once the job has finished
     const total = byNs.reduce((s, r) => s + r.count, 0);
 
     $('#expand-body').innerHTML = `
@@ -1441,6 +1453,13 @@ async function renderExpand() {
       <div class="progress-bar">
         <div class="progress-fill${done ? ' done' : ''}" style="width:${pct}%"></div>
       </div>
+      ${p.status === 'expanding' && p.phase === 'resuming' ? `
+      <div class="expand-activity" id="expand-activity">↻ Resuming — checked ${fmtNum(p.checked)} rows of the file;
+        ${fmtNum(p.skipped)} were already expanded. Lookups continue right after them.</div>`
+      : p.status === 'expanding' && p.waiting ? `
+      <div class="expand-activity waiting" id="expand-activity">⏳ Waiting for Adobe — ${fmtNum(p.waiting.inFlight)}
+        lookup${p.waiting.inFlight === 1 ? '' : 's'} in flight, the oldest for ${fmtNum(Math.round(p.waiting.oldestMs / 1000))} s.
+        Slow answers are retried automatically.</div>` : ''}
       <div class="stat-grid" style="margin-top: 20px">
         <div class="stat">
           <div class="stat-label">Batches</div>
@@ -1496,6 +1515,7 @@ async function renderExpand() {
         await http('POST', `/jobs/${state.job.id}/resume-expansion`);
         showToast('Expansion resumed — already-expanded sources are skipped.', { kind: 'success' });
         state.job.status = 'expanding';
+        breakdown = null;          // re-fetched when the resumed run finishes
         if (!state.pollTimer) state.pollTimer = setInterval(render, 1500);
         await render();
       } catch (err) {

@@ -397,7 +397,15 @@ src/
 │   ├── imsAuth.js          In-memory token cache + thundering-herd guard.
 │   ├── adobeClient.js      axios factory: auth injection, idempotency-aware
 │   │                       retry (5xx + network errors blocked on non-idempotent
-│   │                       requests; 401/429 always retry), Retry-After,
+│   │                       requests; 401/429 always retry; timeouts retried ONLY
+│   │                       for requests tagged retryOnTimeout — the Identity
+│   │                       Graph lookups, 2026-10-09 — everything else fails
+│   │                       fast; a 2xx reply cut off mid-body is retried for
+│   │                       idempotent requests, never for the work-order POST).
+│   │                       A failed sign-in (IMS token) fetch fails the request
+│   │                       as notSent (IMS_TOKEN_FAILED) — it is never "retried"
+│   │                       as the IMS call; the fresh token wins on a retry.
+│   │                       Retry-After,
 │   │                       401 → invalidate, error-body enrichment +
 │   │                       per-endpoint permission hints on 403.
 │   ├── sandboxes.js        GET /sandbox-management.
@@ -406,8 +414,9 @@ src/
 │   │                       see CLAUDE.md I9). + buildNamespaceIndex +
 │   │                       canonicalizeNamespace (fills code from nsid or vv).
 │   ├── identityGraph.js    POST /identity/clusters/members on creds.region host.
-│   │                       Tagged {idempotent:true} (POST as side-effect-free
-│   │                       query). Parses current shape {version, clusters:[
+│   │                       Tagged {idempotent:true, retryOnTimeout:true} (POST as
+│   │                       side-effect-free query), IDENTITY_TIMEOUT_MS (120 s)
+│   │                       per attempt (axios-retry shouldResetTimeout). Parses current shape {version, clusters:[
 │   │                       {compositeXid, members}]} AND legacy bare-array.
 │   │                       expandBatchDetailed → {results, missing} (2026-10-08:
 │   │                       a clean omission is reported, not thrown); expandBatch

@@ -43,6 +43,14 @@ export function detectCloudSyncPath(p) {
   return null;
 }
 
+// A positive number from the environment, else the fallback — a 0, negative or
+// garbage value must never become e.g. a 1 ms log interval (2026-10-09).
+const positiveEnv = (name, fallback) => {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+};
+const requestTimeoutMs = positiveEnv('REQUEST_TIMEOUT_MS', 60_000);
+
 export const config = {
   port: Number(process.env.PORT) || 3000,
   // Default to loopback so the unauthenticated API + destructive submit
@@ -97,7 +105,20 @@ export const config = {
   // always enforces a monthly cap, so there is no "disable monthly" option
   // (review R4 #4); a 0 is coerced to the 3M default, never "unlimited".
   monthlyIdentifierLimit: numEnv('MONTHLY_IDENTIFIER_LIMIT', 3_000_000) || 3_000_000,
-  requestTimeoutMs: Number(process.env.REQUEST_TIMEOUT_MS) || 60_000,
+  requestTimeoutMs,
+  // Identity Graph lookups (2026-10-09): their own, longer timeout — a batch of
+  // 1,000 IDs with large clusters can take Adobe a while. A lookup that times
+  // out is retried (it is side-effect-free); work-order POSTs never are.
+  // Default: 120 s, or REQUEST_TIMEOUT_MS when a box has raised that higher (it
+  // was the only knob for slow lookups before this one existed).
+  identityTimeoutMs: positiveEnv('IDENTITY_TIMEOUT_MS', Math.max(120_000, requestTimeoutMs)),
+  // Expansion activity: a "still waiting on Adobe" log line (and Expansion-tab
+  // notice) after this long without a finished batch, and a Resume progress
+  // line every RESUME_LOG_EVERY already-expanded IDs skipped.
+  expansionHeartbeatMs: positiveEnv('EXPANSION_HEARTBEAT_MS', 30_000),
+  resumeLogEvery: positiveEnv('RESUME_LOG_EVERY', 100_000),
+  // How long a finished expansion's live progress stays readable (ms).
+  liveProgressRetainMs: positiveEnv('LIVE_PROGRESS_RETAIN_MS', 60_000),
 
   // Destructive-submit /quota preflight retry (2026-06-01 flaky-network prod
   // incident). adobeClient does NOT retry timeouts on a GET, so a single slow

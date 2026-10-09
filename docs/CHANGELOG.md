@@ -9,6 +9,113 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-10-09 — Expansion: slow Adobe answers no longer kill the job; the app says what it is doing
+
+The user's run stopped at 38% and failed with *"expansion batch failed … timeout"*. After
+**Resume**, the log showed "namespace registry loaded" and then nothing. Reproduced with the mock
+(one batch answered in 5 s against a 2 s timeout), and the run went through four stages:
+1. Nothing was logged while waiting.
+2. The job failed after one attempt.
+3. Resume re-sent the same batch first.
+4. Resume failed again at the same spot.
+
+Root causes:
+- **Timeouts were never retried.** `axios-retry` deliberately excludes timeouts (`ECONNABORTED`)
+  from "network errors", so the client's retry rule (network / 401 / 429 / 5xx) skipped them.
+  Without `shouldResetTimeout`, a retry would also only get the time left over, which after a
+  timeout is none.
+- **Nothing was logged while waiting:**
+  - a batch waiting on Adobe said nothing until it returned;
+  - a Resume logged its skipping only once the whole file was read;
+  - progress on the Expansion tab didn't move during either.
+
+  (Measured: Resume of 1M IDs at 38% reaches its first lookup in about 1.3 s on a dev Mac, so the
+  skip is fast but was invisible.)
+- Also found: `.env.example` set `IDENTITY_CONCURRENCY=10`, twice the documented safe default of 5,
+  so a box set up from it puts double the load on Adobe.
+
+Fixes:
+
+- **Backend — retries** (`adobeClient.js`, `identityGraph.js`, `config.js`):
+  - Identity Graph lookups opt in with `retryOnTimeout`. A lookup that times out is retried with
+    backoff (up to 5 times), each attempt with the full timeout (per-request
+    `axios-retry: { shouldResetTimeout: true }`).
+  - Lookups get their own `IDENTITY_TIMEOUT_MS`, default **120 s**. Other calls keep
+    `REQUEST_TIMEOUT_MS` (60 s).
+  - Every other request keeps failing fast on a timeout: GETs (the Monitor tick's 15 s budget, the
+    submit quota check) and the work-order POST, which is never resent because Adobe may have
+    received it.
+  - Retries are logged as `Adobe did not answer in time — retrying`. The 50-batch summary gains
+    `timeoutRetries`.
+- **Backend — activity** (`expansion.js`, `routes/jobs.js`):
+  - **Heartbeat:** every `EXPANSION_HEARTBEAT_MS` (30 s) without a finished batch, the log says
+    `still waiting on Adobe` with lookups in flight, the oldest's age and progress.
+  - **Resume:** logs `resuming: skipping IDs already expanded` every `RESUME_LOG_EVERY` (100,000)
+    rows, then `resuming: reached IDs not yet expanded — sending batches again`.
+  - **Progress endpoint:** `GET /jobs/:id/progress` adds `phase` (`resuming` | `expanding`),
+    `checked`, `skipped` and `waiting` (`{ inFlight, oldestMs }`).
+- **Frontend:** the Expansion tab shows "↻ Resuming — checked N rows of the file; M were already
+  expanded…" and "⏳ Waiting for Adobe — N lookups in flight, the oldest for S s. Slow answers are
+  retried automatically."
+- **Config:** `.env.example` uses `IDENTITY_CONCURRENCY=5` and documents `IDENTITY_TIMEOUT_MS`,
+  `REQUEST_TIMEOUT_MS`, `EXPANSION_HEARTBEAT_MS` and `RESUME_LOG_EVERY`. README has new
+  Troubleshooting rows.
+- **Final review fixes** (fresh reviewer: nothing critical in the diff; 8 Important, each fixed
+  test-first):
+  - **(1) My regression:** an OS `ETIMEDOUT` (TCP connect timeout, dropped connection) on a GET
+    is retried again as a network error. Only axios's own `ECONNABORTED` counts as a "timeout".
+  - **(2) My regression:** a failed run's 60 s cleanup no longer deletes the live progress of the
+    Resume that followed it, which had blanked "Resuming / Waiting for Adobe" mid-run.
+  - **(3) A failed run stops at once.** One `AbortController` per run cancels the group's other
+    lookups and their retry waits. The job records the FIRST error, where it used to take
+    whichever rejection came first in array order. Before, a run whose batch had failed stayed
+    "expanding" for up to about 12 min: Resume was refused and the tab said "Waiting for Adobe".
+  - **(4) Cut-off replies:** a 2xx reply that breaks off mid-body is retried for side-effect-free
+    requests, never for the work-order POST, which stays uncertain for Reconcile. Its error no
+    longer reads "HTTP 200 OK".
+  - **(5) App pauses:** when the app itself was paused, the log says so (`the app itself was
+    paused — not waiting on Adobe`) instead of blaming Adobe. Causes: text selected in the
+    Windows console (QuickEdit), sleep, or a heavy page refresh. README has a Troubleshooting row.
+  - **(6) The Expansion tab refresh.** It ran the per-namespace breakdown (a GROUP BY over every
+    stored identity, on the server's only thread) every 1.5 s, and kept polling after the job had
+    finished. Measured: about 2 s per call at 1.9M rows, and **60 vs 290 lookups/min** during a
+    Resume. Now: cheap endpoints only while expanding, the breakdown once when the job finishes,
+    no overlapping polls, and no polling once finished.
+  - **(7) Sign-in retries:** a retry after a 401 carries the fresh token, not the stale one.
+  - **(8) Deletion path (pre-existing):**
+    - A failed sign-in (IMS 429/401 during the token fetch) made a work-order POST resolve with
+      the IMS reply. The work order was then marked **submitted with no Adobe ID**, its quota
+      accepted, and nothing was deleted. Now the request fails as `notSent` and the work order is
+      released for retry.
+    - A 2xx without a `workorderId` is uncertain (kept for Reconcile), never "submitted".
+- **Also from the review:**
+  - `IDENTITY_TIMEOUT_MS` defaults to `REQUEST_TIMEOUT_MS` when that was raised higher.
+  - A 0, negative or garbage value for the new knobs falls back to the default (a negative
+    heartbeat flooded the log).
+  - A test now uses `fileURLToPath`, so it works on Windows.
+- **Not changed:** a batch still waits for the other batches in its group of 10 (`WAVE_SIZE`), so
+  one slow lookup still pauses reading. It is now visible and retried. A rolling pipeline was
+  offered and deferred by the user.
+- **Tests:** `npm test` **437 → 457**:
+  - `adobeClient`: a lookup timeout is retried with a fresh full timeout; a work-order POST and a
+    GET are not;
+  - `identityTimeout`: `IDENTITY_TIMEOUT_MS` drives retries; defaults 120 s / 60 s;
+  - `expansionActivity`: the heartbeat and `waiting` appear and clear; a first-attempt timeout
+    now finishes the job; Resume progress logs; the progress route passes the activity through.
+
+  - final-review fixes: `adobeClient` (OS `ETIMEDOUT` retried, sign-in failure not sent, fresh
+    token on retry, cut-off replies); `submitNotSent` (released or uncertain, never
+    "submitted"); `expansionAbort` (a failed run stops at once with the first error); activity
+    (cleanup race, app-pause log); config (defaults and validation).
+
+  New browser smoke `activity_smoke.py` 7/7:
+  - a real slow lookup shows and clears "Waiting for Adobe";
+  - no breakdown while expanding, one at the finish, then polling stops;
+  - the Resume text.
+
+  All browser smokes pass on master with the Back-button fix (PR #7): nav 36/36, activity 7/7,
+  noreply 23/23, analysis 42/42, report 18/18, fix 8/8, poll 4/4 (138/138).
+
 ## 2026-10-09 — Navigation: browser Back / Forward, "← All jobs", clearer buttons
 
 The user reported that tab navigation didn't route back, and that once a job was open in Analysis

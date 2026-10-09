@@ -191,6 +191,16 @@ export async function submitWorkOrder({
   const { data } = await client.post(`${config.aep.gateway}${PATH}`, body, {
     headers: { 'Content-Type': 'application/json' },
   });
+  // A 2xx without a work-order ID is not a recorded submission (2026-10-09,
+  // final review #8): it must never be marked 'submitted' with no Adobe ID. No
+  // .response on this error → the runner treats it as UNCERTAIN (kept in
+  // 'submitting', quota held) and Reconcile looks it up by displayName.
+  if (!data || typeof data !== 'object' || !data.workorderId) {
+    const e = new Error('Adobe accepted the work-order request but its reply had no work-order ID — ' +
+      'treated as uncertain; Reconcile will look it up by name.');
+    e.code = 'NO_WORKORDER_ID';
+    throw e;
+  }
 
   // Drift detection (CLAUDE.md quota-counting verification, F-block 2026-05-15):
   // Adobe's `operationCount` is THEIR count of submitted identifiers — the
