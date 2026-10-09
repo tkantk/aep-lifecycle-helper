@@ -8,7 +8,8 @@ import { getOrgQuota } from '../services/quotaApi.js';
 import { decryptCreds } from '../utils/crypto.js';
 import { liveProgress } from '../runner/expansion.js';
 import { registerAnalysisRoutes } from './analysisRoutes.js';
-import { exportIdentitiesCsv } from '../runner/identityExport.js';
+import { exportIdentitiesCsv, exportState, startIdentityExport, waitForIdentityExport, discardIdentityExport,
+  exportPath as identityExportPath, exportDownloadName, ExportFailedError } from '../runner/identityExport.js';
 import { discardAnalysisReport } from '../runner/analysisReport.js';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
@@ -85,6 +86,8 @@ router.get('/:id', async (req, res, next) => {
       },
       breakdown: { byNamespace, byWorkOrderStatus },
       quota,
+      // The expanded-identities CSV built in the background (2026-10-09).
+      export: exportState(job.id),
     });
   } catch (err) { next(err); }
 });
@@ -408,16 +411,44 @@ router.post('/:id/work-orders/:woId/retry-rejected', (req, res, next) => {
  *  overlapping export requests — or one export overlapping the planner —
  *  can't collide on the shared cached Statement's single-iterator-per-stmt
  *  rule in better-sqlite3 ("This statement is busy executing a query"). */
+/** POST /api/jobs/:id/export[?rebuild=1] — build the expanded-identities CSV in
+ *  the background (2026-10-09); GET /:id reports `export` (status, progress).
+ *  409 export_not_ready while expanding, export_building / export_busy while a
+ *  build runs. A ready export is returned as is unless ?rebuild=1. */
+router.post('/:id/export', (req, res, next) => {
+  try {
+    const job = q().getJob.get(req.params.id);
+    if (!job) return res.status(404).json({ error: 'job not found' });
+    res.json(startIdentityExport(job.id, { rebuild: req.query.rebuild === '1' }));
+  } catch (err) { next(err); }
+});
+
+/** GET /api/jobs/:id/export — the finished CSV. With none built yet it builds
+ *  one first, as it always did (scripts keep working); the UI builds with POST
+ *  and only downloads once ready, so the browser never waits on the build.
+ *  Built in a worker thread on its own read-only connection (2026-10-06):
+ *  SQLite groups every stored row before the first one — minutes on a large
+ *  job — and on the main thread that froze the server. */
 router.get('/:id/export', async (req, res, next) => {
-  // Built in a worker thread on its own read-only connection (2026-10-06):
-  // SQLite groups every stored row before the first one — minutes on a large
-  // job — and on the main thread that froze the server (and, iterating the
-  // main connection, made concurrent writes throw "connection is busy").
   try {
     const jobId = req.params.id;
-    const outPath = path.join(config.outputDir, `job_${jobId}_identities.csv`);
-    await exportIdentitiesCsv({ jobId, outPath });
-    res.download(outPath);
+    const job = q().getJob.get(jobId);
+    if (!job) {          // unchanged: an unknown job exports an empty file
+      const outPath = path.join(config.outputDir, `job_${jobId}_identities.csv`);
+      await exportIdentitiesCsv({ jobId, outPath });
+      return res.download(outPath);
+    }
+    if (exportState(jobId).status !== 'ready') {
+      if (exportState(jobId).status !== 'building') startIdentityExport(jobId);
+      await waitForIdentityExport(jobId);
+      const state = exportState(jobId);
+      if (state.status !== 'ready') {
+        const e = new ExportFailedError(state.error || 'The CSV export failed — try again.');
+        e.status = 500; e.code = 'export_failed'; e.publicMessage = e.message;
+        throw e;
+      }
+    }
+    res.download(identityExportPath(jobId), exportDownloadName(job));
   } catch (err) { next(err); }
 });
 
@@ -520,6 +551,7 @@ router.delete('/:id', async (req, res, next) => {
     // Stop an Excel-report build for this job and remove its file (the
     // analysis rows go with the cascade below).
     discardAnalysisReport(jobId);
+    discardIdentityExport(jobId);      // stop a CSV build and remove its file
     q().deleteJob.run(jobId);
 
     // Best-effort filesystem cleanup. Failures here aren't fatal — the DB

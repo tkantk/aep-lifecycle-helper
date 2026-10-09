@@ -117,3 +117,16 @@ test('the Expand step mentions IDs with no reply from AEP', () => {
   assert.equal(byKey(V.steps(job({ found_count: 450, no_reply_count: 3 }))).expand.hint, '450 identities found · 3 no reply from AEP');
   assert.equal(byKey(V.steps(job({ found_count: 450 }))).expand.hint, '450 identities found');
 });
+
+test('identityExportView: the Export CSV button for every export state (2026-10-09)', () => {
+  assert.deepEqual(plain(V.identityExportView(null)),
+    { state: 'none', label: 'Export CSV', pct: 0, detail: '', action: 'build' });
+  assert.deepEqual(plain(V.identityExportView({ status: 'building', phase: 'sorting', rowsDone: 0, rowsTotal: 23335220 })),
+    { state: 'building', label: 'Preparing CSV…', pct: 0, detail: 'Sorting 23,335,220 identities — you can keep working', action: null });
+  assert.deepEqual(plain(V.identityExportView({ status: 'building', phase: 'writing', rowsDone: 11667610, rowsTotal: 23335220 })),
+    { state: 'building', label: 'Writing CSV… 50%', pct: 50, detail: '11,667,610 of 23,335,220 identities', action: null });
+  assert.deepEqual(plain(V.identityExportView({ status: 'ready', bytes: 540016640, rowsTotal: 4000000 })),
+    { state: 'ready', label: '⤓ Download CSV', pct: 100, detail: '515.0 MB · 4,000,000 identities', action: 'download' });
+  assert.deepEqual(plain(V.identityExportView({ status: 'failed', error: 'disk full' })),
+    { state: 'failed', label: 'Export CSV', pct: 0, detail: 'The last export failed: disk full', action: 'build' });
+});

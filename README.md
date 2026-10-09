@@ -223,6 +223,12 @@ Turn the concurrency dial up from the conservative default of 5 (e.g.
                    off at the scheduled time.
 ```
 
+**Export CSV** (Expansion tab) builds the expanded-identities file on the server in
+the background — "Preparing CSV…", then "Writing CSV… N%" — and then offers
+**⤓ Download CSV** (the finished file; the browser's own download bar shows it).
+You can keep working meanwhile. The file is kept until a Resume changes the
+identities or the job is deleted (about 0.5 GB per million uploaded IDs).
+
 State is persisted at every step — **close the app and reopen it** and
 you can pick up where you left off. The startup-recovery routine handles
 jobs stuck mid-expansion or mid-submission.
@@ -364,7 +370,8 @@ All under `/api/` on `http://127.0.0.1:3000`.
 | GET | `/api/jobs/:id/work-orders` | All work orders + per-service status |
 | POST | `/api/jobs/:id/reconcile` | Look up uncertain orphans in Adobe by name; record any that exist |
 | POST | `/api/jobs/:id/work-orders/:woId/release-absent` | Operator-confirmed: release a verified-absent orphan for retry. Body `{confirmedAbsent: true}` required |
-| GET | `/api/jobs/:id/export` | Download expanded identities CSV (formula-injection sanitized) |
+| POST | `/api/jobs/:id/export[?rebuild=1]` | Build the expanded-identities CSV in the background (one at a time); `GET /api/jobs/:id` reports `export` (status, progress, size) |
+| GET | `/api/jobs/:id/export` | Download the finished expanded-identities CSV (formula-injection sanitized); with none built yet it builds one first |
 | POST | `/api/jobs/:id/analysis` | Build / rebuild the identity analysis (Identity Graph jobs) |
 | GET | `/api/jobs/:id/analysis` | Analysis status, progress and totals |
 | GET | `/api/jobs/:id/analysis/sources?category=&search=&sort=size\|id&limit=&offset=` | Page through the per-ID report |

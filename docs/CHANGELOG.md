@@ -9,6 +9,54 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-10-09 — Export CSV is built in the background (the browser no longer hangs)
+
+The user reported that **Export CSV** on the Expansion tab hung the browser most of the time.
+Measured (1M uploaded IDs × 5 identities = 5M rows):
+- **One long request:** the button navigated to `GET /api/jobs/:id/export`, which built the WHOLE
+  file before sending a byte. The first row took 9.7 s and the export 14.8 s; at 6.8M IDs, minutes.
+  The browser just waited on that request.
+- **Memory:** SQLite grouped and sorted every row in RAM (`temp_store = MEMORY`), adding about
+  **+0.97 GB** to the app, about 6 GB at 6.8M, on the laptop the browser runs on.
+
+Changes:
+
+- **Backend** (`runner/identityExport.js`, `identityExportWorker.js`, `routes/jobs.js`, `db.js`):
+  - `POST /api/jobs/:id/export[?rebuild=1]` starts a background build in the worker and answers
+    at once.
+  - `GET /api/jobs/:id` reports `export`: status building/ready/failed; phase sorting/writing;
+    rows done/total, where total = the job's distinct identities; size; error.
+  - `GET /api/jobs/:id/export` sends the finished file, named after the job
+    (`<job>_identities.csv`). With none built yet it builds one first, as before, so scripts keep
+    working. An unknown job still gets an empty file.
+  - The worker writes `.tmp` and renames it when done.
+  - New additive `jobs.export_*` columns.
+  - **Lifecycle:** one build at a time across the app (409 `export_building` / `export_busy`), and
+    409 `export_not_ready` while the job is expanding. The file is kept until an expansion run
+    (e.g. Resume) changes the identities, or the job is deleted; both discard it, even mid-build.
+    A build interrupted by a restart is marked failed at startup.
+- **Memory:** the worker sorts ON DISK (`temp_store = FILE`):
+  - **+166 MB instead of +969 MB** at 1M IDs, with the same time;
+  - in a side-by-side, disk was also faster (first row 4.9 s vs 6.9 s).
+
+  The main connection still sorts in RAM; planning's memory at 6.8M is worth measuring next.
+- **Frontend (Expansion tab):** the button shows "Preparing CSV…" (sorting), then "Writing CSV…
+  N%", then "⤓ Download CSV", with size and identities beside it and a "↻ Rebuild CSV" link.
+  - The download is the finished file, so it starts at once in the browser's download bar.
+  - The page never navigates away or waits on the build; a toast says when it's ready.
+  - The button stays disabled while building. It has its own click handler because
+    `onClickGuarded` re-enabled it when the click returned.
+  - The export poll stops on tab or job change.
+- **Tests:** `npm test` **457 → 467**:
+  - `identityExportBuild` (9): background build and instant download; one at a time; rebuild;
+    not while expanding; a Resume discards; delete removes; restart marks failed; GET builds
+    first; the disk sort;
+  - `webJobView`: `identityExportView` states.
+
+  New browser smoke `export_smoke.py` 10/10: build, then download, with no page navigation; the
+  file and name; Rebuild; progress and disabled while building; still disabled right after the
+  click. All smokes 148/148.
+
 ## 2026-10-09 — Expansion: slow Adobe answers no longer kill the job; the app says what it is doing
 
 The user's run stopped at 38% and failed with *"expansion batch failed … timeout"*. After

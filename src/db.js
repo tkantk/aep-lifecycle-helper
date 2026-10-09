@@ -361,6 +361,16 @@ export function initDb() {
     { table: 'job_analysis', column: 'report_finished_at', type: 'TEXT' },
     // 2026-10-08: how many uploaded IDs got no reply from AEP (no_reply_sources rows).
     { table: 'jobs', column: 'no_reply_count', type: 'INTEGER NOT NULL DEFAULT 0' },
+    // 2026-10-09: the expanded-identities CSV, built in the background
+    // (runner/identityExport.js) — 'building' | 'ready' | 'failed', progress,
+    // size, error. Cleared when an expansion run starts or the job is deleted.
+    { table: 'jobs', column: 'export_status', type: 'TEXT' },
+    { table: 'jobs', column: 'export_rows_done', type: 'INTEGER NOT NULL DEFAULT 0' },
+    { table: 'jobs', column: 'export_rows_total', type: 'INTEGER' },
+    { table: 'jobs', column: 'export_bytes', type: 'INTEGER' },
+    { table: 'jobs', column: 'export_error', type: 'TEXT' },
+    { table: 'jobs', column: 'export_started_at', type: 'TEXT' },
+    { table: 'jobs', column: 'export_finished_at', type: 'TEXT' },
   ];
   for (const { table, column, type } of additiveColumns) {
     try {
@@ -982,6 +992,18 @@ function prepared() {
       report_bytes = NULL, report_error = NULL, report_built_for = NULL, report_started_at = NULL,
       report_finished_at = NULL WHERE job_id = ?`),
     listBuildingReports: db.prepare(`SELECT job_id FROM job_analysis WHERE report_status = 'building'`),
+    // Expanded-identities CSV export (2026-10-09; runner/identityExport.js).
+    startExport: db.prepare(`UPDATE jobs SET export_status = 'building', export_rows_done = 0, export_rows_total = @rowsTotal,
+      export_bytes = NULL, export_error = NULL, export_started_at = datetime('now'), export_finished_at = NULL WHERE id = @jobId`),
+    finishExport: db.prepare(`UPDATE jobs SET export_status = 'ready', export_rows_done = @rowsDone, export_rows_total = @rowsDone,
+      export_bytes = @bytes, export_finished_at = datetime('now') WHERE id = @jobId`),
+    failExport: db.prepare(`UPDATE jobs SET export_status = 'failed', export_error = ?, export_finished_at = datetime('now') WHERE id = ?`),
+    clearExport: db.prepare(`UPDATE jobs SET export_status = NULL, export_rows_done = 0, export_rows_total = NULL, export_bytes = NULL,
+      export_error = NULL, export_started_at = NULL, export_finished_at = NULL WHERE id = ?`),
+    listBuildingExports: db.prepare(`SELECT id FROM jobs WHERE export_status = 'building'`),
+    markInterruptedExportsFailed: db.prepare(`UPDATE jobs SET export_status = 'failed',
+      export_error = 'interrupted by a restart — export it again', export_finished_at = datetime('now')
+      WHERE export_status = 'building'`),
     markInterruptedReportsFailed: db.prepare(`UPDATE job_analysis SET report_status = 'failed',
       report_error = 'interrupted by restart — build it again', report_finished_at = datetime('now')
       WHERE report_status = 'building'`),

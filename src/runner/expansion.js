@@ -3,6 +3,7 @@ import { expandBatchDetailed } from '../services/identityGraph.js';
 import { listNamespaces, buildNamespaceIndex, canonicalizeNamespace } from '../services/namespaces.js';
 import { snapshotAndResetRateLimitHits, snapshotAndResetTimeoutRetries } from '../services/adobeClient.js';
 import { insertIdentitiesAndCount, clearNoReply, q } from '../db.js';
+import { discardIdentityExport } from './identityExport.js';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { streamIds } from '../utils/csv.js';
@@ -38,6 +39,9 @@ export async function runExpansion({
   // work already done.
   skipSourceIds = null,
 }) {
+  // The stored identities are about to change: an export built from them is
+  // stale (2026-10-09). Stop a build and remove the file.
+  discardIdentityExport(jobId);
   const creds = await decryptCreds(credsId);
   const job = q().getJob.get(jobId);
   const total = job.total_source_ids;

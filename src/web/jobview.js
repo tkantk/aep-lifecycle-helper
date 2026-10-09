@@ -151,7 +151,35 @@
     return { state: 'none', label: 'Build Excel report', pct: 0, size: '', error: '', action: 'build' };
   }
 
+  /** The Expansion tab's Export CSV button for an export state (GET /jobs/:id → export; 2026-10-09). */
+  function identityExportView(exp) {
+    var e = exp || {};
+    function size(b) {
+      if (!(b > 0)) return '';
+      return b >= 1048576 ? (b / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(b / 1024)) + ' KB';
+    }
+    if (e.status === 'building') {
+      if (e.phase === 'writing' && e.rowsTotal > 0) {
+        var pct = Math.min(100, Math.floor(100 * (e.rowsDone || 0) / e.rowsTotal));
+        return { state: 'building', label: 'Writing CSV… ' + pct + '%', pct: pct,
+          detail: fmt(e.rowsDone) + ' of ' + fmt(e.rowsTotal) + ' identities', action: null };
+      }
+      return { state: 'building', label: 'Preparing CSV…', pct: 0,
+        detail: (e.rowsTotal > 0 ? 'Sorting ' + fmt(e.rowsTotal) + ' identities' : 'Sorting the identities') + ' — you can keep working',
+        action: null };
+    }
+    if (e.status === 'ready') {
+      return { state: 'ready', label: '⤓ Download CSV', pct: 100,
+        detail: [size(e.bytes), e.rowsTotal > 0 ? fmt(e.rowsTotal) + ' identities' : ''].filter(Boolean).join(' · '), action: 'download' };
+    }
+    if (e.status === 'failed') {
+      return { state: 'failed', label: 'Export CSV', pct: 0, detail: 'The last export failed: ' + (e.error || 'unknown error'), action: 'build' };
+    }
+    return { state: 'none', label: 'Export CSV', pct: 0, detail: '', action: 'build' };
+  }
+
   root.AepJobView = {
+    identityExportView: identityExportView,
     steps: steps,
     badges: badges,
     scopeEstimates: scopeEstimates,

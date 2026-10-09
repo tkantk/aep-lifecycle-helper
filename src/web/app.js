@@ -182,6 +182,7 @@ window.addEventListener('hashchange', onRouteChange);
 function goto(step, { record = true } = {}) {
   if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
   stopExcelPoll();
+  stopExportPoll();
   state.step = step;
   if (record) recordRoute(step);
   const meta = STEPS[step];
@@ -1134,6 +1135,7 @@ async function switchToJob(jobId) {
     recordRoute(state.step);
     if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; }
     stopExcelPoll();
+    stopExportPoll();
     // Re-render whatever tab the operator was on.
     const meta = STEPS[state.step];
     if (meta) await meta.render();
@@ -1320,10 +1322,32 @@ async function renderExpand() {
   // completion. Hold the disable for 3 s so a rapid double-click can't
   // re-trigger /export — even though the server is now collision-safe
   // (see fix on 2026-05-29), duplicate downloads still waste resources.
-  onClickGuarded($('#btn-export-csv'), async () => {
-    window.location.href = `${API}/jobs/${state.job.id}/export`;
-    await new Promise(r => setTimeout(r, 3000));
-  }, { loadingText: 'Preparing download…' });
+  // Export CSV (2026-10-09): the server builds the file in the background (with
+  // progress); the button then downloads the FINISHED file — the browser never
+  // waits on the build (it used to navigate to a URL that took minutes).
+  // Its own click handler, not onClickGuarded: that one re-enables the button
+  // when the click is handled, but while a build runs the button must stay
+  // disabled — paintIdentityExport (the export's state) decides.
+  const exportBtn = $('#btn-export-csv');
+  let exportClickBusy = false;
+  exportBtn?.addEventListener('click', async () => {
+    if (exportClickBusy || exportBtn.disabled) return;
+    exportClickBusy = true;
+    try {
+      const v = window.AepJobView.identityExportView(state.exportState);
+      if (v.action === 'download') {
+        window.location.href = `${API}/jobs/${state.job.id}/export`;
+        await new Promise(r => setTimeout(r, 3000));   // no double download on a rapid re-click
+      } else if (v.action === 'build') {
+        exportBtn.disabled = true;                      // until the server answers
+        await startIdentityExportUi(false);
+      }
+    } finally {
+      exportClickBusy = false;
+      paintIdentityExport(state.exportState);
+    }
+  });
+  onClickGuarded($('#btn-export-rebuild'), () => startIdentityExportUi(true));
   $('#btn-goto-plan').addEventListener('click', () => goto('plan'));
 
   // Delete Job — hard-delete the job and all its data (expanded identities,
@@ -1503,6 +1527,8 @@ async function renderExpand() {
     renderActiveJobHeader('expand-body');
 
     $('#btn-export-csv').hidden = !done || total === 0;
+    paintIdentityExport(j.export);
+    if (j.export?.status === 'building') pollIdentityExport(state.job.id);
     $('#btn-goto-plan').hidden = !done;
     $('#btn-goto-analysis').hidden = !done || state.job.expansion_mode === 'none';
 
@@ -1969,6 +1995,55 @@ async function startExcelReport(rebuild) {
 // build's poll let a rebuild started mid-report find a timer "already running",
 // skip its own poll, and freeze at its first progress value (review, 2026-10-07).
 let excelPollTimer = null;
+// ─── Export CSV, built in the background (2026-10-09) ─────────────────
+let exportPollTimer = null;
+function stopExportPoll() { if (exportPollTimer) { clearInterval(exportPollTimer); exportPollTimer = null; } }
+function paintIdentityExport(exp) {
+  state.exportState = exp || null;
+  const btn = $('#btn-export-csv');
+  if (!btn) return;
+  const v = window.AepJobView.identityExportView(exp);
+  btn.textContent = v.label;
+  btn.disabled = v.state === 'building';
+  btn.classList.toggle('btn-primary', v.state === 'ready');
+  btn.classList.toggle('btn-secondary', v.state !== 'ready');
+  const meta = $('#export-meta');
+  if (meta) { meta.textContent = btn.hidden ? '' : v.detail; meta.classList.toggle('error', v.state === 'failed'); }
+  const rebuild = $('#btn-export-rebuild');
+  if (rebuild) rebuild.hidden = btn.hidden || v.state !== 'ready';
+}
+async function startIdentityExportUi(rebuild) {
+  const jobId = state.job.id;
+  try {
+    paintIdentityExport(await http('POST', `/jobs/${jobId}/export${rebuild ? '?rebuild=1' : ''}`));
+  } catch (err) {
+    // Already building (e.g. started from another tab): follow it.
+    if (!(err.status === 409 && err.data?.error === 'export_building')) {
+      showToast(`Could not start the export: ${err.message}`, { kind: 'error' });
+      return;
+    }
+  }
+  pollIdentityExport(jobId);
+}
+function pollIdentityExport(jobId) {
+  if (exportPollTimer) return;
+  let busy = false;
+  exportPollTimer = setInterval(async () => {
+    if (busy) return;
+    busy = true;
+    try {
+      if (state.step !== 'expand' || state.job?.id !== jobId) { stopExportPoll(); return; }
+      const j = await http('GET', `/jobs/${jobId}`);
+      if (state.step !== 'expand' || state.job?.id !== jobId) { stopExportPoll(); return; }
+      paintIdentityExport(j.export);
+      if (j.export?.status !== 'building') {
+        stopExportPoll();
+        if (j.export?.status === 'ready') showToast('The CSV is ready — click ⤓ Download CSV.', { kind: 'success' });
+        else if (j.export?.status === 'failed') showToast(`The CSV export failed: ${j.export.error}`, { kind: 'error' });
+      }
+    } catch { /* a missed poll — the next one retries */ } finally { busy = false; }
+  }, 2000);
+}
 function stopExcelPoll() {
   if (excelPollTimer) { clearInterval(excelPollTimer); excelPollTimer = null; }
 }
