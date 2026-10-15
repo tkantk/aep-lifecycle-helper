@@ -35,3 +35,16 @@ export const NO_REPLY_CHUNK_SQL = 'SELECT source_id FROM no_reply_sources WHERE 
 // The job's largest clusters, all categories (idx_sa_job_size). (job, limit)
 export const TOP_CLUSTERS_SQL = `SELECT source_id, category, identities_total, other_not_in_list FROM source_analysis
   WHERE job_id = ? ORDER BY identities_total DESC, source_id LIMIT ?`;
+
+// Distinct identities per stored namespace — each (namespace, value) once, the
+// rule behind the job's distinct identity count (found_count), so the groups add
+// up to it. Sorts every stored row of the job (33M on a 6.8M-ID job): run it on a
+// worker thread's connection with temp_store = FILE (2026-10-14; measured 3.5 s at
+// 5M rows, 33 s at 12M — faster than linear growth, so minutes at 33M — with RSS
+// flat and ~95 bytes of temp files per row in the OS temp folder). (job)
+export const DISTINCT_BY_NAMESPACE_SQL = `SELECT ns_code, ns_id, COUNT(DISTINCT identity_id) AS n
+  FROM expanded_identities WHERE job_id = ?
+  GROUP BY COALESCE(ns_code, ''), COALESCE(ns_id, 0)`;
+
+// Uploaded IDs that share a cluster with another uploaded ID. (job)
+export const MERGED_WITH_UPLOADED_SQL = 'SELECT COUNT(*) AS n FROM source_analysis WHERE job_id = ? AND other_in_list > 0';

@@ -179,9 +179,35 @@ demo — never for production. See CLAUDE.md I12.
                      stored or no reply). not_found (2026-10-08) = one own row
                      and nothing else: Adobe answered with no identities (it
                      lists an ID it knows in its own cluster, which adds a
-                     second own row); still planned as a single-ID delete. One transaction
+                     second own row); still planned as a single-ID delete. Shown as
+                     "Not in identity graph" since 2026-10-14: Identity Service
+                     doesn't store an ID with no links, so its profile may still
+                     exist. One transaction
                      per page into source_analysis, a setImmediate yield
-                     between pages, totals in job_analysis.summary_json. A
+                     between pages, totals in job_analysis.summary_json.
+                     summary.distinct (2026-10-14) = { uploaded, outsideProfiles,
+                     byNamespace, mergedWithUploaded }: identities per namespace
+                     counted ONCE (COUNT(DISTINCT), the found_count rule), the
+                     uploaded IDs included, so the parts add up to found_count —
+                     what the Analysis tab and the Excel Summary show. Counted at
+                     the end of the build by analysisCountsWorker.js (worker
+                     thread, own read-only connection, temp_store = FILE: 3.5 s at
+                     5M rows, 33 s at 12M, minutes at 33M; ~95 bytes of temp files
+                     per row in the OS temp folder) while GET /analysis reports
+                     phase 'counting'. If it fails the analysis stands with
+                     summary.distinctError and the report build counts again (the
+                     report then omits only the namespace section if that fails
+                     too). summary.byNamespace /
+                     otherProfiles stay per-uploaded-ID SUMS (uploaded IDs left
+                     out, shared identities counted again) and are only used to
+                     order the data-sheet / CSV namespace columns. An analysis
+                     built earlier gets `distinct` from its next Excel report
+                     build: the report worker counts it, analysisReport.js stores
+                     it (setAnalysisSummary, only while finished_at is unchanged,
+                     so the report stays valid; a failure there never fails the
+                     report). report_built_for = finished_at + '#v2' (the workbook
+                     format): a report built by older code is out of date and is
+                     never served. A
                      failed build marks only the analysis failed; one still
                      'building' at startup is marked failed (restart). Read by
                      the Analysis tab via routes/analysisRoutes.js.
@@ -190,7 +216,7 @@ demo — never for production. See CLAUDE.md I12.
                      read-only connection — which streams analysisWorkbook.js's
                      workbook (Summary dashboard + one sheet per merged category,
                      each merged uploaded ID with all its identities in one row,
-                     + "Not found in AEP" / "No reply from AEP" ID lists)
+                     + "Not in identity graph" / "No reply from AEP" ID lists)
                      to data/output/job_<id>_analysis.xlsx. One build at a time;
                      kept until the analysis is rebuilt or the job deleted; state
                      in job_analysis.report_*.
@@ -519,9 +545,15 @@ src/
 │   │                       the pure functions from analysisCore.js.
 │   ├── analysisCore.js     IMPORT-FREE analysis logic shared with the report worker:
 │   │                       classifySource, describeSourceIdentities, sourceNsMatcher,
-│   │                       resolveSourceNamespace, categoryChunkReader (2026-10-07).
+│   │                       resolveSourceNamespace, categoryChunkReader (2026-10-07),
+│   │                       splitDistinctNamespaces (2026-10-14).
 │   ├── analysisSql.js      IMPORT-FREE SQL text shared by the main thread and the
-│   │                       report worker (category walks, identities, top clusters).
+│   │                       workers (category walks, identities, top clusters,
+│   │                       distinct identities per namespace, merged-with-uploaded).
+│   ├── analysisReaders.js  Read-only views of an analysis on any connection, shared by
+│   │                       the report and distinct-count workers (2026-10-14).
+│   ├── analysisCounts.js   computeDistinctCounts: summary.distinct from those readers.
+│   ├── analysisCountsWorker.js  Worker thread: distinct counts at the end of a build.
 │   ├── analysisWorkbook.js The Excel report (ExcelJS streaming writer): Summary
 │   │                       dashboard + merged-ID sheets; identity values as TEXT
 │   │                       cells, 32,767-char cut, sheets continue past 1,048,575 rows.
@@ -529,7 +561,8 @@ src/
 │   │                       time), state (never stale: built_for = the analysis
 │   │                       finished_at, file must exist), discard (analysis rebuild,
 │   │                       job delete), startup marks interrupted builds failed.
-│   ├── analysisReportWorker.js  Worker thread: read-only connection → workbook file.
+│   ├── analysisReportWorker.js  Worker thread: read-only connection → workbook file
+│   │                       (counts summary.distinct first for an older analysis).
 │   ├── identityExport.js   Expanded-identities CSV written by
 │   │                       identityExportWorker.js in a worker thread (2026-10-06).
 │   │                       Built in the BACKGROUND (2026-10-09): POST starts it,

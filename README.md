@@ -177,15 +177,26 @@ Turn the concurrency dial up from the conservative default of 5 (e.g.
                    instead, and Resume asks about every ID again once fixed.
       ↓
 3a. Analysis       Built automatically after expansion (Identity Graph jobs).
-                   Puts every uploaded ID in one group: Not found in AEP ·
-                   Only itself · Linked identities · Merged with a profile in
-                   your file · ⚠ Merged with a profile NOT in your file (deleting
-                   with linked identities also deletes that profile's
-                   identities). Filter, search, drill into a cluster. The
-                   Downloads card offers an Excel report (a dashboard sheet +
-                   every merged ID with all its identities in one row + the
-                   Not found / No reply lists), a Summary CSV, a Detail CSV and
-                   the No reply list. Review only.
+                   Puts every uploaded ID in one group: Not in identity graph
+                   (no links in AEP's identity graph; its profile may still
+                   exist, so it is still deleted) · Only itself · Linked
+                   identities · Merged with a profile in your file · ⚠ Merged
+                   with a profile NOT in your file (deleting with linked
+                   identities also deletes that profile's identities).
+                   Identities per namespace are counted once each, your
+                   uploaded IDs included, so they add up to Distinct
+                   identities. "Merged with a profile NOT in your file" = how
+                   many of your uploaded IDs; "Profiles NOT in your file" = how
+                   many different such profiles (one can be merged with several
+                   of your IDs). Filter,
+                   search, drill into a cluster. The Downloads card offers an
+                   Excel report (a dashboard sheet + every merged ID with all
+                   its identities in one row + the Not in identity graph / No
+                   reply lists), a Summary CSV, a Detail CSV and the No reply
+                   list. Review only. An analysis built before 2026-10-14 gets
+                   the per-namespace counts from its next Excel report build
+                   (no rebuild, no calls to Adobe); its old workbook is out of
+                   date, so the card offers "Build Excel report" again.
       ↓
 4. Batch Planning  Choose what the plan deletes: uploaded IDs + linked
                    identities (default) or uploaded IDs only. Re-planning
@@ -228,6 +239,9 @@ the background — "Preparing CSV…", then "Writing CSV… N%" — and then off
 **⤓ Download CSV** (the finished file; the browser's own download bar shows it).
 You can keep working meanwhile. The file is kept until a Resume changes the
 identities or the job is deleted (about 0.5 GB per million uploaded IDs).
+Big jobs also need free space in the computer's temp folder (`%TEMP%` on Windows):
+the export and the analysis's per-namespace count sort on disk there, about
+100 bytes per stored identity (roughly 3 GB for a 6.8M-ID job with 33M identities).
 
 State is persisted at every step — **close the app and reopen it** and
 you can pick up where you left off. The startup-recovery routine handles

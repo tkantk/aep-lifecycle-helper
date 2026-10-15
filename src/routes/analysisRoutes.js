@@ -2,7 +2,7 @@ import { performance } from 'node:perf_hooks';
 import { q, db } from '../db.js';
 import {
   analysisAvailability, isAnalysisBuilding, buildAnalysis, describeSourceIdentities, sourceNamespaceOf,
-  ANALYSIS_CATEGORIES, AnalysisUnavailableError, AnalysisRunningError,
+  ANALYSIS_CATEGORIES, AnalysisUnavailableError, AnalysisRunningError, analysisPhase,
 } from '../runner/analysis.js';
 import { categoryChunkReader } from '../runner/analysisCore.js';
 import { startAnalysisReport, reportState, reportPath, reportDownloadName } from '../runner/analysisReport.js';
@@ -170,6 +170,7 @@ export function registerAnalysisRoutes(router) {
       res.json({
         available, reason,
         status: a?.status ?? null,
+        phase: a?.status === 'building' ? analysisPhase(job.id) : null,   // 'counting' (2026-10-14)
         sourcesDone: a?.sources_done ?? 0,
         sourcesTotal: a?.sources_total ?? null,
         summary: a?.summary_json ? JSON.parse(a.summary_json) : null,

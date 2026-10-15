@@ -1,11 +1,13 @@
 import ExcelJS from 'exceljs';
 import { describeSourceIdentities, sourceNsMatcher } from './analysisCore.js';
+import { countOutsideProfiles, finishDistinctCounts } from './analysisCounts.js';
 
 /**
  * The identity-analysis Excel report (2026-10-07): a "Summary" dashboard sheet in
  * Adobe colours, then one sheet per merged category listing every uploaded ID with
  * all of its identities in ONE row (one column per namespace), and one-column lists
- * of the uploaded IDs not found in AEP / with no reply from AEP (2026-10-08). Streamed with
+ * of the uploaded IDs not in the identity graph / with no reply from AEP (2026-10-08). Identities per
+ * namespace are counted once each, the uploaded IDs included (2026-10-14). Streamed with
  * ExcelJS (rows are written and released as they go); runs in a worker thread
  * (analysisReportWorker.js), so it must not import db.js / config.js. Identity
  * values are TEXT cells, never formulas. The writer waits for the zip to catch up
@@ -15,22 +17,24 @@ export const EXCEL_MAX_DATA_ROWS = 1_048_575;   // 1,048,576 rows per sheet incl
 export const EXCEL_MAX_CELL_CHARS = 32_767;
 // Tab names stay ≤ 31 chars even with an overflow suffix up to " (10)".
 export const REPORT_SHEETS = { merged_outside_list: '⚠ Merged · NOT in file', merged_in_list: 'Merged · in file',
-  not_found: 'Not found in AEP', no_reply: 'No reply from AEP' };
+  not_found: 'Not in identity graph', no_reply: 'No reply from AEP' };
+// "Not in identity graph" was "Not found in AEP" until 2026-10-14: AEP's identity graph
+// doesn't keep an ID that isn't linked to anything, so its profile may still exist.
 export const CATEGORY_LABEL = {
-  not_found: 'Not found in AEP', source_only: 'Only itself', linked: 'Linked identities',
+  not_found: 'Not in identity graph', source_only: 'Only itself', linked: 'Linked identities',
   merged_in_list: 'Merged with a profile in your file', merged_outside_list: '⚠ Merged with a profile NOT in your file',
 };
 const CATEGORY_MEANING = {
-  not_found: 'AEP has no identities for it — deleted on its own.',
+  not_found: "No links in AEP's identity graph. Its profile may still exist — it is still deleted on its own.",
   source_only: 'In AEP, nothing else linked.',
   linked: 'Its own email, ECID, phone… no other profile.',
   merged_in_list: 'That profile is being deleted too.',
   merged_outside_list: "Deleting also removes that profile's identities.",
 };
-// An analysis built before "Not found in AEP" existed (no not_found key): those IDs
-// are still counted under "Only itself" — say so rather than show 0 (final review #4).
+// An analysis built before this category existed (no not_found key): those IDs are
+// still counted under "Only itself" — say so rather than show 0 (final review #4).
 const legacyAnalysis = (summary) => !Object.prototype.hasOwnProperty.call(summary.byCategory || {}, 'not_found');
-const LEGACY_NOT_FOUND = 'This analysis was built before "Not found in AEP" existed — rebuild the analysis, then this report, to see these IDs.';
+const LEGACY_NOT_FOUND = 'This analysis was built before "Not in identity graph" existed — rebuild the analysis, then this report, to see these IDs.';
 const NO_REPLY_LABEL = 'No reply from AEP';
 const NO_REPLY_MEANING = "AEP didn't answer for it, even when asked again — not in the plan.";
 const ORDER = ['not_found', 'source_only', 'linked', 'merged_in_list', 'merged_outside_list'];
@@ -94,7 +98,7 @@ export function dataNamespaces(summary, sourceNs) {
     .map(([k]) => k);
 }
 
-function writeSummary(wb, { meta, summary, outsideProfiles, topClusters }) {
+function writeSummary(wb, { meta, summary, distinct, outsideProfiles, countError, topClusters }) {
   const ws = wb.addWorksheet('Summary', {
     views: [{ showGridLines: false }],
     pageSetup: { orientation: 'landscape', fitToPage: true, fitToWidth: 1, fitToHeight: 0 },
@@ -139,25 +143,31 @@ function writeSummary(wb, { meta, summary, outsideProfiles, topClusters }) {
     { font: font({ size: 9, color: { argb: COLOR.grey600 } }) });
 
   // Tiles (rows 7-9). "Asked" = every uploaded ID Adobe was asked about: the
-  // analysed ones plus those it never answered for (no reply, 2026-10-08).
+  // analysed ones plus those it never answered for (no reply, 2026-10-08). The two
+  // orange tiles count different things (2026-10-14): how many of YOUR uploaded IDs
+  // are in that category (its own name), and how many different such profiles.
   const notFound = summary.byCategory.not_found || 0, noReply = summary.noReply || 0, asked = summary.sources + noReply;
   const tiles = [
     [2, 2, 'UPLOADED IDS', asked, notFound || noReply
-      ? `${notFound.toLocaleString('en-US')} not found · ${noReply.toLocaleString('en-US')} no reply` : 'analysed', COLOR.navy],
-    [3, 4, 'DISTINCT IDENTITIES', summary.identities, 'in their clusters', COLOR.blue],
-    [5, 24, '⚠ MERGED · NOT IN FILE', summary.byCategory.merged_outside_list || 0, 'uploaded IDs', COLOR.orange],
-    [26, 26, 'PROFILES NOT IN YOUR FILE', outsideProfiles, 'distinct — also deleted with linked identities', COLOR.orange],
+      ? `${notFound.toLocaleString('en-US')} not in identity graph · ${noReply.toLocaleString('en-US')} no reply` : 'analysed', COLOR.navy],
+    [3, 4, 'DISTINCT IDENTITIES', summary.identities, 'removed when deleting with linked identities', COLOR.blue],
+    [5, 24, '⚠ MERGED WITH A PROFILE NOT IN YOUR FILE', summary.byCategory.merged_outside_list || 0, 'of your uploaded IDs', COLOR.orange],
+    [26, 26, '⚠ PROFILES NOT IN YOUR FILE', outsideProfiles,
+      'different profiles merged with your IDs — also deleted with linked identities', COLOR.orange],
   ];
   for (const [c1, c2, label, value, sub, argb] of tiles) {
     for (let r = 7; r <= 9; r++) paint(r, c1, c2, { fill: solid(COLOR.grey50) });
     paint(7, c1, c2, { border: { top: { style: 'thick', color: { argb } } } });
     span(7, c1, c2, label, { font: font({ size: 9, bold: true, color: { argb: COLOR.grey600 } }), fill: solid(COLOR.grey50),
-      border: { top: { style: 'thick', color: { argb } } }, alignment: { indent: 1 } });
+      border: { top: { style: 'thick', color: { argb } } }, alignment: { indent: 1, wrapText: true, vertical: 'top' } });
     span(8, c1, c2, value, { numFmt: '#,##0', fill: solid(COLOR.grey50), alignment: { horizontal: 'left', indent: 1 },
       font: font({ size: 20, bold: true, color: { argb: argb === COLOR.orange && value > 0 ? COLOR.orange : COLOR.ink } }) });
-    span(9, c1, c2, sub, { font: font({ size: 9, color: { argb: COLOR.grey600 } }), fill: solid(COLOR.grey50), alignment: { indent: 1 } });
+    span(9, c1, c2, sub, { font: font({ size: 9, color: { argb: COLOR.grey600 } }), fill: solid(COLOR.grey50),
+      alignment: { indent: 1, wrapText: true, vertical: 'top' } });
   }
+  ws.getRow(7).height = 24;                       // two lines for the longer labels
   ws.getRow(8).height = 28;
+  ws.getRow(9).height = 26;                       // and explanations
   row = 9;
 
   section('CATEGORIES');
@@ -185,17 +195,49 @@ function writeSummary(wb, { meta, summary, outsideProfiles, topClusters }) {
     style(ws.getCell(row, 26), { value: NO_REPLY_MEANING, font: font({ color: { argb: COLOR.grey600 } }) });
   }
 
+  // Each identity counted once, the uploaded IDs included (2026-10-14). These were
+  // summed per uploaded ID: the uploaded IDs were left out and an identity shared by
+  // several of them counted once for each — fewer hashedKocids than emails on a file
+  // of hashedKocids. The source namespace splits into the file's IDs and the profiles
+  // NOT in it; the rows add up to Distinct identities.
   const srcKey = meta.sourceNamespace;
-  const nsRows = Object.entries(summary.byNamespace || {}).sort((a, b) => (b[1] - a[1]) || (a[0] < b[0] ? -1 : 1));
-  const nsTotal = nsRows.reduce((t, [, n]) => t + n, 0);
-  section('NAMESPACES');
-  head([[2, 'Namespace'], [3, 'Identities'], [4, '%'], [26, 'Identities linked to the uploaded IDs, per namespace']]);
-  for (const [ns, n] of nsRows) {
+  section('IDENTITIES BY NAMESPACE');
+  if (!distinct) {
+    // The count failed (e.g. no room for its temp files): everything else stands.
     row++;
-    style(ws.getCell(row, 2), { value: ns === srcKey ? `${ns} (other profiles)` : ns, font: font() });
+    span(row, 2, LAST_COL, `Identities per namespace couldn't be counted: ${countError}. Rebuild this report to try again — `
+      + "the count needs free space in the computer's temp folder (about 100 bytes per stored identity).",
+    { font: font({ color: { argb: COLOR.grey600 } }) });
+  }
+  const ownNote = noReply > 0
+    ? `the IDs AEP answered for — the ${noReply.toLocaleString('en-US')} with no reply are not in this count`
+    : 'the IDs in your file';
+  const nsRows = !distinct ? [] : [
+    [`${srcKey} · your uploaded IDs`, distinct.uploaded, COLOR.navy, ownNote],
+    ...(distinct.outsideProfiles > 0
+      ? [[`${srcKey} · profiles NOT in your file`, distinct.outsideProfiles, COLOR.orange, 'merged with your IDs — also deleted with linked identities']]
+      : []),
+    ...Object.entries(distinct.byNamespace || {}).sort((a, b) => (b[1] - a[1]) || (a[0] < b[0] ? -1 : 1))
+      .map(([ns, n]) => [ns, n, COLOR.blue, '']),
+  ];
+  const nsTotal = nsRows.reduce((t, r) => t + r[1], 0);
+  if (distinct) head([[2, 'Namespace'], [3, 'Identities'], [4, '%'], [26, 'Each identity counted once']]);
+  for (const [label, n, argb, note] of nsRows) {
+    row++;
+    style(ws.getCell(row, 2), { value: label, font: font(argb === COLOR.orange ? { bold: true, color: { argb } } : {}) });
     style(ws.getCell(row, 3), { value: n, numFmt: '#,##0', font: font() });
     style(ws.getCell(row, 4), { value: pct(n, nsTotal), numFmt: '0.0%', font: font() });
-    bar(row, pct(n, nsTotal), COLOR.blue);
+    bar(row, pct(n, nsTotal), argb);
+    if (note) style(ws.getCell(row, 26), { value: note, font: font({ color: { argb: COLOR.grey600 } }) });
+  }
+  if (distinct) {
+    row++;
+    style(ws.getCell(row, 2), { value: 'Total', font: font({ bold: true }) });
+    style(ws.getCell(row, 3), { value: nsTotal, numFmt: '#,##0', font: font({ bold: true }) });
+    style(ws.getCell(row, 4), { value: nsTotal > 0 ? 1 : 0, numFmt: '0.0%', font: font({ bold: true }) });
+    if (nsTotal === summary.identities) {
+      style(ws.getCell(row, 26), { value: 'the same as Distinct identities above', font: font({ color: { argb: COLOR.grey600 } }) });
+    }
   }
 
   section('TOP 25 LARGEST CLUSTERS');
@@ -232,6 +274,10 @@ function writeSummary(wb, { meta, summary, outsideProfiles, topClusters }) {
     style(ws.getCell(row, 2), { value: NO_REPLY_LABEL, font: font({ bold: true, color: { argb: COLOR.red } }) });
     span(row, 3, LAST_COL, NO_REPLY_MEANING, { font: font() });
   }
+  row++;
+  style(ws.getCell(row, 2), { value: '⚠ Profiles NOT in your file', font: font({ bold: true, color: { argb: COLOR.orange } }) });
+  span(row, 3, LAST_COL, 'How many different profiles you did not upload share a cluster with your IDs. One can be merged '
+    + 'with several of your IDs, so this differs from the "Merged with a profile NOT in your file" count of your IDs.', { font: font() });
   row++;
   span(row, 3, LAST_COL, "Deleting with linked identities removes every identity in each uploaded ID's cluster — including profiles NOT in your file.",
     { font: font({ bold: true, color: { argb: COLOR.orange } }) });
@@ -292,7 +338,7 @@ async function writeCategorySheets(wb, { category, meta, namespaces, readers, de
   return total;
 }
 
-/** A one-column list of uploaded IDs (Not found in AEP · No reply from AEP), continued on "(2)". */
+/** A one-column list of uploaded IDs (Not in identity graph · No reply from AEP), continued on "(2)". */
 async function writeListSheet(wb, { title, header, argb, chunks, maxRowsPerSheet, progress, emptyNote }) {
   let part = 0, inSheet = 0, total = 0, ws = null;
   const open = () => {
@@ -330,16 +376,24 @@ async function writeListSheet(wb, { title, header, argb, chunks, maxRowsPerSheet
 }
 
 export async function writeAnalysisWorkbook({ filename, meta, summary, sourceNs, readers,
-  maxRowsPerSheet = EXCEL_MAX_DATA_ROWS, onProgress = () => {} }) {
+  maxRowsPerSheet = EXCEL_MAX_DATA_ROWS, onProgress = () => {}, onPhase = () => {} }) {
   const describe = (sourceId) => describeSourceIdentities({ sourceId, sourceNs, rows: readers.identitiesOf(sourceId), isInList: readers.isInList });
-  // First pass: distinct profiles outside the upload (the analysis total is a sum per uploaded ID).
-  const outside = new Set();
-  for await (const chunk of readers.categoryChunks('merged_outside_list')) {
-    for (const r of chunk) for (const i of describe(r.source_id)) if (i.relation === 'other_profile' && !i.inList) outside.add(i.value);
+  // Distinct counts (2026-10-14): stored with the analysis, or counted here for one
+  // built before them (the worker sends them back to be kept). If the per-namespace
+  // count fails (e.g. no room for its temp files) the report still builds: the
+  // profiles NOT in the file come from the merged clusters, and the namespace
+  // section says why it is missing.
+  let distinct = summary.distinct || null, countError = null;
+  let outsideProfiles = distinct ? distinct.outsideProfiles : null;
+  if (!distinct) {
+    onPhase('counting');
+    outsideProfiles = await countOutsideProfiles({ readers, sourceNs });
+    try { distinct = finishDistinctCounts({ readers, sourceNs, outsideProfiles }); }
+    catch (err) { countError = String(err?.message || err); }
   }
   const wb = new ExcelJS.stream.xlsx.WorkbookWriter({ filename, useStyles: true, useSharedStrings: false });
   wb.creator = 'AEP Data Lifecycle Helper';
-  writeSummary(wb, { meta, summary, outsideProfiles: outside.size, topClusters: readers.topClusters(25) });
+  writeSummary(wb, { meta, summary, distinct, outsideProfiles, countError, topClusters: readers.topClusters(25) });
   const namespaces = dataNamespaces(summary, sourceNs);
   let rows = 0;
   const progress = (n) => { rows += n; onProgress(rows); };
@@ -348,11 +402,11 @@ export async function writeAnalysisWorkbook({ filename, meta, summary, sourceNs,
   }
   await writeListSheet(wb, { title: REPORT_SHEETS.not_found, header: meta.sourceNamespace, argb: CATEGORY_COLOR.not_found,
     chunks: readers.categoryChunks('not_found'), maxRowsPerSheet, progress,
-    emptyNote: legacyAnalysis(summary) ? LEGACY_NOT_FOUND : 'No uploaded ID came back from AEP with no identities.' });
+    emptyNote: legacyAnalysis(summary) ? LEGACY_NOT_FOUND : 'No uploaded ID came back from AEP without links in the identity graph.' });
   if ((summary.noReply || 0) > 0) {
     await writeListSheet(wb, { title: REPORT_SHEETS.no_reply, header: meta.sourceNamespace, argb: COLOR.red,
       chunks: readers.noReplyChunks(), maxRowsPerSheet, progress });
   }
   await wb.commit();
-  return { rows, outsideProfiles: outside.size };
+  return { rows, outsideProfiles, distinct };
 }

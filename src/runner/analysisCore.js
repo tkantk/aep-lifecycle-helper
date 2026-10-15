@@ -84,6 +84,27 @@ export function classifySource({ sourceId, sourceNs, rows, isInList }) {
 }
 
 /**
+ * Distinct identities per namespace for the summary (2026-10-14), from
+ * DISTINCT_BY_NAMESPACE_SQL groups. The source namespace splits into the uploaded
+ * IDs and the profiles NOT in the file (`outsideProfiles`: distinct values, from
+ * the merged clusters); every other namespace is keyed as in nsCounts. The parts
+ * add up to the groups' total: the job's distinct identities.
+ */
+export function splitDistinctNamespaces(groups, sourceNs, outsideProfiles) {
+  const { matches } = sourceNsMatcher(sourceNs);
+  let source = 0;
+  const byNamespace = {};
+  for (const g of groups) {
+    const n = Number(g.n) || 0;
+    if (matches(g)) { source += n; continue; }
+    const k = nsKeyOf(g);
+    byNamespace[k] = (byNamespace[k] || 0) + n;
+  }
+  const outside = Math.min(outsideProfiles, source);
+  return { uploaded: source - outside, outsideProfiles: outside, byNamespace };
+}
+
+/**
  * One uploaded ID's cluster, deduplicated, for the drill-down and the detail
  * CSV: the ID itself first, then other profiles, then linked identities (each
  * group by namespace, then value). Other profiles carry `inList`.

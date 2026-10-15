@@ -9,6 +9,78 @@ Format: `## YYYY-MM-DD` session headers; bullets grouped under **Backend**,
 
 ---
 
+## 2026-10-14 — Analysis: identities per namespace counted once; clear "NOT in your file" numbers
+
+On the 6.8M job's Excel Summary the user saw fewer hashedKocids than emails although every hashedKocid
+was found, and two near-identical headers ("⚠ Merged · NOT in file" and "Profiles NOT in your file").
+
+- **Cause 1:** `summary.byNamespace` (the Analysis tab's "Linked identities by namespace", the Excel
+  NAMESPACES section) summed, per uploaded ID, the OTHER identities in its cluster. The uploaded IDs
+  were left out — the hashedKocid row held only other profiles ("hashedKocid (other profiles)" in
+  Excel, unlabelled in the app) — and an identity shared by several uploaded IDs was counted once for
+  each. The rows didn't add up to Distinct identities.
+- **Cause 2:** the app's "Other profiles · NOT in your file" was a per-uploaded-ID sum; the Excel tile
+  of the same name was distinct. The Excel tiles also didn't say that one counts YOUR uploaded IDs
+  and the other counts the other profiles.
+- **Also:** "Not found in AEP" overstated. Identity Service doesn't store an ID with no links, so its
+  profile may still exist; the uploaded ID is still deleted on its own. It's now "Not in identity
+  graph".
+
+Changes:
+
+- **Backend:** `summary.distinct = { uploaded, outsideProfiles, byNamespace, mergedWithUploaded }`.
+  - Each identity is counted once (COUNT(DISTINCT) per namespace, the same rule as `found_count`), with
+    the uploaded IDs included, so the parts add up to Distinct identities.
+  - Counted at the end of the analysis build by `analysisCountsWorker.js`: own read-only connection,
+    `temp_store = FILE`. Measured 3.5 s at 5M rows and 33 s at 12M; it grows faster than linearly, so
+    several minutes at 6.8M (33M rows). Memory stays flat; it uses ~95 bytes of temp files per row in
+    the OS temp folder. It runs off the main thread, and the Analysis tab shows "Counting identities
+    per namespace…" meanwhile.
+  - New: `analysisReaders.js` (shared by both workers), `analysisCounts.js`,
+    `analysisCore.splitDistinctNamespaces`, `DISTINCT_BY_NAMESPACE_SQL` / `MERGED_WITH_UPLOADED_SQL`.
+  - The per-ID sums stay in the summary for column order only.
+- **Older analyses:** their next Excel report build counts `distinct` (the report worker now sorts on
+  disk) and `analysisReport.js` stores it (`setAnalysisSummary`, only while `finished_at` is
+  unchanged, so the report stays valid). No analysis rebuild and no calls to Adobe.
+- **Excel Summary:**
+  - Tiles "⚠ MERGED WITH A PROFILE NOT IN YOUR FILE" (the category's own name; "of your uploaded
+    IDs") and "⚠ PROFILES NOT IN YOUR FILE" (different profiles).
+  - "IDENTITIES BY NAMESPACE": "<ns> · your uploaded IDs", "<ns> · profiles NOT in your file", the
+    other namespaces, and a Total.
+  - The legend explains the difference between the two tiles.
+  - Category and sheet "Not in identity graph".
+- **Analysis tab:**
+  - Stats "Profiles NOT in your file" (distinct) and "Distinct identities".
+  - An "Identities by namespace, each counted once" table with a Total.
+  - The callout uses the distinct number.
+  - An older analysis shows a note instead of the old sums, and fills in when its Excel report
+    finishes.
+- **Final review fixes** (each tested RED first):
+  - A workbook built by older code is out of date: `report_built_for` now carries the workbook format
+    (`#v2`), so the 6.8M job's existing report is never served again and the card offers "Build
+    Excel report". Before this, a plain Download kept serving the old per-ID sums.
+  - If the per-namespace count fails (e.g. no room for temp files), the analysis stands with
+    `summary.distinctError` and the app says why. The report still builds: profiles NOT in the file
+    come from the merged clusters, and only the namespace section is replaced by the reason.
+  - A failure while storing the counts back never fails a finished report.
+  - "Counting identities…" is shown while the count runs (the Analysis tab, the job's step bar and
+    the Excel button), instead of a frozen 100% or 0%.
+  - "Your IDs merged" no longer names two different numbers: the Excel tile uses the category name,
+    and the app's extra "merged with each other" stat is gone.
+  - When some IDs got no reply, the "your uploaded IDs" row notes that they are not in that count.
+  - The Analysis tab repaints, callout included, when an Excel build adds the counts.
+- **Plan tab:** the warning shown right before the delete choice ("Deleting linked identities also
+  deletes those N profiles' identities") now uses the distinct number. It showed the per-ID sum,
+  e.g. 200 where there were 7 profiles. For an older analysis it leaves the number out.
+- **Tests:** `npm test` **467 → 481**. `analysisDistinct` (9, RED first): the split; the build's
+  counts adding up to `found_count`; the Excel tiles and namespace rows; an older analysis counted by its report build and
+  stored without invalidating the report; the workers. The workbook test (+1) checks that an outside
+  profile merged with two uploaded IDs is counted once. The `webJobView` test (+1) covers
+  `analysisCountsView`. Workbook and report tests were updated for the new names and fixtures.
+  Browser smoke `distinct_smoke.py`: 17/17, including the Plan-tab warning. More tests from the final
+  review: an out-of-date workbook, a failed count (analysis and workbook), a failed write-back, the
+  counting phase, and `excelReportView`'s counting label.
+
 ## 2026-10-09 — Export CSV is built in the background (the browser no longer hangs)
 
 The user reported that **Export CSV** on the Expansion tab hung the browser most of the time.

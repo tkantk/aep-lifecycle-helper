@@ -130,3 +130,34 @@ test('identityExportView: the Export CSV button for every export state (2026-10-
   assert.deepEqual(plain(V.identityExportView({ status: 'failed', error: 'disk full' })),
     { state: 'failed', label: 'Export CSV', pct: 0, detail: 'The last export failed: disk full', action: 'build' });
 });
+
+test('analysisCountsView: identities per namespace counted once, the uploaded IDs included (2026-10-14)', () => {
+  const summary = { identities: 11, byCategory: { merged_outside_list: 1 },
+    distinct: { uploaded: 6, outsideProfiles: 1, byNamespace: { ECID: 1, email: 2, phone: 1 }, mergedWithUploaded: 2 } };
+  assert.deepEqual(plain(V.analysisCountsView(summary, 'hashedKocid')), {
+    rows: [
+      { label: 'hashedKocid · your uploaded IDs', ns: 'hashedKocid', n: 6, share: 6 / 11, tone: 'uploaded' },
+      { label: 'hashedKocid · profiles NOT in your file', ns: 'hashedKocid', n: 1, share: 1 / 11, tone: 'outside' },
+      { label: 'email', ns: 'email', n: 2, share: 2 / 11, tone: 'ns' },
+      { label: 'ECID', ns: 'ECID', n: 1, share: 1 / 11, tone: 'ns' },
+      { label: 'phone', ns: 'phone', n: 1, share: 1 / 11, tone: 'ns' },
+    ],
+    total: 11, outsideProfiles: 1, mergedWithUploaded: 2,
+  });
+  const none = V.analysisCountsView({ identities: 3, distinct: { uploaded: 2, outsideProfiles: 0, byNamespace: { email: 1 }, mergedWithUploaded: 0 } }, 'hashedKocid');
+  assert.deepEqual(plain(none.rows.map(r => r.tone)), ['uploaded', 'ns'], 'no "NOT in your file" row when there are none');
+  assert.equal(V.analysisCountsView({ identities: 5, byNamespace: { email: 9 } }, 'hashedKocid'), null,
+    'an analysis built before the distinct counts shows none (its numbers were per-ID sums)');
+});
+
+test('excelReportView: while a report counts identities per namespace it says so (review #4)', () => {
+  assert.deepEqual(plain(V.excelReportView({ status: 'building', phase: 'counting', rowsDone: 0, rowsTotal: 894724 })),
+    { state: 'building', label: 'Counting identities…', pct: 0, size: '', error: '', action: null });
+});
+
+test('steps: the Analyse step says when the build is counting identities, not a frozen 100% (2026-10-14)', () => {
+  const job = { status: 'expanded', expansion_mode: 'cluster', total_source_ids: 10, found_count: 30 };
+  const s = V.steps(job, { analysis: { status: 'building', phase: 'counting', sourcesDone: 10, sourcesTotal: 10 } });
+  const a = s.find(x => x.key === 'analysis');
+  assert.deepEqual([a.hint, a.running], ['Counting identities per namespace…', true]);
+});

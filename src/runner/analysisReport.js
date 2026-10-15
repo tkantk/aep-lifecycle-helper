@@ -13,7 +13,14 @@ import { resolveSourceNamespace } from './analysisCore.js';
  * from. One build runs at a time across the app (measured at 6.8M uploaded IDs /
  * 894,724 merged rows: 7.2 min, +151 MB process memory, a 240 MB file).
  */
-let running = null;      // { jobId, worker, rowsDone, rowsTotal, settled, discarded }
+let running = null;      // { jobId, worker, rowsDone, rowsTotal, settled, discarded, distinct, phase }
+
+// The workbook's format, stored with the analysis's finished_at in report_built_for:
+// bump it when the workbook's content changes, so a report built by older code is
+// out of date and built again (2026-10-14: v2 counts identities per namespace once
+// each — v1 workbooks show per-uploaded-ID sums and "Not found in AEP").
+const REPORT_FORMAT = 'v2';
+const builtFor = (a) => `${a.finished_at}#${REPORT_FORMAT}`;
 
 function httpError(Cls, status, code, message) {
   const e = new Cls(message); e.status = status; e.code = code; e.publicMessage = message; return e;
@@ -49,13 +56,13 @@ export function reportDownloadName(job) {
 export function reportState(jobId) {
   const a = q().getJobAnalysis.get(jobId);
   if (!a || !a.report_status) return { status: null };
-  if (a.report_status === 'ready' && (a.report_built_for !== a.finished_at || !fs.existsSync(reportPath(jobId)))) {
+  if (a.report_status === 'ready' && (a.report_built_for !== builtFor(a) || !fs.existsSync(reportPath(jobId)))) {
     q().clearReport.run(jobId);
     return { status: null };
   }
   const live = running && running.jobId === jobId ? running : null;
-  return { status: a.report_status, rowsDone: live ? live.rowsDone : a.report_rows_done, rowsTotal: a.report_rows_total,
-    bytes: a.report_bytes, finishedAt: a.report_finished_at, error: a.report_error };
+  return { status: a.report_status, phase: live ? live.phase : null, rowsDone: live ? live.rowsDone : a.report_rows_done,
+    rowsTotal: a.report_rows_total, bytes: a.report_bytes, finishedAt: a.report_finished_at, error: a.report_error };
 }
 
 export function startAnalysisReport(jobId, { rebuild = false, maxRowsPerSheet } = {}) {
@@ -76,7 +83,7 @@ export function startAnalysisReport(jobId, { rebuild = false, maxRowsPerSheet } 
   const rowsTotal = (summary.byCategory.merged_outside_list || 0) + (summary.byCategory.merged_in_list || 0)
     + (summary.byCategory.not_found || 0) + (summary.noReply || 0);
   removeFiles(jobId);
-  q().startReport.run({ jobId, rowsTotal, builtFor: a.finished_at });
+  q().startReport.run({ jobId, rowsTotal, builtFor: builtFor(a) });
   const sourceNs = resolveSourceNamespace(job, job.source_namespace_id == null ? q().sourceRowNamespace.get(job.id) : undefined);
   const meta = { jobId: job.id, jobName: job.name || job.id, createdAt: utc(job.created_at), sandbox: job.sandbox_name,
     sourceNamespace: job.source_namespace, expansionMode: job.expansion_mode, deleteScope: effectiveScope(job),
@@ -85,7 +92,7 @@ export function startAnalysisReport(jobId, { rebuild = false, maxRowsPerSheet } 
   const worker = new Worker(new URL('./analysisReportWorker.js', import.meta.url), {
     workerData: { dbPath: config.dbPath, jobId, tmpPath: tmpPath(jobId), meta, summary, sourceNs, maxRowsPerSheet },
   });
-  const run = { jobId, worker, rowsDone: 0, rowsTotal, settled: false, discarded: false };
+  const run = { jobId, worker, rowsDone: 0, rowsTotal, settled: false, discarded: false, distinct: null, phase: null };
   running = run;
   const finish = (err) => {
     if (run.settled) return;
@@ -105,11 +112,25 @@ export function startAnalysisReport(jobId, { rebuild = false, maxRowsPerSheet } 
     } catch (e) {
       removeFiles(jobId);
       q().failReport.run(String(e.message).slice(0, 500), jobId);
+      return;
+    }
+    // An analysis built before the distinct counts, or whose count failed (2026-10-14):
+    // the worker counted them for the report — keep them, so the Analysis tab shows
+    // them too. Optional: a failure here never costs the finished report.
+    if (run.distinct && !summary.distinct) {
+      try {
+        const { distinctError: _, ...rest } = summary;
+        q().setAnalysisSummary.run(JSON.stringify({ ...rest, distinct: run.distinct }), jobId, a.finished_at);
+        logger.info({ jobId }, 'analysis: identities per namespace added from the report build');
+      } catch (e) {
+        logger.warn({ jobId, err: e.message }, 'analysis: could not keep the counts from the report build');
+      }
     }
   };
   worker.on('message', (m) => {
-    if (m?.type === 'progress') run.rowsDone = m.rowsDone;
-    else if (m?.type === 'done') { run.rowsDone = m.rows; finish(null); }
+    if (m?.type === 'phase') run.phase = m.phase;
+    else if (m?.type === 'progress') { run.rowsDone = m.rowsDone; run.phase = null; }
+    else if (m?.type === 'done') { run.rowsDone = m.rows; run.distinct = m.distinct || null; finish(null); }
     else if (m?.type === 'error') finish(new Error(m.error));
   });
   worker.once('error', finish);

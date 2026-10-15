@@ -1561,7 +1561,9 @@ async function renderExpand() {
 // this tab changes the job, its plan or its work orders. Built automatically
 // after a cluster expansion; never for an expansion-off job.
 const ANALYSIS_CATS = [
-  { key: 'not_found',           label: 'Not found in AEP',                         hint: 'AEP has no identities for it — deleted on its own' },
+  // Was "Not found in AEP" until 2026-10-14: AEP's identity graph doesn't keep an ID
+  // that isn't linked to anything, so the profile may still exist.
+  { key: 'not_found',           label: 'Not in identity graph',                    hint: "No links in AEP's identity graph — its profile may still exist; still deleted on its own" },
   { key: 'source_only',         label: 'Only itself',                              hint: 'In AEP, nothing else linked' },
   { key: 'linked',              label: 'Linked identities',                        hint: 'Its own email, ECID, phone… no other profile' },
   { key: 'merged_in_list',      label: 'Merged with a profile in your file',       hint: 'That profile is being deleted too' },
@@ -1651,9 +1653,14 @@ function renderAnalysisBuilding(a) {
   const paint = (x) => {
     const total = x.sourcesTotal || 0;
     const pct = total ? Math.min(100, Math.floor((x.sourcesDone || 0) / total * 100)) : 0;
+    // The last step counts identities per namespace — minutes on a big job (2026-10-14).
+    const head = x.phase === 'counting'
+      ? `<b>Counting identities per namespace…</b>
+        <span class="count">every uploaded ID is grouped; this last step can take a few minutes on a big job</span>`
+      : `<b>Building the analysis…</b>
+        <span class="count">${fmtNum(x.sourcesDone)} / ${fmtNum(total)} uploaded IDs (${pct}%)</span>`;
     $('#analysis-body').innerHTML = `
-      <div class="progress-head"><b>Building the analysis…</b>
-        <span class="count">${fmtNum(x.sourcesDone)} / ${fmtNum(total)} uploaded IDs (${pct}%)</span></div>
+      <div class="progress-head">${head}</div>
       <div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>
       <div class="f-hint" style="margin-top:10px">Runs in the background — you can leave this tab; planning and submitting are not blocked.</div>`;
     renderActiveJobHeader('analysis-body', { analysis: x });
@@ -1685,6 +1692,46 @@ function nsCountsHtml(counts) {
   return shown + (entries.length > 3 ? ` <span class="muted">+${entries.length - 3} more</span>` : '');
 }
 
+/**
+ * Identities per namespace, each counted once with the uploaded IDs included
+ * (2026-10-14), plus the merged-profile counts; or, for an analysis built before
+ * these counts, a note saying how to get them (its numbers were per-ID sums).
+ */
+function analysisCountsHtml(s, srcNs) {
+  const counts = window.AepJobView.analysisCountsView(s, srcNs);
+  if (!counts) {
+    // Counting failed for this build (e.g. no room for its temp files), or the
+    // analysis was built before these counts. Either way the Excel build counts again.
+    return s.distinctError
+      ? `<div class="alert warning" id="analysis-counts-legacy"><div>Identities per namespace couldn't be counted:
+          ${escape(s.distinctError)}. Build the <b>Excel report</b> under Downloads to count them again (it needs free space in
+          the computer's temp folder, about 100 bytes per stored identity), or click <b>↻ Rebuild</b> above.</div></div>`
+      : `<div class="alert info" id="analysis-counts-legacy"><div>Identities per namespace need newer counts: this analysis was
+          built before each identity was counted once. Build the <b>Excel report</b> under Downloads (no calls to Adobe) or click
+          <b>↻ Rebuild</b> above, and they appear here.</div></div>`;
+  }
+  const pct = (share) => `${(share * 100).toFixed(1)}%`;
+  return `<div id="analysis-counts">
+    <div class="stat-grid two">
+      <div class="stat${counts.outsideProfiles ? ' warn' : ''}"><div class="stat-label">Profiles NOT in your file</div><div class="stat-value">${fmtNum(counts.outsideProfiles)}</div><div class="stat-sub">different profiles merged with your IDs — also deleted with linked identities</div></div>
+      <div class="stat"><div class="stat-label">Distinct identities</div><div class="stat-value">${fmtNum(s.identities)}</div><div class="stat-sub">every identity in the clusters, counted once</div></div>
+    </div>
+    <details class="ns-dist" open>
+      <summary>Identities by namespace, each counted once</summary>
+      <div class="table-wrap"><table id="analysis-ns">
+        <thead><tr><th>Namespace</th><th class="num">Identities</th><th class="num">Share</th><th>Distribution</th></tr></thead>
+        <tbody>${counts.rows.map(r => `<tr class="ns-row ${r.tone}">
+          <td><span class="ns-badge ${nsClass(r.ns)}">${escape(r.ns)}</span>${r.tone === 'uploaded' ? ' <span class="ns-note">your uploaded IDs</span>'
+            : r.tone === 'outside' ? ' <span class="ns-note warn-text">profiles NOT in your file</span>' : ''}</td>
+          <td class="num">${fmtNum(r.n)}</td><td class="num">${pct(r.share)}</td>
+          <td><div class="progress-bar" style="width:120px"><div class="progress-fill" style="width:${pct(r.share)}; background:${r.tone === 'outside' ? 'var(--orange500)' : nsColor(r.ns)}"></div></div></td>
+        </tr>`).join('')}
+        <tr class="ns-total"><td>Total</td><td class="num">${fmtNum(counts.total)}</td><td class="num">${counts.total ? '100%' : '—'}</td><td></td></tr></tbody>
+      </table></div>
+    </details>
+  </div>`;
+}
+
 function renderAnalysisReady(a) {
   const s = a.summary;
   const view = analysisView();
@@ -1695,10 +1742,9 @@ function renderAnalysisReady(a) {
   const uploaded = total + noReply;
   const share = (n) => (uploaded ? `${(n / uploaded * 100).toFixed(n > 0 && n / uploaded < 0.001 ? 2 : 1)}%` : '0%');
   const outside = s.byCategory.merged_outside_list || 0;
-  const nsRows = Object.entries(s.byNamespace || {}).sort((x, y) => y[1] - x[1]);
-  const nsTotal = nsRows.reduce((t, [, n]) => t + n, 0);
   const srcNs = state.job.source_namespace || 'uploaded ID';
-  // Built before "Not found in AEP" existed (no not_found key): those IDs are still
+  const counts = window.AepJobView.analysisCountsView(s, srcNs);
+  // Built before this category existed (no not_found key): those IDs are still
   // counted under "Only itself" — show "—" and ask for a rebuild, never 0 (final review #4).
   const legacyNotFound = !Object.prototype.hasOwnProperty.call(s.byCategory || {}, 'not_found');
   const unknownCat = (key) => legacyNotFound && key === 'not_found';
@@ -1740,7 +1786,7 @@ function renderAnalysisReady(a) {
     ${outside > 0 ? `
     <div class="alert warning" id="analysis-callout">
       <div style="flex:1"><div class="alert-title">${fmtNum(outside)} uploaded ID${outside === 1 ? '' : 's'} share a cluster with a profile that is NOT in your file</div>
-        ${fmtNum(s.otherProfiles.notInList)} such profile${s.otherProfiles.notInList === 1 ? '' : 's'} in total. Planning with
+        ${counts ? `${fmtNum(counts.outsideProfiles)} different profile${counts.outsideProfiles === 1 ? ' NOT in your file is' : 's NOT in your file are'} in those clusters. ` : ''}Planning with
         <b>linked identities</b> (the default) also deletes those profiles' identities. Review them, or plan
         <b>uploaded IDs only</b> to delete just the IDs in your file.</div>
       <button class="btn btn-secondary" id="btn-show-outside" style="align-self:center; white-space:nowrap">Show these IDs</button>
@@ -1757,29 +1803,13 @@ function renderAnalysisReady(a) {
       }).join('')}
     </div>
     ${legacyNotFound ? `
-    <div class="alert info" id="analysis-legacy"><div>This analysis was built before “Not found in AEP” existed, so uploaded IDs
-      AEP doesn't know are still counted under “Only itself”. Click <b>↻ Rebuild</b> above to see them.</div></div>` : ''}
+    <div class="alert info" id="analysis-legacy"><div>This analysis was built before “Not in identity graph” existed, so uploaded IDs
+      with no links in AEP's identity graph are still counted under “Only itself”. Click <b>↻ Rebuild</b> above to see them.</div></div>` : ''}
     ${(s.noReply || 0) > 0 ? `
     <div class="alert info" id="analysis-no-reply"><div><b>No reply from AEP: ${fmtNum(s.noReply)} uploaded ID${s.noReply === 1 ? '' : 's'}.</b>
       AEP left ${s.noReply === 1 ? 'it' : 'them'} out of its answer, even when asked again, so ${s.noReply === 1 ? 'it is' : 'they are'} not
       in the plan and nothing will be deleted for ${s.noReply === 1 ? 'it' : 'them'}. Download the list under Downloads.</div></div>` : ''}
-    <div class="stat-grid">
-      <div class="stat"><div class="stat-label">Other profiles · in your file</div><div class="stat-value">${fmtNum(s.otherProfiles.inList)}</div><div class="stat-sub">merged with another uploaded ID</div></div>
-      <div class="stat${s.otherProfiles.notInList ? ' warn' : ''}"><div class="stat-label">Other profiles · NOT in your file</div><div class="stat-value">${fmtNum(s.otherProfiles.notInList)}</div><div class="stat-sub">also deleted with linked identities</div></div>
-      <div class="stat"><div class="stat-label">Linked identities</div><div class="stat-value">${fmtNum(nsTotal)}</div><div class="stat-sub">summed over the uploaded IDs</div></div>
-    </div>
-    ${nsRows.length ? `
-    <details class="ns-dist">
-      <summary>Linked identities by namespace (${nsRows.length})</summary>
-      <div class="table-wrap"><table>
-        <thead><tr><th>Namespace</th><th class="num">Count</th><th class="num">Share</th><th>Distribution</th></tr></thead>
-        <tbody>${nsRows.map(([ns, n]) => `<tr>
-          <td><span class="ns-badge ${nsClass(ns)}">${escape(ns)}</span></td>
-          <td class="num">${fmtNum(n)}</td><td class="num">${(n / nsTotal * 100).toFixed(1)}%</td>
-          <td><div class="progress-bar" style="width:120px"><div class="progress-fill" style="width:${(n / nsTotal * 100).toFixed(1)}%; background:${nsColor(ns)}"></div></div></td>
-        </tr>`).join('')}</tbody>
-      </table></div>
-    </details>` : ''}
+    ${analysisCountsHtml(s, srcNs)}
     <div class="section"><div class="section-head">Uploaded IDs</div><div class="section-sub">Click a row to see every identity in its cluster.</div></div>
     <div class="analysis-controls">
       <div class="filter-chips" role="tablist">
@@ -2059,6 +2089,9 @@ function pollExcelReport() {
       if (!onAnalysisTab(jobId)) { stopExcelPoll(); return; }
       if (a.report?.status !== 'building') stopExcelPoll();
       paintExcelReport(a.report);
+      // The report build counted identities for an analysis without them: repaint
+      // the summary so the counts and the callout's number appear (2026-10-14).
+      if ($('#analysis-counts-legacy') && a.summary?.distinct && a.status === 'ready') renderAnalysisReady(a);
     } catch { /* transient — keep polling */ }
     finally { busy = false; }
   }, 2000);
@@ -2167,10 +2200,14 @@ async function renderScopeChooser(target, { replan = false } = {}) {
     const el = $('#plan-callout');
     if (!el) return;
     if (scope === 'cluster' && outside > 0) {
-      const profiles = summary.otherProfiles.notInList;
+      // Distinct profiles (2026-10-14): summary.otherProfiles is a per-uploaded-ID sum,
+      // which counts a profile again for every uploaded ID it is merged with.
+      const counts = window.AepJobView.analysisCountsView(summary, state.job.source_namespace || 'uploaded ID');
+      const profiles = counts ? counts.outsideProfiles : null;
       el.innerHTML = `<div class="alert warning"><div style="flex:1">
           <div class="alert-title">${fmtNum(outside)} uploaded ID${outside === 1 ? '' : 's'} share a cluster with a profile NOT in your file</div>
-          Deleting linked identities also deletes those ${fmtNum(profiles)} profile${profiles === 1 ? "'s" : "s'"} identities.
+          Deleting linked identities also deletes ${profiles == null ? "those profiles'"
+            : `those ${fmtNum(profiles)} profile${profiles === 1 ? "'s" : "s'"}`} identities.
           Review them on the Analysis tab, or choose <b>Uploaded IDs only</b>.</div>
         <button class="btn btn-secondary" data-goto="analysis" type="button" style="align-self:center; white-space:nowrap">Review →</button></div>`;
     } else if (scope === 'cluster' && !summary) {

@@ -1,9 +1,13 @@
 import { performance } from 'node:perf_hooks';
+import { Worker } from 'node:worker_threads';
+import { config } from '../config.js';
 import { q, db } from '../db.js';
 import { logger } from '../utils/logger.js';
 import { PLANNABLE_JOB_STATUSES } from './submission.js';
 import { ANALYSIS_CATEGORIES, classifySource, describeSourceIdentities, resolveSourceNamespace } from './analysisCore.js';
 import { discardAnalysisReport } from './analysisReport.js';
+import { makeAnalysisReaders } from './analysisReaders.js';
+import { computeDistinctCounts } from './analysisCounts.js';
 
 // The pure logic lives in analysisCore.js (shared with the Excel-report worker).
 export { ANALYSIS_CATEGORIES, classifySource, describeSourceIdentities };
@@ -43,6 +47,12 @@ const DELETE_CHUNK = 50_000;     // old rows cleared per statement on a rebuild
 // Builds run in this process only; a 'building' row left by a dead process is
 // marked failed at startup (recovery.js).
 const building = new Set();
+// Builds in their last step, counting identities per namespace (2026-10-14):
+// minutes on a 6.8M-ID job, so the Analysis tab says so instead of a frozen 100%.
+const counting = new Set();
+
+/** 'counting' while the job's build counts identities per namespace, else null. */
+export function analysisPhase(jobId) { return counting.has(jobId) ? 'counting' : null; }
 
 export class AnalysisUnavailableError extends Error {
   constructor(message) {
@@ -168,6 +178,19 @@ export async function buildAnalysis(jobId, { pageSize = PAGE_SIZE } = {}) {
     // counted once) — what deleting with linked identities removes.
     summary.identities = q().getJob.get(jobId)?.found_count ?? 0;
     summary.noReply = q().getJob.get(jobId)?.no_reply_count ?? 0;   // never analysed: no identities (2026-10-08)
+    // Each identity once, the uploaded IDs included (2026-10-14): what the Analysis
+    // tab and the Excel report show per namespace. Counted off the main thread; if
+    // it fails (e.g. no room for its temp files) the analysis still stands, says
+    // why, and the next Excel report build tries again.
+    counting.add(jobId);
+    try {
+      summary.distinct = await _seams.countDistinct(jobId, sourceNs);
+    } catch (err) {
+      summary.distinctError = String(err?.message || err).slice(0, 300);
+      logger.warn({ jobId, err: summary.distinctError }, 'analysis: counting identities per namespace failed — the next Excel report build tries again');
+    } finally {
+      counting.delete(jobId);
+    }
     summary.builtAt = new Date().toISOString();
     q().finishJobAnalysis.run(JSON.stringify(summary), summary.sources, jobId);
     logger.info({ jobId, sources: summary.sources, byCategory: summary.byCategory, ms: Date.now() - t0 },
@@ -182,6 +205,30 @@ export async function buildAnalysis(jobId, { pageSize = PAGE_SIZE } = {}) {
     building.delete(jobId);
   }
 }
+
+/** The analysis's distinct counts, on a worker thread (in-process for an in-memory database). */
+function countDistinct(jobId, sourceNs) {
+  if (config.dbPath === ':memory:') return computeDistinctCounts({ readers: makeAnalysisReaders(db, jobId), sourceNs });
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(new URL('./analysisCountsWorker.js', import.meta.url),
+      { workerData: { dbPath: config.dbPath, jobId, sourceNs } });
+    let settled = false;
+    const settle = (err, distinct) => {
+      if (settled) return;
+      settled = true;
+      if (err) reject(err); else resolve(distinct);
+    };
+    worker.on('message', (m) => {
+      if (m?.type === 'done') settle(null, m.distinct);
+      else if (m?.type === 'error') settle(new Error(m.error));
+    });
+    worker.once('error', settle);
+    worker.once('exit', (code) => settle(new Error(`distinct-count worker exited with code ${code} before answering`)));
+  });
+}
+
+/** Test seam: the distinct-count step, replaceable to simulate a failure or a slow count. */
+export const _seams = { countDistinct };
 
 /** Fire-and-forget build after a successful cluster expansion; never throws into the caller. */
 export function queueAnalysisBuild(jobId) {

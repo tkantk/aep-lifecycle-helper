@@ -971,6 +971,12 @@ function prepared() {
         summary_json = NULL, error = NULL, started_at = excluded.started_at, finished_at = NULL
     `),
     setJobAnalysisProgress: db.prepare('UPDATE job_analysis SET sources_done = ? WHERE job_id = ?'),
+    // The ready analysis's summary, rewritten in place only for the analysis it was
+    // read from (finished_at unchanged, so its Excel report stays valid) — an
+    // analysis built before the distinct counts gets them from its report build
+    // (2026-10-14). (summaryJson, jobId, finishedAt)
+    setAnalysisSummary: db.prepare(`UPDATE job_analysis SET summary_json = ?
+      WHERE job_id = ? AND finished_at = ? AND status = 'ready'`),
     finishJobAnalysis: db.prepare(`
       UPDATE job_analysis
          SET status = 'ready', summary_json = ?, sources_done = ?, error = NULL, finished_at = datetime('now')

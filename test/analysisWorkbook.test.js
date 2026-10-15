@@ -28,16 +28,24 @@ const analysisRows = {
   merged_outside_list: [sa('G', 'merged_outside_list', 1502, 1), sa('E', 'merged_outside_list', 6, 1), sa('F', 'merged_outside_list', 4, 1)],
   merged_in_list: [sa('C', 'merged_in_list', 3, 0), sa('D', 'merged_in_list', 3, 0)],
 };
-const summary = { sources: 7, identities: 1521, byCategory: { not_found: 0, source_only: 1, linked: 1, merged_in_list: 2, merged_outside_list: 3 },
-  byNamespace: { email: 1504, hashedKocid: 5, phone: 1, Email: 1, 'nsid:777': 1 }, otherProfiles: { inList: 2, notInList: 3 } };
+// byNamespace/otherProfiles: the per-uploaded-ID sums (data-sheet column order);
+// distinct: each identity once, uploaded IDs included (2026-10-14) — 7 + 2 + 1507 = 1516.
+const DISTINCT = { uploaded: 7, outsideProfiles: 2, byNamespace: { email: 1503, Email: 1, 'nsid:777': 1, phone: 1, crm: 1 },
+  mergedWithUploaded: 2 };
+const summary = { sources: 7, identities: 1516, byCategory: { not_found: 0, source_only: 1, linked: 1, merged_in_list: 2, merged_outside_list: 3 },
+  byNamespace: { email: 1504, hashedKocid: 5, phone: 1, Email: 1, 'nsid:777': 1 }, otherProfiles: { inList: 2, notInList: 3 },
+  distinct: DISTINCT };
 const meta = { jobId: 'job-1', jobName: 'kocid-oct', createdAt: '2026-10-07 09:00:00', sandbox: 'prod', sourceNamespace: 'hashedKocid',
-  expansionMode: 'cluster', deleteScope: 'cluster', totalSourceIds: 7, foundCount: 1521,
+  expansionMode: 'cluster', deleteScope: 'cluster', totalSourceIds: 7, foundCount: 1516,
   analysisBuiltAt: '2026-10-07 10:42 UTC', generatedAt: '2026-10-07 11:05 UTC' };
 const readersFor = (rows) => ({
   async *categoryChunks(cat) { const list = rows[cat] || []; for (let i = 0; i < list.length; i += 2) yield list.slice(i, i + 2); },
   identitiesOf: (s) => identities[s] || [],
   isInList: (v) => inList.has(v),
   topClusters: (n) => Object.values(rows).flat().sort((a, b) => b.identities_total - a.identities_total).slice(0, n),
+  distinctByNamespace: () => [{ ns_code: 'hashedKocid', ns_id: 5000, n: 9 }, { ns_code: 'email', ns_id: 6, n: 1503 },
+    { ns_code: 'Email', ns_id: 66, n: 1 }, { ns_code: null, ns_id: 777, n: 1 }, { ns_code: 'phone', ns_id: 7, n: 1 }, { ns_code: 'crm', ns_id: 9, n: 1 }],
+  mergedWithUploaded: () => 2,
 });
 async function build(opts = {}) {
   const filename = path.join(dir, `r-${Math.random().toString(36).slice(2)}.xlsx`);
@@ -66,7 +74,7 @@ test('dataNamespaces: every namespace but the source one, most common first', ()
   assert.deepEqual(dataNamespaces(summary, KOC), ['email', 'Email', 'nsid:777', 'phone']);
 });
 
-test('sheets, Summary dashboard values and the distinct outside-profile tile', async () => {
+test('sheets, Summary dashboard values: clear tiles and identities per namespace counted once', async () => {
   const { wb, res, progress } = await build();
   assert.deepEqual(wb.worksheets.map(w => w.name), ['Summary', REPORT_SHEETS.merged_outside_list, REPORT_SHEETS.merged_in_list, REPORT_SHEETS.not_found]);
   const s = wb.getWorksheet('Summary');
@@ -75,11 +83,14 @@ test('sheets, Summary dashboard values and the distinct outside-profile tile', a
   assert.equal(s.pageSetup.orientation, 'landscape');
   const tile = (label) => { const c = findCell(s, label); return s.getCell(c.row + 1, c.col).value; };
   assert.equal(tile('UPLOADED IDS'), 7);
-  assert.equal(tile('PROFILES NOT IN YOUR FILE'), 2, 'X is shared by E and F: counted once (the analysis sum says 3)');
+  assert.equal(tile('⚠ MERGED WITH A PROFILE NOT IN YOUR FILE'), 3, 'how many of YOUR uploaded IDs');
+  assert.equal(tile('⚠ PROFILES NOT IN YOUR FILE'), 2, 'how many different profiles NOT in the file');
   const linked = findCell(s, 'Linked identities');
   assert.equal(s.getCell(linked.row, 3).value, 1);
   assert.ok(Math.abs(s.getCell(linked.row, 4).value - 1 / 7) < 1e-9);
-  assert.equal(s.getCell(findCell(s, 'email').row, 3).value, 1504);
+  const ns = (label) => s.getCell(findCell(s, label).row, 3).value;
+  assert.deepEqual([ns('hashedKocid · your uploaded IDs'), ns('hashedKocid · profiles NOT in your file'), ns('email'), ns('Total')],
+    [7, 2, 1503, 1516], 'each identity once, the uploaded IDs included — the rows add up to the distinct identities');
   const top = findCell(s, 'TOP 25 LARGEST CLUSTERS');
   assert.equal(s.getCell(top.row + 2, 2).value, 'G');
   assert.equal(s.getCell(findCell(s, 'Sandbox').row, 3).value, 'prod');
@@ -165,32 +176,36 @@ test('names say whose profile; "Not found" and "No reply" get a row, a legend li
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.readFile(filename);
   assert.deepEqual(wb.worksheets.map(w => w.name),
-    ['Summary', '⚠ Merged · NOT in file', 'Merged · in file', 'Not found in AEP', 'No reply from AEP']);
+    ['Summary', '⚠ Merged · NOT in file', 'Merged · in file', 'Not in identity graph', 'No reply from AEP']);
   const s = wb.getWorksheet('Summary');
-  for (const label of ['Not found in AEP', 'Only itself', 'Linked identities', 'Merged with a profile in your file',
+  for (const label of ['Not in identity graph', 'Only itself', 'Linked identities', 'Merged with a profile in your file',
     '⚠ Merged with a profile NOT in your file', 'No reply from AEP']) assert.ok(findCell(s, label), label);
   const nr = findCell(s, 'No reply from AEP');
   assert.equal(s.getCell(nr.row, 3).value, 3);
   assert.ok(Math.abs(s.getCell(nr.row, 4).value - 3 / 12) < 1e-9, '% of every uploaded ID asked (9 analysed + 3 no reply)');
   const up = findCell(s, 'UPLOADED IDS');
-  assert.deepEqual([s.getCell(up.row + 1, up.col).value, s.getCell(up.row + 2, up.col).value], [12, '2 not found · 3 no reply']);
+  assert.deepEqual([s.getCell(up.row + 1, up.col).value, s.getCell(up.row + 2, up.col).value], [12, '2 not in identity graph · 3 no reply']);
+  const own = findCell(s, 'hashedKocid · your uploaded IDs');
+  assert.match(String(s.getCell(own.row, 26).value), /3 with no reply are not in this count/,
+    'the row says why it is smaller than UPLOADED IDS (review #7)');
   let text = '';
   s.eachRow(row => row.eachCell(c => { text += ` ${c.value}`; }));
   assert.doesNotMatch(text, /in your list|NOT in list/, 'no "list" wording left');
-  assert.deepEqual(wb.getWorksheet('Not found in AEP').getSheetValues().slice(1).map(v => v[1]), ['hashedKocid', 'N1', 'N2']);
+  assert.deepEqual(wb.getWorksheet('Not in identity graph').getSheetValues().slice(1).map(v => v[1]), ['hashedKocid', 'N1', 'N2']);
   assert.deepEqual(wb.getWorksheet('No reply from AEP').getSheetValues().slice(1).map(v => v[1]), ['hashedKocid', 'Q1', 'Q2', 'Q3']);
   assert.equal(res.rows, 5 + 2 + 3, 'progress counts the list rows');
 });
 
 test('with none not found, the list sheet carries a note and no "No reply" row or sheet appears', async () => {
   const { wb } = await build();
-  assert.equal(wb.getWorksheet('Not found in AEP').getRow(2).getCell(1).value, 'No uploaded ID came back from AEP with no identities.',
+  assert.equal(wb.getWorksheet('Not in identity graph').getRow(2).getCell(1).value,
+    'No uploaded ID came back from AEP without links in the identity graph.',
     'never claims every ID was found — IDs with no reply were not confirmed (final review #4)');
   assert.equal(wb.getWorksheet('No reply from AEP'), undefined);
   assert.equal(findCell(wb.getWorksheet('Summary'), 'No reply from AEP'), null);
 });
 
-test('an analysis built before "Not found in AEP" existed says to rebuild instead of showing 0', async () => {
+test('an analysis built before "Not in identity graph" existed says to rebuild instead of showing 0', async () => {
   // Final review #4: its summary has no not_found key — those IDs are still counted
   // under "Only itself", so a 0 here would look like an answer.
   const legacy = { ...summary, byCategory: { source_only: 1, linked: 1, merged_in_list: 2, merged_outside_list: 3 } };
@@ -198,9 +213,41 @@ test('an analysis built before "Not found in AEP" existed says to rebuild instea
   await writeAnalysisWorkbook({ filename, meta, summary: legacy, sourceNs: KOC, readers: readersFor(analysisRows) });
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.readFile(filename);
-  assert.match(String(wb.getWorksheet('Not found in AEP').getRow(2).getCell(1).value), /built before .*rebuild/i);
+  assert.match(String(wb.getWorksheet('Not in identity graph').getRow(2).getCell(1).value), /built before .*rebuild/i);
   const s = wb.getWorksheet('Summary');
-  const nf = findCell(s, 'Not found in AEP');
+  const nf = findCell(s, 'Not in identity graph');
   assert.equal(s.getCell(nf.row, 3).value, '—');
   assert.match(String(s.getCell(nf.row, 26).value), /rebuild/i);
+});
+
+test('an analysis without stored distinct counts: the workbook counts them, each outside profile once', async () => {
+  // Built before 2026-10-14. X is merged with both E and F: one profile NOT in the
+  // file, not two (the per-ID sum said 3 with Y).
+  const { distinct: _, ...legacy } = summary;
+  const filename = path.join(dir, 'counted.xlsx');
+  const res = await writeAnalysisWorkbook({ filename, meta, summary: legacy, sourceNs: KOC, readers: readersFor(analysisRows) });
+  assert.deepEqual(res.distinct, DISTINCT);
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.readFile(filename);
+  const s = wb.getWorksheet('Summary');
+  const c = findCell(s, '⚠ PROFILES NOT IN YOUR FILE');
+  assert.equal(s.getCell(c.row + 1, c.col).value, 2);
+});
+
+test('if counting identities per namespace fails, the report still builds and says why (review #2)', async () => {
+  const { distinct: _, ...legacy } = summary;
+  const readers = { ...readersFor(analysisRows), distinctByNamespace: () => { throw new Error('database or disk is full'); } };
+  const filename = path.join(dir, 'count-failed.xlsx');
+  const res = await writeAnalysisWorkbook({ filename, meta, summary: legacy, sourceNs: KOC, readers });
+  assert.equal(res.distinct, null, 'nothing to keep');
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.readFile(filename);
+  const s = wb.getWorksheet('Summary');
+  const c = findCell(s, '⚠ PROFILES NOT IN YOUR FILE');
+  assert.equal(s.getCell(c.row + 1, c.col).value, 2, 'still counted, from the merged clusters');
+  let text = '';
+  s.eachRow(row => row.eachCell(cell => { text += ` ${cell.value}`; }));
+  assert.match(text, /couldn't be counted: database or disk is full/);
+  assert.equal(findCell(s, 'Total'), null);
+  assert.equal(wb.worksheets.length, 4, 'every other sheet is there');
 });

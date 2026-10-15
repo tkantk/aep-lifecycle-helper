@@ -56,6 +56,9 @@
     var aStatus = analysis && analysis.status;
     if (off) add('analysis', 'Analyse', 'na', 'Not available — expansion was off');
     else if (!expanded) add('analysis', 'Analyse', 'locked', afterExpansion);
+    else if (aStatus === 'building' && analysis.phase === 'counting') {
+      add('analysis', 'Analyse', 'todo', 'Counting identities per namespace…', true);   // its last, slow step (2026-10-14)
+    }
     else if (aStatus === 'building') {
       var total = analysis.sourcesTotal || 0;
       var pct = total > 0 ? Math.min(100, Math.floor(100 * (analysis.sourcesDone || 0) / total)) : 0;
@@ -143,6 +146,8 @@
       return b >= 1048576 ? (b / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(b / 1024)) + ' KB';
     }
     if (r.status === 'building') {
+      // An older analysis's report first counts identities per namespace (2026-10-14).
+      if (r.phase === 'counting') return { state: 'building', label: 'Counting identities…', pct: 0, size: '', error: '', action: null };
       var pct = r.rowsTotal > 0 ? Math.min(100, Math.floor(100 * (r.rowsDone || 0) / r.rowsTotal)) : 0;
       return { state: 'building', label: 'Building… ' + pct + '%', pct: pct, size: '', error: '', action: null };
     }
@@ -178,7 +183,28 @@
     return { state: 'none', label: 'Export CSV', pct: 0, detail: '', action: 'build' };
   }
 
+  /**
+   * The Analysis tab's identities per namespace (2026-10-14): each identity once,
+   * the uploaded IDs included, so the rows add up to the distinct identities. Null
+   * for an analysis built before these counts — its numbers were summed per
+   * uploaded ID (uploaded IDs left out, shared identities counted again).
+   */
+  function analysisCountsView(summary, srcNs) {
+    var d = summary && summary.distinct;
+    if (!d) return null;
+    var rows = [{ label: srcNs + ' · your uploaded IDs', ns: srcNs, n: d.uploaded || 0, tone: 'uploaded' }];
+    if (d.outsideProfiles > 0) rows.push({ label: srcNs + ' · profiles NOT in your file', ns: srcNs, n: d.outsideProfiles, tone: 'outside' });
+    Object.keys(d.byNamespace || {})
+      .map(function (k) { return [k, d.byNamespace[k]]; })
+      .sort(function (a, b) { return (b[1] - a[1]) || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0); })
+      .forEach(function (e) { rows.push({ label: e[0], ns: e[0], n: e[1], tone: 'ns' }); });
+    var total = rows.reduce(function (t, r) { return t + r.n; }, 0);
+    rows.forEach(function (r) { r.share = total > 0 ? r.n / total : 0; });
+    return { rows: rows, total: total, outsideProfiles: d.outsideProfiles || 0, mergedWithUploaded: d.mergedWithUploaded || 0 };
+  }
+
   root.AepJobView = {
+    analysisCountsView: analysisCountsView,
     identityExportView: identityExportView,
     steps: steps,
     badges: badges,

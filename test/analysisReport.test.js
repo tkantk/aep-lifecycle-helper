@@ -82,7 +82,7 @@ test('a report builds in a worker: file ready, merged IDs only, the event loop s
   const wb = new ExcelJS.Workbook(); await wb.xlsx.readFile(report.reportPath(jobId));
   assert.deepEqual(wb.worksheets.map(w => [w.name, w.rowCount]),
     [['Summary', wb.getWorksheet('Summary').rowCount], ['⚠ Merged · NOT in file', 3001], ['Merged · in file', 3001],
-     ['Not found in AEP', 2]]);   // header + "Every uploaded ID was found in AEP."
+     ['Not in identity graph', 2]]);   // header + the "none in this category" note
   assert.ok(maxLag < 150, `event loop blocked ${Math.round(maxLag)} ms`);
 });
 
@@ -162,7 +162,7 @@ test('a job planned before scopes existed reads "linked identities" in the repor
   assert.doesNotMatch(sub, /not planned/);
 });
 
-test('the report lists "Not found in AEP" and "No reply from AEP" IDs (end to end, worker thread)', async () => {
+test('the report lists "Not in identity graph" and "No reply from AEP" IDs (end to end, worker thread)', async () => {
   const jobId = await seed(2, { build: false });
   bulkInsertIdentities([[jobId, 'hashedKocid', 5000, 'NF1', 'NF1']]);   // Adobe: no identities
   insertIdentitiesAndCount([], 0, 0, jobId, ['NR1']);                  // Adobe: no reply
@@ -172,6 +172,6 @@ test('the report lists "Not found in AEP" and "No reply from AEP" IDs (end to en
   assert.equal(st.status, 'ready', st.error);
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.readFile(report.reportPath(jobId));
-  assert.equal(wb.getWorksheet('Not found in AEP').getRow(2).getCell(1).value, 'NF1');
+  assert.equal(wb.getWorksheet('Not in identity graph').getRow(2).getCell(1).value, 'NF1');
   assert.equal(wb.getWorksheet('No reply from AEP').getRow(2).getCell(1).value, 'NR1');
 });
